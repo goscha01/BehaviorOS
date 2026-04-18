@@ -1,13 +1,17 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import "./landing.css";
 import LandingDemo from "@/components/landing/LandingDemo";
+import EarlyAccessModal from "@/components/landing/EarlyAccessModal";
 
 export default function LandingPage() {
   const heroBarsRef = useRef<HTMLDivElement>(null);
   const howBarsRef = useRef<HTMLDivElement>(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const openModal = () => setModalOpen(true);
+  const closeModal = () => setModalOpen(false);
 
   useEffect(() => {
     const heroEl = heroBarsRef.current;
@@ -66,9 +70,9 @@ export default function LandingPage() {
             <a href="#use-cases">Use cases</a>
             <a href="#start">Pricing</a>
           </div>
-          <Link href="/register" className="cta">
+          <button type="button" onClick={openModal} className="cta">
             Start a session →
-          </Link>
+          </button>
         </div>
       </nav>
 
@@ -94,9 +98,9 @@ export default function LandingPage() {
                 <span className="chip">Service businesses</span>
               </div>
               <div className="btn-row">
-                <Link href="/register" className="btn primary">
+                <button type="button" onClick={openModal} className="btn primary">
                   Start your first session <span className="arr">→</span>
-                </Link>
+                </button>
                 <a href="#demo" className="btn ghost">
                   See live demo
                 </a>
@@ -365,9 +369,9 @@ export default function LandingPage() {
             existing workflows.
           </p>
           <div className="btn-row">
-            <Link href="/register" className="btn primary">
+            <button type="button" onClick={openModal} className="btn primary">
               Start your first session <span className="arr">→</span>
-            </Link>
+            </button>
             <a href="#demo" className="btn ghost">
               See live demo
             </a>
@@ -409,10 +413,18 @@ export default function LandingPage() {
           </div>
           <div>
             © 2026 BehavioralIQ · <Link href="/login">Login</Link> ·{" "}
-            <Link href="/register">Sign up</Link>
+            <button
+              type="button"
+              onClick={openModal}
+              style={{ color: "inherit", padding: 0, font: "inherit", cursor: "pointer" }}
+            >
+              Request access
+            </button>
           </div>
         </div>
       </footer>
+
+      <EarlyAccessModal open={modalOpen} onClose={closeModal} />
     </div>
   );
 }
