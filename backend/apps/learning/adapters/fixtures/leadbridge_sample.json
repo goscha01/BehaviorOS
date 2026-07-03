@@ -1,0 +1,58 @@
+[
+  {
+    "conversation_id": "lb_conv_00001",
+    "channel": "thumbtack",
+    "playbook_version": "v3.2",
+    "created_at": "2026-07-01T14:20:00Z",
+    "closed_at": "2026-07-01T14:35:00Z",
+    "lead": {
+      "name": "Sarah",
+      "location": "Chicago, IL",
+      "service": "weekly_house_cleaning"
+    },
+    "messages": [
+      {"role": "customer", "text": "Hi, I'm looking for weekly house cleaning. Do you handle homes with pets?", "ts": "2026-07-01T14:20:00Z"},
+      {"role": "ai", "text": "Yes! We bring all our own supplies and are pet-friendly. What's the size of your home?", "ts": "2026-07-01T14:20:30Z"},
+      {"role": "customer", "text": "3 bedroom, 2 bath. Two dogs.", "ts": "2026-07-01T14:22:10Z"},
+      {"role": "ai", "text": "Perfect — for a 3/2 with pets on a weekly cadence, we're looking at around $135–$160 per visit. Want me to hold a slot for Tuesday morning?", "ts": "2026-07-01T14:22:40Z"},
+      {"role": "customer", "text": "Yes please, Tuesday works", "ts": "2026-07-01T14:34:12Z"}
+    ],
+    "outcome": {"status": "booked", "revenue_estimate": 145}
+  },
+  {
+    "conversation_id": "lb_conv_00002",
+    "channel": "yelp",
+    "playbook_version": "v3.2",
+    "created_at": "2026-07-02T09:05:00Z",
+    "closed_at": "2026-07-02T09:11:00Z",
+    "lead": {
+      "name": "Marcus",
+      "location": "Naperville, IL",
+      "service": "deep_clean"
+    },
+    "messages": [
+      {"role": "customer", "text": "How much for a deep clean?", "ts": "2026-07-02T09:05:00Z"},
+      {"role": "ai", "text": "Deep cleans start at $220 for a 2-bedroom. Can I get the square footage?", "ts": "2026-07-02T09:05:20Z"},
+      {"role": "customer", "text": "That's too much, thanks", "ts": "2026-07-02T09:10:45Z"}
+    ],
+    "outcome": {"status": "lost", "loss_reason": "price"}
+  },
+  {
+    "conversation_id": "lb_conv_00003",
+    "channel": "thumbtack",
+    "playbook_version": "v3.2",
+    "created_at": "2026-07-02T11:15:00Z",
+    "closed_at": "2026-07-02T11:28:00Z",
+    "lead": {
+      "name": "Priya",
+      "location": "Oak Park, IL",
+      "service": "move_out_clean"
+    },
+    "messages": [
+      {"role": "customer", "text": "Need a move-out clean by Friday. Cats and a hamster.", "ts": "2026-07-02T11:15:00Z"},
+      {"role": "ai", "text": "We can do Friday. For a move-out with pets, we bring all supplies including pet-safe products. What size?", "ts": "2026-07-02T11:15:40Z"},
+      {"role": "customer", "text": "2 bed / 1 bath apartment. Great — book me.", "ts": "2026-07-02T11:27:30Z"}
+    ],
+    "outcome": {"status": "booked", "revenue_estimate": 280}
+  }
+]

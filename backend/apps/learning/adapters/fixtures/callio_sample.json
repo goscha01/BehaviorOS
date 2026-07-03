@@ -1,0 +1,34 @@
+[
+  {
+    "call_id": "cal_00001",
+    "playbook_version": "voice-v1.4",
+    "started_at": "2026-07-02T09:15:00Z",
+    "ended_at": "2026-07-02T09:22:00Z",
+    "duration_seconds": 420,
+    "lead": {"name": "Marcus", "phone_last_4": "8231"},
+    "transcript": [
+      {"speaker": "agent", "text": "Thanks for calling, how can I help?", "ts": 0.5},
+      {"speaker": "customer", "text": "Need someone to clean before we move in next Saturday", "ts": 3.2},
+      {"speaker": "agent", "text": "Absolutely. What's the size of the place and are you looking for a standard clean or a deep clean?", "ts": 8.1},
+      {"speaker": "customer", "text": "3 bed 2 bath, deep clean. And we have a dog.", "ts": 14.4},
+      {"speaker": "agent", "text": "Got it — for a move-in deep clean at 3/2 with a pet, we bring pet-safe supplies. That comes to around $340. Saturday morning works?", "ts": 22.0},
+      {"speaker": "customer", "text": "Yes, book it.", "ts": 45.2}
+    ],
+    "outcome": {"status": "won", "handoff_to_dispatcher": true, "revenue_estimate": 340}
+  },
+  {
+    "call_id": "cal_00002",
+    "playbook_version": "voice-v1.4",
+    "started_at": "2026-07-03T13:02:00Z",
+    "ended_at": "2026-07-03T13:04:30Z",
+    "duration_seconds": 150,
+    "lead": {"name": "Ellen", "phone_last_4": "0442"},
+    "transcript": [
+      {"speaker": "agent", "text": "Thanks for calling, how can I help?", "ts": 0.4},
+      {"speaker": "customer", "text": "Do you clean short-term rentals? I have three Airbnbs.", "ts": 2.9},
+      {"speaker": "agent", "text": "We do standard residential cleaning. I'm not sure about short-term rental turnovers — let me connect you with a dispatcher.", "ts": 9.0},
+      {"speaker": "customer", "text": "Never mind, I'll try someone else.", "ts": 15.6}
+    ],
+    "outcome": {"status": "lost", "loss_reason": "unclear_service_fit"}
+  }
+]

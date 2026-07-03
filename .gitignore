@@ -56,3 +56,6 @@ coverage.xml
 
 # Static files (collected)
 staticfiles/
+
+# Claude Code local settings
+.claude/

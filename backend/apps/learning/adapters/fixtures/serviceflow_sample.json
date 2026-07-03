@@ -1,0 +1,41 @@
+[
+  {
+    "job_id": "sf_job_00001",
+    "customer_id": "cust_lb_00001",
+    "service_type": "weekly_house_cleaning",
+    "rules_version": "ops-2026-Q3",
+    "created_at": "2026-07-01T14:35:00Z",
+    "completed_at": "2026-07-02T13:00:00Z",
+    "status": "completed",
+    "revenue": 145,
+    "recurring": true,
+    "cancelled_reason": null,
+    "review": null
+  },
+  {
+    "job_id": "sf_job_00002",
+    "customer_id": "cust_lb_00003",
+    "service_type": "move_out_clean",
+    "rules_version": "ops-2026-Q3",
+    "created_at": "2026-07-02T11:28:00Z",
+    "completed_at": "2026-07-05T18:00:00Z",
+    "status": "completed",
+    "revenue": 280,
+    "recurring": false,
+    "cancelled_reason": null,
+    "review": null
+  },
+  {
+    "job_id": "sf_job_00003",
+    "customer_id": "cust_walk_in_00007",
+    "service_type": "deep_clean",
+    "rules_version": "ops-2026-Q3",
+    "created_at": "2026-06-28T10:00:00Z",
+    "completed_at": null,
+    "status": "cancelled",
+    "revenue": 0,
+    "recurring": false,
+    "cancelled_reason": "customer_no_show",
+    "review": null
+  }
+]
