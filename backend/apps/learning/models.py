@@ -173,11 +173,23 @@ class LearningSuggestion(BaseModel):
         OTHER = 'other', 'Other'
 
     class Status(models.TextChoices):
-        PENDING = 'pending', 'Pending'
+        # Review lifecycle. Ordered by typical progression, but the API
+        # enforces which transitions are valid per current state.
+        NEW = 'new', 'New (freshly synthesized)'
+        UNDER_REVIEW = 'under_review', 'Under review'
         APPROVED = 'approved', 'Approved'
+        IMPLEMENTED = 'implemented', 'Implemented (published to target channel)'
+        MEASURED = 'measured', 'Measured (impact quantified)'
+        ARCHIVED = 'archived', 'Archived'
         REJECTED = 'rejected', 'Rejected'
-        IMPLEMENTED = 'implemented', 'Implemented'
         WATCHLIST = 'watchlist', 'Watchlist (below surface threshold)'
+
+    # Statuses that indicate the suggestion is still "in play" — used by
+    # the clustering merge pass to decide which suggestions can absorb
+    # new candidates.
+    ACTIVE_STATUSES = (
+        'new', 'under_review', 'approved', 'implemented', 'measured', 'watchlist',
+    )
 
     org = models.ForeignKey(
         'accounts.Organization', on_delete=models.CASCADE, related_name='learning_suggestions'
@@ -224,7 +236,21 @@ class LearningSuggestion(BaseModel):
     synthesis_prompt_version = models.CharField(max_length=32, blank=True)
     synthesis_cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
     status = models.CharField(
-        max_length=20, choices=Status.choices, default=Status.PENDING
+        max_length=20, choices=Status.choices, default=Status.NEW
+    )
+    publish_targets = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Channel keys this suggestion should be published to when implemented '
+                  '(e.g. ["leadbridge_playbook", "callio_voice_rules"]). Empty in Phase 1; '
+                  'the approve endpoint persists this so a future publisher can pick it up '
+                  'without breaking the API contract.',
+    )
+    impact_json = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Before/after metrics captured when the suggestion transitions to MEASURED '
+                  '(e.g. {"win_rate_before": 0.42, "win_rate_after": 0.51, "sample_size": 320}).',
     )
     reviewed_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -366,6 +392,17 @@ class RejectedSuggestionSignature(BaseModel):
         null=True,
         blank=True,
         related_name='rejection_signatures',
+    )
+    rejection_reason = models.TextField(
+        help_text='Required at rejection time. Persisted for future analyzer prompting '
+                  '("customers rejected X for reason Y — do not re-recommend").',
+    )
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='rejected_suggestion_signatures',
     )
     expires_at = models.DateTimeField(help_text='90 days from rejection by default.')
 

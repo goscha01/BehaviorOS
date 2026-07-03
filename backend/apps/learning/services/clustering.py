@@ -146,11 +146,7 @@ class EvidenceClusteringService:
             .filter(
                 org=self.org,
                 category=category,
-                status__in=(
-                    LearningSuggestion.Status.PENDING,
-                    LearningSuggestion.Status.APPROVED,
-                    LearningSuggestion.Status.WATCHLIST,
-                ),
+                status__in=LearningSuggestion.ACTIVE_STATUSES,
             )
             .only('id', 'fingerprint', 'representative_examples', 'supporting_count')
         )

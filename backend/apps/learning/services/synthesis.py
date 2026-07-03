@@ -147,7 +147,7 @@ class SynthesisService:
     ) -> LearningSuggestion:
         support_count = len(cluster.candidates)
         status = (
-            LearningSuggestion.Status.PENDING
+            LearningSuggestion.Status.NEW
             if support_count >= self.min_supporting
             else LearningSuggestion.Status.WATCHLIST
         )

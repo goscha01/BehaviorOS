@@ -58,17 +58,18 @@ class LearningSuggestionAdmin(admin.ModelAdmin):
     search_fields = ('title', 'description', 'org__name', 'fingerprint')
     readonly_fields = ('created_at', 'updated_at', 'supporting_count', 'fingerprint')
     inlines = [CandidateRecommendationInline]
-    actions = ['mark_approved', 'mark_rejected']
+    actions = ['mark_approved', 'mark_archived']
 
     @admin.action(description='Mark selected suggestions as approved')
     def mark_approved(self, request, queryset):
         queryset.update(status=LearningSuggestion.Status.APPROVED)
 
-    @admin.action(description='Mark selected suggestions as rejected')
-    def mark_rejected(self, request, queryset):
-        # Note: the clustering pipeline is responsible for creating the
-        # RejectedSuggestionSignature row when it observes this transition.
-        queryset.update(status=LearningSuggestion.Status.REJECTED)
+    @admin.action(description='Archive selected suggestions')
+    def mark_archived(self, request, queryset):
+        # Rejection is a distinct action that requires a reason — do it
+        # through the API/UI, not the admin bulk action, so the
+        # RejectedSuggestionSignature gets populated correctly.
+        queryset.update(status=LearningSuggestion.Status.ARCHIVED)
 
 
 @admin.register(CandidateRecommendation)
@@ -85,7 +86,12 @@ class CandidateRecommendationAdmin(admin.ModelAdmin):
 
 @admin.register(RejectedSuggestionSignature)
 class RejectedSuggestionSignatureAdmin(admin.ModelAdmin):
-    list_display = ('org', 'category', 'signature', 'expires_at', 'created_at')
+    list_display = ('org', 'category', 'rejection_reason_preview', 'expires_at', 'created_at')
     list_filter = ('category',)
-    search_fields = ('signature', 'org__name')
+    search_fields = ('signature', 'rejection_reason', 'org__name')
     date_hierarchy = 'expires_at'
+    readonly_fields = ('signature', 'tokens')
+
+    @admin.display(description='Reason')
+    def rejection_reason_preview(self, obj):
+        return (obj.rejection_reason or '')[:80]
