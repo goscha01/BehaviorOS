@@ -77,12 +77,31 @@ class StubProvider(BaseProvider):
         user_prompt: str,
         model: str,
     ) -> LLMResult:
-        # Rough heuristic — if the transcript mentions pets, emit a
-        # pets-related candidate rule. Keeps stub output slightly
-        # sensitive to input so tests can exercise different paths.
-        signal_pets = 'pet' in user_prompt.lower() or 'dog' in user_prompt.lower() or 'cat' in user_prompt.lower()
+        # Detect which caller is asking based on the system prompt.
+        # The synthesis prompt asks for one consolidated recommendation
+        # across candidates; the analyzer prompt asks for structured
+        # learnings from one piece of evidence.
+        if 'synthesize' in system_prompt.lower():
+            payload = self._stub_synthesis(user_prompt)
+        else:
+            payload = self._stub_analysis(user_prompt)
+        raw = json.dumps(payload, ensure_ascii=False, indent=2)
+        return LLMResult(
+            raw_response=raw,
+            parsed_json=payload,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=Decimal('0'),
+            model_used=model,
+            provider=self.name,
+        )
 
-        analysis = {
+    @staticmethod
+    def _stub_analysis(user_prompt: str) -> dict:
+        signal_pets = any(
+            token in user_prompt.lower() for token in ('pet', 'dog', 'cat')
+        )
+        return {
             'summary': '[stub] Analysis produced by StubProvider (no ANTHROPIC_API_KEY configured).',
             'category': 'pricing' if 'price' in user_prompt.lower() else 'other',
             'subcategory': 'stub subcategory',
@@ -99,16 +118,21 @@ class StubProvider(BaseProvider):
             'candidate_faq': [],
             'signals': ['[stub] pets mentioned'] if signal_pets else ['[stub] no notable signals'],
         }
-        raw = json.dumps(analysis, ensure_ascii=False, indent=2)
-        return LLMResult(
-            raw_response=raw,
-            parsed_json=analysis,
-            input_tokens=0,
-            output_tokens=0,
-            cost_usd=Decimal('0'),
-            model_used=model,
-            provider=self.name,
-        )
+
+    @staticmethod
+    def _stub_synthesis(user_prompt: str) -> dict:
+        return {
+            'title': '[stub] Consolidated recommendation from cluster',
+            'description': (
+                '[stub] StubProvider consolidated the cluster into one recommendation. '
+                'Configure ANTHROPIC_API_KEY for real synthesis.'
+            ),
+            'confidence': 0.5,
+            'why_this_matters': '[stub] Business impact not evaluated without a real LLM.',
+            'supporting_evidence_summary': '[stub] Multiple candidates across evidence supported this pattern.',
+            'suggested_playbook_change': '[stub] Playbook change not proposed.',
+            'suggested_faq_addition': '',
+        }
 
 
 class AnthropicProvider(BaseProvider):

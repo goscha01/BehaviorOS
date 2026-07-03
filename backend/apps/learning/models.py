@@ -50,8 +50,8 @@ class EvidenceInsight(BaseModel):
     """One record per piece of analyzed evidence (conversation, call, outcome, etc.).
 
     Generic on purpose — the source system decides what kind of evidence this
-    represents. `payload` carries whatever the adapter normalized. Idempotency
-    is enforced by (source_system, source_evidence_id).
+    represents. `source_payload` carries whatever the adapter normalized.
+    Idempotency is enforced by (source_system, external_id).
     """
 
     class EvidenceType(models.TextChoices):
@@ -156,6 +156,13 @@ class EvidenceInsight(BaseModel):
 
 
 class LearningSuggestion(BaseModel):
+    """One aggregated business recommendation, synthesized from a cluster of
+    similar `CandidateRecommendation` rows.
+
+    BehaviorOS's product output. Never created per-conversation — every
+    suggestion represents a recurring pattern across evidence.
+    """
+
     class Category(models.TextChoices):
         PRICING = 'pricing', 'Pricing'
         FAQ = 'faq', 'FAQ'
@@ -185,24 +192,37 @@ class LearningSuggestion(BaseModel):
     category = models.CharField(max_length=32, choices=Category.choices)
     title = models.CharField(max_length=200)
     description = models.TextField()
+    fingerprint = models.CharField(
+        max_length=512,
+        db_index=True,
+        help_text='Normalized token union from supporting candidates; used for merging '
+                  'new candidates and rejection checks (Jaccard-based comparison).',
+    )
     confidence = models.DecimalField(max_digits=3, decimal_places=2, default=0)
     confidence_breakdown = models.JSONField(
         default=dict,
         blank=True,
-        help_text='Component scores (avg confidence, support count factor, etc.) explaining the score.',
-    )
-    supporting_evidence = models.ManyToManyField(
-        EvidenceInsight,
-        through='SuggestionEvidence',
-        related_name='suggestions',
-        blank=True,
-    )
-    supporting_count = models.PositiveIntegerField(
-        default=0, help_text='Denormalized count of linked evidence, for fast list rendering.'
+        help_text='{llm, support, outcome_consistency, final} — components explaining the score.',
     )
     representative_examples = models.JSONField(
-        default=list, blank=True, help_text='Up to 3 verbatim snippets for the dashboard card.'
+        default=dict,
+        blank=True,
+        help_text='{top: [3 examples], highest_confidence: {...}, newest: {...}} — each '
+                  'example = {candidate_id, evidence_id, snippet, source_system}.',
     )
+    supporting_count = models.PositiveIntegerField(
+        default=0,
+        help_text='Denormalized count of supporting CandidateRecommendation rows.',
+    )
+    synthesis_json = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Full synthesis output: why_this_matters, supporting_evidence_summary, '
+                  'suggested_playbook_change, suggested_faq_addition.',
+    )
+    synthesis_model = models.CharField(max_length=64, blank=True)
+    synthesis_prompt_version = models.CharField(max_length=32, blank=True)
+    synthesis_cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.PENDING
     )
@@ -228,41 +248,102 @@ class LearningSuggestion(BaseModel):
         return f"[{self.category}] {self.title}"
 
 
-class SuggestionEvidence(BaseModel):
-    """Through-table linking a suggestion to the evidence that supports it."""
+class CandidateRecommendation(BaseModel):
+    """One candidate recommendation extracted from an EvidenceInsight's analysis.
 
-    suggestion = models.ForeignKey(
-        LearningSuggestion, on_delete=models.CASCADE, related_name='evidence_links'
+    Each analysis emits zero or more candidate playbook rules and FAQ entries.
+    Each becomes one CandidateRecommendation row. Clustering operates on these,
+    not on evidence directly — one improvement idea can span many conversations,
+    and one conversation can suggest many improvements.
+    """
+
+    class Kind(models.TextChoices):
+        PLAYBOOK_RULE = 'playbook_rule', 'Playbook rule'
+        FAQ = 'faq', 'FAQ'
+
+    class OutcomeSignal(models.TextChoices):
+        POSITIVE = 'positive', 'Positive (booked / won / recurring)'
+        NEGATIVE = 'negative', 'Negative (cancelled / lost / no_show)'
+        NEUTRAL = 'neutral', 'Neutral / unknown'
+
+    org = models.ForeignKey(
+        'accounts.Organization',
+        on_delete=models.CASCADE,
+        related_name='candidate_recommendations',
     )
     evidence = models.ForeignKey(
-        EvidenceInsight, on_delete=models.CASCADE, related_name='suggestion_links'
+        EvidenceInsight,
+        on_delete=models.CASCADE,
+        related_name='candidate_recommendations',
     )
-    similarity_score = models.DecimalField(
-        max_digits=4,
-        decimal_places=3,
+    job = models.ForeignKey(
+        LearningJob,
+        on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        help_text='Reserved for future semantic clustering; null in Phase 1 keyword grouping.',
+        related_name='candidate_recommendations',
+        help_text='Job that produced this candidate.',
+    )
+    suggestion = models.ForeignKey(
+        LearningSuggestion,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='candidate_recommendations',
+        help_text='Cluster this candidate was merged into. Null = unclustered (resume queue).',
+    )
+    kind = models.CharField(max_length=20, choices=Kind.choices)
+    category = models.CharField(
+        max_length=32,
+        choices=LearningSuggestion.Category.choices,
+        help_text='Denormalized from analysis_json.category for filtering.',
+    )
+    title = models.CharField(
+        max_length=400,
+        help_text='For playbook_rule: rule title. For faq: the question.',
+    )
+    description = models.TextField(
+        help_text='For playbook_rule: rule body. For faq: the answer.',
+    )
+    llm_confidence = models.DecimalField(
+        max_digits=3, decimal_places=2, default=0,
+        help_text='Per-candidate confidence from the analyzer LLM.',
+    )
+    outcome_signal = models.CharField(
+        max_length=20, choices=OutcomeSignal.choices, default=OutcomeSignal.NEUTRAL,
+        db_index=True,
+    )
+    fingerprint = models.CharField(
+        max_length=512, db_index=True,
+        help_text='Normalized token string; used for Jaccard clustering.',
+    )
+    tokens = models.JSONField(
+        default=list, blank=True,
+        help_text='Deduplicated token list matching fingerprint. Denormalized for fast set ops.',
+    )
+    clustered_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Null = unclustered (resume queue for clustering).',
     )
 
     class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=['suggestion', 'evidence'],
-                name='learning_suggestion_evidence_unique',
-            ),
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['clustered_at']),
+            models.Index(fields=['org', 'category', 'clustered_at']),
+            models.Index(fields=['suggestion']),
         ]
 
     def __str__(self):
-        return f"{self.suggestion_id} ← {self.evidence_id}"
+        return f"[{self.kind}/{self.category}] {self.title[:60]}"
 
 
 class RejectedSuggestionSignature(BaseModel):
     """Fingerprint of a rejected cluster so it doesn't re-surface every night.
 
-    Phase 1 signature: deterministic hash of (category + normalized keyword set).
-    When semantic clustering ships later, add a signature variant based on
-    centroid-embedding buckets.
+    Populated when a LearningSuggestion.status transitions to REJECTED.
+    The clustering pass checks new candidate clusters against these
+    signatures via Jaccard similarity; matches are silently dropped.
     """
 
     org = models.ForeignKey(
@@ -271,7 +352,14 @@ class RejectedSuggestionSignature(BaseModel):
         related_name='rejected_suggestion_signatures',
     )
     category = models.CharField(max_length=32, choices=LearningSuggestion.Category.choices)
-    signature = models.CharField(max_length=128)
+    signature = models.CharField(
+        max_length=512,
+        help_text='Fingerprint of the rejected suggestion (token union of its candidates).',
+    )
+    tokens = models.JSONField(
+        default=list, blank=True,
+        help_text='Deduplicated tokens matching signature. Used for Jaccard comparison.',
+    )
     rejected_suggestion = models.ForeignKey(
         LearningSuggestion,
         on_delete=models.SET_NULL,
@@ -289,9 +377,9 @@ class RejectedSuggestionSignature(BaseModel):
             ),
         ]
         indexes = [
-            models.Index(fields=['org', 'category', 'signature']),
+            models.Index(fields=['org', 'category']),
             models.Index(fields=['expires_at']),
         ]
 
     def __str__(self):
-        return f"rejected[{self.category}]:{self.signature[:12]}"
+        return f"rejected[{self.category}]:{self.signature[:40]}"

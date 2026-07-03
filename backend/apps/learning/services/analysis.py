@@ -22,9 +22,21 @@ from apps.accounts.models import Organization
 from apps.learning.analyzers import get_analyzer_for
 from apps.learning.analyzers.base import AnalysisResult
 from apps.learning.analyzers.schema import AnalysisSchemaError, empty_analysis
-from apps.learning.models import EvidenceInsight, LearningJob
+from apps.learning.models import CandidateRecommendation, EvidenceInsight, LearningJob
 from apps.learning.services.budget import BudgetTracker
+from apps.learning.services.fingerprint import fingerprint as fingerprint_text
+from apps.learning.services.fingerprint import tokenize
 from apps.learning.services.llm_client import LearningLLMClient, LLMProviderError
+
+# Outcome-status → CandidateRecommendation.OutcomeSignal mapping. Populated
+# from the source system's own outcome vocabulary — never inferred.
+_POSITIVE_OUTCOMES = frozenset({
+    'booked', 'won', 'completed', 'recurring', 'accepted', 'confirmed',
+})
+_NEGATIVE_OUTCOMES = frozenset({
+    'cancelled', 'canceled', 'lost', 'no_show', 'declined', 'rejected',
+    'churned',
+})
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +136,88 @@ class EvidenceAnalysisService:
             'analyzed_at',
             'updated_at',
         ])
+        self._extract_candidates(insight, analysis.analysis_json)
+
+    def _extract_candidates(self, insight: EvidenceInsight, analysis_json: dict) -> None:
+        """Flatten candidate_playbook_rules + candidate_faq into
+        CandidateRecommendation rows so clustering has something to group.
+
+        Delete-then-create: on a re-analysis (prompt version bump, manual
+        reset), stale candidates are wiped before new ones are written.
+        Clustered candidates lose their suggestion linkage — the next
+        clustering run reattaches or re-clusters them.
+        """
+        CandidateRecommendation.objects.filter(evidence=insight).delete()
+
+        category = str(analysis_json.get('category', 'other')).lower()
+        parent_confidence = _to_decimal(analysis_json.get('confidence', 0))
+        outcome_signal = _classify_outcome(insight.outcome)
+
+        rows: list[CandidateRecommendation] = []
+        for rule in analysis_json.get('candidate_playbook_rules', []) or []:
+            if not isinstance(rule, dict):
+                continue
+            title = str(rule.get('title', '')).strip()
+            description = str(rule.get('description', '')).strip()
+            if not title and not description:
+                continue
+            rule_conf = _to_decimal(rule.get('confidence', parent_confidence))
+            rows.append(self._build_candidate(
+                insight=insight,
+                kind=CandidateRecommendation.Kind.PLAYBOOK_RULE,
+                category=category,
+                title=title,
+                description=description,
+                llm_confidence=rule_conf,
+                outcome_signal=outcome_signal,
+            ))
+
+        for faq in analysis_json.get('candidate_faq', []) or []:
+            if not isinstance(faq, dict):
+                continue
+            question = str(faq.get('question', '')).strip()
+            answer = str(faq.get('answer', '')).strip()
+            if not question and not answer:
+                continue
+            rows.append(self._build_candidate(
+                insight=insight,
+                kind=CandidateRecommendation.Kind.FAQ,
+                category=category,
+                title=question,
+                description=answer,
+                llm_confidence=parent_confidence,
+                outcome_signal=outcome_signal,
+            ))
+
+        if rows:
+            CandidateRecommendation.objects.bulk_create(rows)
+
+    def _build_candidate(
+        self,
+        *,
+        insight: EvidenceInsight,
+        kind: str,
+        category: str,
+        title: str,
+        description: str,
+        llm_confidence: Decimal,
+        outcome_signal: str,
+    ) -> CandidateRecommendation:
+        fp_text = f'{title}\n{description}'
+        tokens = tokenize(fp_text)
+        return CandidateRecommendation(
+            org=self.org,
+            evidence=insight,
+            job=self.job,
+            kind=kind,
+            category=category,  # schema validator already clamps to valid enum
+            title=title[:400],
+            description=description,
+            llm_confidence=llm_confidence,
+            outcome_signal=outcome_signal,
+            fingerprint=fingerprint_text(fp_text),
+            tokens=tokens,
+        )
 
     @transaction.atomic
     def _persist_failure(
@@ -141,3 +235,19 @@ class EvidenceAnalysisService:
             'analysis_prompt_version',
             'updated_at',
         ])
+
+
+def _to_decimal(value) -> Decimal:
+    try:
+        return Decimal(str(value)).quantize(Decimal('0.01'))
+    except (TypeError, ValueError, ArithmeticError):
+        return Decimal('0')
+
+
+def _classify_outcome(outcome_status: str) -> str:
+    lowered = (outcome_status or '').lower()
+    if lowered in _POSITIVE_OUTCOMES:
+        return CandidateRecommendation.OutcomeSignal.POSITIVE
+    if lowered in _NEGATIVE_OUTCOMES:
+        return CandidateRecommendation.OutcomeSignal.NEGATIVE
+    return CandidateRecommendation.OutcomeSignal.NEUTRAL

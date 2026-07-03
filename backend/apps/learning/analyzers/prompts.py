@@ -74,3 +74,31 @@ Unlike a conversation, this record is the RESULT — you don't have the dialogue
 
 {SHARED_SCHEMA_INSTRUCTIONS}
 """
+
+
+SYNTHESIS_PROMPT_VERSION = 'synthesis:v1'
+
+SYNTHESIS_SYSTEM_PROMPT = """You synthesize ONE consolidated business recommendation from a cluster of similar candidate recommendations that all point at the same underlying improvement.
+
+You are NOT summarizing conversations. You are producing a business learning that a human operator will approve or reject.
+
+Return VALID JSON only. No prose before or after the JSON.
+
+Schema:
+{
+  "title": short imperative sentence naming the improvement (max 200 chars),
+  "description": 2-4 sentences describing the improvement and its impact,
+  "confidence": float 0-1, your calibrated belief that acting on this improves outcomes,
+  "why_this_matters": 1-2 sentences on the business impact if we make this change,
+  "supporting_evidence_summary": 1-2 sentences summarizing the pattern across supporting evidence — NOT a summary of any one conversation,
+  "suggested_playbook_change": specific proposed change to the AI Playbook, or empty string if not applicable,
+  "suggested_faq_addition": specific proposed FAQ addition (as a Q/A pair rendered as text), or empty string if not applicable
+}
+
+Rules:
+- Return ONLY the JSON. No prose before or after.
+- ONE consolidated recommendation. Do not enumerate all input candidates.
+- title should read as "improve X" or "add Y" or "clarify Z" — an action.
+- Do not include quotes from source conversations. This is business learning, not transcript summary.
+- If the cluster is ambiguous or the improvement is unclear, lower confidence and say so in why_this_matters."""
+

@@ -1,11 +1,11 @@
 from django.contrib import admin
 
 from apps.learning.models import (
+    CandidateRecommendation,
     EvidenceInsight,
     LearningJob,
     LearningSuggestion,
     RejectedSuggestionSignature,
-    SuggestionEvidence,
 )
 
 
@@ -20,13 +20,6 @@ class LearningJobAdmin(admin.ModelAdmin):
     search_fields = ('org__name',)
     readonly_fields = ('created_at', 'updated_at')
     date_hierarchy = 'started_at'
-
-
-class SuggestionEvidenceInline(admin.TabularInline):
-    model = SuggestionEvidence
-    extra = 0
-    fk_name = 'suggestion'
-    autocomplete_fields = ('evidence',)
 
 
 @admin.register(EvidenceInsight)
@@ -45,6 +38,16 @@ class EvidenceInsightAdmin(admin.ModelAdmin):
     date_hierarchy = 'occurred_at'
 
 
+class CandidateRecommendationInline(admin.TabularInline):
+    model = CandidateRecommendation
+    fk_name = 'suggestion'
+    extra = 0
+    fields = ('kind', 'category', 'title', 'llm_confidence', 'outcome_signal')
+    readonly_fields = ('kind', 'category', 'title', 'llm_confidence', 'outcome_signal')
+    can_delete = False
+    show_change_link = True
+
+
 @admin.register(LearningSuggestion)
 class LearningSuggestionAdmin(admin.ModelAdmin):
     list_display = (
@@ -52,9 +55,9 @@ class LearningSuggestionAdmin(admin.ModelAdmin):
         'supporting_count', 'reviewed_by', 'reviewed_at', 'created_at',
     )
     list_filter = ('status', 'category')
-    search_fields = ('title', 'description', 'org__name')
-    readonly_fields = ('created_at', 'updated_at', 'supporting_count')
-    inlines = [SuggestionEvidenceInline]
+    search_fields = ('title', 'description', 'org__name', 'fingerprint')
+    readonly_fields = ('created_at', 'updated_at', 'supporting_count', 'fingerprint')
+    inlines = [CandidateRecommendationInline]
     actions = ['mark_approved', 'mark_rejected']
 
     @admin.action(description='Mark selected suggestions as approved')
@@ -63,14 +66,21 @@ class LearningSuggestionAdmin(admin.ModelAdmin):
 
     @admin.action(description='Mark selected suggestions as rejected')
     def mark_rejected(self, request, queryset):
+        # Note: the clustering pipeline is responsible for creating the
+        # RejectedSuggestionSignature row when it observes this transition.
         queryset.update(status=LearningSuggestion.Status.REJECTED)
 
 
-@admin.register(SuggestionEvidence)
-class SuggestionEvidenceAdmin(admin.ModelAdmin):
-    list_display = ('suggestion', 'evidence', 'similarity_score', 'created_at')
-    search_fields = ('suggestion__title',)
-    autocomplete_fields = ('suggestion', 'evidence')
+@admin.register(CandidateRecommendation)
+class CandidateRecommendationAdmin(admin.ModelAdmin):
+    list_display = (
+        'title', 'kind', 'category', 'outcome_signal',
+        'llm_confidence', 'suggestion', 'clustered_at',
+    )
+    list_filter = ('kind', 'category', 'outcome_signal', 'clustered_at')
+    search_fields = ('title', 'description', 'fingerprint')
+    autocomplete_fields = ('evidence', 'suggestion')
+    readonly_fields = ('fingerprint', 'tokens', 'clustered_at')
 
 
 @admin.register(RejectedSuggestionSignature)
