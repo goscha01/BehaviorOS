@@ -107,16 +107,31 @@ class EvidenceInsight(BaseModel):
         blank=True,
         help_text='Adapter-level metadata about the fetch itself (cursor, source URL, fetch time, etc.).',
     )
-    ai_summary = models.TextField(blank=True)
-    recommendations = models.JSONField(
-        default=list,
+    ai_summary = models.TextField(
         blank=True,
-        help_text='List of {category, change, rationale, confidence} objects from the analyzer.',
+        help_text='Short human-readable summary extracted from analysis_json.summary. '
+                  'For display only — not analyzed downstream.',
+    )
+    analysis_json = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Structured business learning from the analyzer: category, subcategory, '
+                  'customer_intent, outcome_analysis, candidate_playbook_rules, candidate_faq, '
+                  'signals, confidence. Schema versioned via analysis_prompt_version.',
+    )
+    raw_response = models.TextField(
+        blank=True,
+        help_text='Raw model output before JSON parsing. Kept so we can inspect exactly '
+                  'what the model returned when a recommendation looks wrong.',
     )
     analysis_model = models.CharField(
-        max_length=64, blank=True, help_text='Model used, e.g. "claude-haiku-4-5".'
+        max_length=64, blank=True, help_text='Model used, e.g. "claude-haiku-4-5-20251001".'
     )
-    analysis_prompt_version = models.CharField(max_length=32, blank=True)
+    analysis_prompt_version = models.CharField(
+        max_length=32, blank=True,
+        help_text='Analyzer prompt version at analysis time, e.g. "conversation:v1". '
+                  'Bump when prompt changes so we can re-queue insights.',
+    )
     analysis_cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
     analyzed_at = models.DateTimeField(
         null=True, blank=True, help_text='Null = still queued for analysis (resume queue).'

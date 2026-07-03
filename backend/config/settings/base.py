@@ -171,7 +171,7 @@ OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 # Synthesis model runs once per cluster (low volume, high-judgment model).
 # Embedding model is reserved for Phase 2 semantic clustering.
 LEARNING_ANALYSIS_MODEL = os.environ.get(
-    'LEARNING_ANALYSIS_MODEL', 'claude-haiku-4-5'
+    'LEARNING_ANALYSIS_MODEL', 'claude-haiku-4-5-20251001'
 )
 LEARNING_SYNTHESIS_MODEL = os.environ.get(
     'LEARNING_SYNTHESIS_MODEL', 'claude-opus-4-7'
@@ -210,3 +210,18 @@ CALLIO_LEARNING_URL = os.environ.get('CALLIO_LEARNING_URL', '')
 CALLIO_LEARNING_TOKEN = os.environ.get('CALLIO_LEARNING_TOKEN', '')
 SERVICEFLOW_LEARNING_URL = os.environ.get('SERVICEFLOW_LEARNING_URL', '')
 SERVICEFLOW_LEARNING_TOKEN = os.environ.get('SERVICEFLOW_LEARNING_TOKEN', '')
+
+# LLM provider credentials. When ANTHROPIC_API_KEY is unset, the learning
+# LLM client falls back to a StubProvider that returns canned structured
+# JSON — lets analyzers be developed + tested without spending tokens.
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+
+# Per-model pricing in USD per 1M tokens (input / output). BudgetTracker
+# reads this to attribute cost per analysis. Override via env-driven JSON
+# if pricing changes without a code deploy.
+# Rates below are placeholders; verify against current Anthropic pricing.
+LEARNING_MODEL_PRICING = {
+    'claude-haiku-4-5-20251001': {'input_per_mtok': 1.00, 'output_per_mtok': 5.00},
+    'claude-sonnet-4-6': {'input_per_mtok': 3.00, 'output_per_mtok': 15.00},
+    'claude-opus-4-7': {'input_per_mtok': 15.00, 'output_per_mtok': 75.00},
+}
