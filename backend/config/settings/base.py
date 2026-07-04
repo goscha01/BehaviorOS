@@ -105,8 +105,23 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
-CORS_ALLOWED_ORIGINS = [FRONTEND_URL]
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CORS_ALLOWED_ORIGINS', FRONTEND_URL).split(',')
+    if origin.strip()
+]
 CORS_ALLOW_CREDENTIALS = True
+
+# CSRF trusted origins needed for admin + any cross-origin form POST once we're
+# behind HTTPS on a different domain from the frontend. Defaults to the
+# CORS list so a single env var can drive both.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        'CSRF_TRUSTED_ORIGINS', ','.join(CORS_ALLOWED_ORIGINS)
+    ).split(',')
+    if origin.strip() and origin.strip().startswith(('http://', 'https://'))
+]
 
 # DRF
 REST_FRAMEWORK = {

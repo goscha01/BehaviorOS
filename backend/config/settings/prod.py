@@ -5,6 +5,12 @@ DEBUG = False
 SIMPLE_JWT['AUTH_COOKIE_SECURE'] = True
 SIMPLE_JWT['AUTH_COOKIE_SAMESITE'] = 'None'
 
+# Railway (and most PaaS) terminate TLS at the edge and forward as HTTP
+# with X-Forwarded-Proto=https. Without this, SECURE_SSL_REDIRECT sees
+# `request.scheme == 'http'` and infinite-redirects.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = True
+
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
