@@ -213,6 +213,62 @@ export function archiveSuggestion(id: string): Promise<TransitionResponse> {
   return apiPost<TransitionResponse>(`${BASE}/${id}/archive/`);
 }
 
+// ---- Morning brief + trends ----
+
+export interface BriefSuggestion {
+  id: string;
+  title: string;
+  category: SuggestionCategory;
+  status: SuggestionStatus;
+  confidence: string;
+  supporting_count: number;
+  created_at: string;
+}
+
+export interface BriefLastJob {
+  id: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  evidence_processed: number;
+  suggestions_created: number;
+  cost_usd: string;
+}
+
+export interface MorningBrief {
+  generated_at: string;
+  window_days: number;
+  since: string;
+  last_job: BriefLastJob | null;
+  new_suggestions_today: {
+    count: number;
+    since: string;
+    top: BriefSuggestion[];
+  };
+  category_counts: Partial<Record<SuggestionCategory, number>>;
+  trends: {
+    top_supported: BriefSuggestion[];
+    recurring_issues: BriefSuggestion[];
+    recurring_opportunities: BriefSuggestion[];
+  };
+}
+
+export interface TrendsResponse {
+  window_days: number;
+  since: string;
+  top_supported: BriefSuggestion[];
+  recurring_issues: BriefSuggestion[];
+  recurring_opportunities: BriefSuggestion[];
+}
+
+export function getMorningBrief(windowDays = 30): Promise<MorningBrief> {
+  return apiGet<MorningBrief>(`${BASE}/morning-brief/?window_days=${windowDays}`);
+}
+
+export function getTrends(windowDays = 30): Promise<TrendsResponse> {
+  return apiGet<TrendsResponse>(`${BASE}/trends/?window_days=${windowDays}`);
+}
+
 // ---------- UI helpers ----------
 
 export const STATUS_LABEL: Record<SuggestionStatus, string> = {

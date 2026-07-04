@@ -13,6 +13,9 @@ anywhere, so the contract is stable when the publisher lands.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
+from django.utils.dateparse import parse_datetime
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -32,6 +35,7 @@ from apps.learning.serializers import (
     SupportingEvidenceSerializer,
 )
 from apps.learning.services import lifecycle
+from apps.learning.services.trends import TrendsService
 
 
 class LearningSuggestionViewSet(
@@ -61,7 +65,37 @@ class LearningSuggestionViewSet(
         category = self.request.query_params.get('category')
         if category:
             qs = qs.filter(category=category)
+        created_after = self.request.query_params.get('created_after')
+        if created_after:
+            parsed = parse_datetime(created_after)
+            if parsed is not None:
+                qs = qs.filter(created_at__gte=parsed)
+        ordering = self.request.query_params.get('ordering')
+        if ordering:
+            # Whitelist to prevent injection into ORDER BY.
+            allowed = {'created_at', '-created_at', 'confidence', '-confidence',
+                       'supporting_count', '-supporting_count'}
+            if ordering in allowed:
+                qs = qs.order_by(ordering)
         return qs
+
+    @action(detail=False, methods=['get'], url_path='morning-brief')
+    def morning_brief(self, request):
+        """Compact summary of what BehaviorOS learned recently.
+
+        One request powers the /dashboard/learning homepage — avoids
+        four separate round-trips for last-job / todays-suggestions /
+        category-counts / trends.
+        """
+        window_days = _int_param(request, 'window_days', default=30, minimum=1, maximum=365)
+        brief = TrendsService(org=request.org).morning_brief(window_days=window_days)
+        return Response(asdict(brief))
+
+    @action(detail=False, methods=['get'])
+    def trends(self, request):
+        window_days = _int_param(request, 'window_days', default=30, minimum=1, maximum=365)
+        result = TrendsService(org=request.org).trends(window_days=window_days)
+        return Response(asdict(result))
 
     def _run(self, transition_fn, *args, **kwargs):
         """Run a lifecycle transition, translating TransitionError → 400."""
@@ -161,3 +195,14 @@ class LearningJobViewSet(
     permission_classes = [IsAuthenticated, IsOrgMember]
     queryset = LearningJob.objects.all()
     serializer_class = LearningJobSerializer
+
+
+def _int_param(request, name: str, *, default: int, minimum: int, maximum: int) -> int:
+    raw = request.query_params.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))

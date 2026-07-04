@@ -151,6 +151,20 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 
+# Nightly learning job — runs the full BehaviorOS pipeline for every org.
+# Time chosen for after upstream systems have settled (LeadBridge /
+# Callio / ServiceFlow finish end-of-day writes). Override in an env
+# with LEARNING_NIGHTLY_HOUR if needed.
+_learning_nightly_hour = int(os.environ.get('LEARNING_NIGHTLY_HOUR', '2'))
+_learning_nightly_minute = int(os.environ.get('LEARNING_NIGHTLY_MINUTE', '0'))
+from celery.schedules import crontab  # noqa: E402
+CELERY_BEAT_SCHEDULE = {
+    'behavioros-nightly-learning': {
+        'task': 'apps.learning.tasks.run_nightly_learning_job_for_all_orgs',
+        'schedule': crontab(hour=_learning_nightly_hour, minute=_learning_nightly_minute),
+    },
+}
+
 # Stripe
 STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
 STRIPE_PUBLISHABLE_KEY = os.environ.get('STRIPE_PUBLISHABLE_KEY', '')
