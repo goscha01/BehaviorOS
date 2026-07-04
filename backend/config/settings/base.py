@@ -245,12 +245,28 @@ SERVICEFLOW_LEARNING_TOKEN = os.environ.get('SERVICEFLOW_LEARNING_TOKEN', '')
 # JSON — lets analyzers be developed + tested without spending tokens.
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
-# Per-model pricing in USD per 1M tokens (input / output). BudgetTracker
-# reads this to attribute cost per analysis. Override via env-driven JSON
-# if pricing changes without a code deploy.
-# Rates below are placeholders; verify against current Anthropic pricing.
+# Per-model pricing in USD per 1M tokens. Cache-write is billed at ~1.25×
+# the input rate; cache-read at ~0.10×. Multipliers live on each pricing
+# row so a model with unusual cache pricing can override in one place.
+# Rates below are placeholders — verify against current Anthropic pricing
+# before the first real synthesis run in staging.
 LEARNING_MODEL_PRICING = {
-    'claude-haiku-4-5-20251001': {'input_per_mtok': 1.00, 'output_per_mtok': 5.00},
-    'claude-sonnet-4-6': {'input_per_mtok': 3.00, 'output_per_mtok': 15.00},
-    'claude-opus-4-7': {'input_per_mtok': 15.00, 'output_per_mtok': 75.00},
+    'claude-haiku-4-5-20251001': {
+        'input_per_mtok': 1.00,
+        'output_per_mtok': 5.00,
+        'cache_write_multiplier': 1.25,
+        'cache_read_multiplier': 0.10,
+    },
+    'claude-sonnet-4-6': {
+        'input_per_mtok': 3.00,
+        'output_per_mtok': 15.00,
+        'cache_write_multiplier': 1.25,
+        'cache_read_multiplier': 0.10,
+    },
+    'claude-opus-4-7': {
+        'input_per_mtok': 15.00,
+        'output_per_mtok': 75.00,
+        'cache_write_multiplier': 1.25,
+        'cache_read_multiplier': 0.10,
+    },
 }

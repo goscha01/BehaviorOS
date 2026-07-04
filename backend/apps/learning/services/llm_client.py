@@ -40,6 +40,8 @@ class LLMResult:
     parsed_json: dict
     input_tokens: int
     output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
     cost_usd: Decimal
     model_used: str
     provider: str  # 'anthropic' | 'openai' | 'stub'
@@ -91,6 +93,8 @@ class StubProvider(BaseProvider):
             parsed_json=payload,
             input_tokens=0,
             output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
             cost_usd=Decimal('0'),
             model_used=model,
             provider=self.name,
@@ -176,28 +180,66 @@ class AnthropicProvider(BaseProvider):
         raw = '{' + ''.join(text_parts)
         parsed = _try_parse_json(raw)
         usage = response.usage
-        input_tokens = getattr(usage, 'input_tokens', 0) + getattr(usage, 'cache_read_input_tokens', 0)
-        output_tokens = getattr(usage, 'output_tokens', 0)
-        cost = compute_cost(model, input_tokens, output_tokens)
+        input_tokens = getattr(usage, 'input_tokens', 0) or 0
+        output_tokens = getattr(usage, 'output_tokens', 0) or 0
+        cache_read_tokens = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        cache_write_tokens = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+        cost = compute_cost(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+        logger.info(
+            'anthropic call model=%s input=%d output=%d cache_read=%d cache_write=%d cost_usd=%s',
+            model, input_tokens, output_tokens,
+            cache_read_tokens, cache_write_tokens, cost,
+        )
         return LLMResult(
             raw_response=raw,
             parsed_json=parsed,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
             cost_usd=cost,
             model_used=model,
             provider=self.name,
         )
 
 
-def compute_cost(model: str, input_tokens: int, output_tokens: int) -> Decimal:
+def compute_cost(
+    model: str,
+    *,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> Decimal:
+    """USD cost for one Anthropic call, cache-aware.
+
+    Anthropic bills cache reads at ~10% and cache writes at ~125% of the
+    base input rate. Multipliers live in LEARNING_MODEL_PRICING per model
+    so unusual pricing can be overridden without touching this code.
+    """
     pricing = settings.LEARNING_MODEL_PRICING.get(model)
     if not pricing:
         logger.warning('No pricing configured for model %s; cost will be zero', model)
         return Decimal('0')
-    input_cost = Decimal(str(pricing['input_per_mtok'])) * Decimal(input_tokens) / Decimal(1_000_000)
-    output_cost = Decimal(str(pricing['output_per_mtok'])) * Decimal(output_tokens) / Decimal(1_000_000)
-    return (input_cost + output_cost).quantize(Decimal('0.0001'))
+
+    input_rate = Decimal(str(pricing['input_per_mtok']))
+    output_rate = Decimal(str(pricing['output_per_mtok']))
+    cache_read_mult = Decimal(str(pricing.get('cache_read_multiplier', 0.10)))
+    cache_write_mult = Decimal(str(pricing.get('cache_write_multiplier', 1.25)))
+    per_mtok = Decimal(1_000_000)
+
+    input_cost = input_rate * Decimal(input_tokens) / per_mtok
+    output_cost = output_rate * Decimal(output_tokens) / per_mtok
+    cache_read_cost = input_rate * cache_read_mult * Decimal(cache_read_tokens) / per_mtok
+    cache_write_cost = input_rate * cache_write_mult * Decimal(cache_write_tokens) / per_mtok
+    total = input_cost + output_cost + cache_read_cost + cache_write_cost
+    return total.quantize(Decimal('0.0001'))
 
 
 def _try_parse_json(raw: str) -> dict:
