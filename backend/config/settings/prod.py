@@ -12,6 +12,10 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 USE_X_FORWARDED_HOST = True
 
 SECURE_SSL_REDIRECT = True
+# Health check runs container-to-container on plain HTTP, no X-Forwarded-Proto,
+# so it would otherwise 301 and Railway would mark the deploy unhealthy.
+SECURE_REDIRECT_EXEMPT = [r'^api/health/']
+
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 SECURE_HSTS_SECONDS = 31536000
