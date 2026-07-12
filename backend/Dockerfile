@@ -23,4 +23,9 @@ EXPOSE 8000
 # migrate runs on every container start — safe because it's idempotent
 # and Phase 1 runs single-instance so there's no race. If we ever scale
 # horizontally, move this to a Railway pre-deploy command.
-CMD ["sh", "-c", "python manage.py migrate --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3 --access-logfile - --error-logfile -"]
+# NOTE: `makemigrations --noinput` runs here to bootstrap the initial DB
+# schema on the very first deploy — no app has migration files checked in
+# yet. After the first successful boot, extract migrations from the
+# container, commit them to the repo, and remove `makemigrations` from
+# this line to avoid ORM/git drift on subsequent redeploys.
+CMD ["sh", "-c", "python manage.py makemigrations --noinput && python manage.py migrate --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3 --access-logfile - --error-logfile -"]
