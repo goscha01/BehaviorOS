@@ -3,27 +3,38 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import {
+  catalogEntry,
+  INTEGRATION_CATALOG,
   listIntegrations,
   runSyncIntegration,
-  SOURCE_META,
-  sourceLabel,
   testIntegration,
   upsertIntegration,
+  type IntegrationCatalogEntry,
+  type IntegrationProvider,
   type SourceIntegration,
   type SyncStatus,
 } from "@/lib/learning";
 
 export default function IntegrationsPage() {
-  const [items, setItems] = useState<SourceIntegration[]>([]);
+  const [backendItems, setBackendItems] = useState<
+    Record<string, SourceIntegration>
+  >({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState<SourceIntegration | null>(null);
+  const [editing, setEditing] = useState<{
+    catalog: IntegrationCatalogEntry;
+    row: SourceIntegration | null;
+  } | null>(null);
 
   const refresh = () => {
     setLoading(true);
     setError("");
     listIntegrations()
-      .then(setItems)
+      .then((rows) => {
+        const map: Record<string, SourceIntegration> = {};
+        for (const r of rows) map[r.source_system] = r;
+        setBackendItems(map);
+      })
       .catch((err) =>
         setError(err instanceof Error ? err.message : "Failed to load.")
       )
@@ -32,8 +43,18 @@ export default function IntegrationsPage() {
 
   useEffect(refresh, []);
 
+  const activeSources = INTEGRATION_CATALOG.filter(
+    (e) => e.status === "available"
+  );
+  const viaCallio = INTEGRATION_CATALOG.filter(
+    (e) => e.status === "coming_soon" && e.provider === "callio"
+  );
+  const direct = INTEGRATION_CATALOG.filter(
+    (e) => e.status === "coming_soon" && e.provider === "direct"
+  );
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div>
         <Link
           href="/dashboard/learning"
@@ -44,8 +65,7 @@ export default function IntegrationsPage() {
         <h1 className="mt-1 text-2xl font-bold text-gray-900">Integrations</h1>
         <p className="mt-1 text-gray-500">
           Connect the systems BehaviorOS learns from. When a source is
-          unconfigured, its adapter falls back to bundled fixtures so the
-          pipeline still runs end-to-end.
+          unconfigured its adapter falls back to bundled fixtures.
         </p>
       </div>
 
@@ -54,21 +74,54 @@ export default function IntegrationsPage() {
       ) : error ? (
         <p className="text-sm text-rose-600">{error}</p>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2">
-          {items.map((item) => (
-            <IntegrationCard
-              key={item.source_system}
-              item={item}
-              onEdit={() => setEditing(item)}
-              onSynced={refresh}
-            />
-          ))}
-        </div>
+        <>
+          <Section
+            title="Active"
+            subtitle="These sources have live adapters. Connect a URL + token to start pulling real data; otherwise BehaviorOS uses bundled fixtures."
+          >
+            <div className="grid gap-4 md:grid-cols-2">
+              {activeSources.map((entry) => (
+                <ActiveIntegrationCard
+                  key={entry.source_system}
+                  entry={entry}
+                  row={backendItems[entry.source_system] ?? null}
+                  onEdit={(row) => setEditing({ catalog: entry, row })}
+                  onSynced={refresh}
+                />
+              ))}
+            </div>
+          </Section>
+
+          <Section
+            title="Coming soon — via Callio / Sigcore"
+            subtitle="These connect through Callio's shared communications platform. One connector at the platform layer, no duplicated OAuth or webhooks in BehaviorOS."
+            providerBadge="callio"
+          >
+            <div className="grid gap-3 md:grid-cols-3">
+              {viaCallio.map((entry) => (
+                <ComingSoonCard key={entry.source_system} entry={entry} />
+              ))}
+            </div>
+          </Section>
+
+          <Section
+            title="Coming soon — direct to BehaviorOS"
+            subtitle="Systems Callio doesn't own. BehaviorOS will run these adapters natively — CRMs, ad platforms, payment/accounting systems, and third-party dispatch tools."
+            providerBadge="direct"
+          >
+            <div className="grid gap-3 md:grid-cols-3">
+              {direct.map((entry) => (
+                <ComingSoonCard key={entry.source_system} entry={entry} />
+              ))}
+            </div>
+          </Section>
+        </>
       )}
 
       {editing && (
         <IntegrationDialog
-          integration={editing}
+          entry={editing.catalog}
+          row={editing.row}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -80,41 +133,83 @@ export default function IntegrationsPage() {
   );
 }
 
-function statusPill(status: SyncStatus, hasUrl: boolean): {
-  label: string;
-  className: string;
-} {
-  if (!hasUrl) return { label: "Not connected", className: "bg-gray-100 text-gray-700" };
-  if (status === "ok") return { label: "Connected", className: "bg-emerald-100 text-emerald-800" };
-  if (status === "error") return { label: "Error", className: "bg-rose-100 text-rose-800" };
+function Section({
+  title,
+  subtitle,
+  providerBadge,
+  children,
+}: {
+  title: string;
+  subtitle: string;
+  providerBadge?: IntegrationProvider;
+  children: React.ReactNode;
+}) {
+  return (
+    <section>
+      <div className="mb-3 flex items-center gap-2">
+        <h2 className="text-lg font-semibold text-gray-900">{title}</h2>
+        {providerBadge === "callio" && (
+          <span className="rounded-full bg-purple-100 px-2 py-0.5 text-xs font-medium text-purple-800">
+            via Callio
+          </span>
+        )}
+        {providerBadge === "direct" && (
+          <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
+            direct
+          </span>
+        )}
+      </div>
+      <p className="mb-4 text-sm text-gray-600">{subtitle}</p>
+      {children}
+    </section>
+  );
+}
+
+function statusPill(
+  status: SyncStatus,
+  hasUrl: boolean
+): { label: string; className: string } {
+  if (!hasUrl)
+    return { label: "Not connected", className: "bg-gray-100 text-gray-700" };
+  if (status === "ok")
+    return { label: "Connected", className: "bg-emerald-100 text-emerald-800" };
+  if (status === "error")
+    return { label: "Error", className: "bg-rose-100 text-rose-800" };
   return { label: "Configured", className: "bg-blue-100 text-blue-800" };
 }
 
-function IntegrationCard({
-  item,
+function ActiveIntegrationCard({
+  entry,
+  row,
   onEdit,
   onSynced,
 }: {
-  item: SourceIntegration;
-  onEdit: () => void;
+  entry: IntegrationCatalogEntry;
+  row: SourceIntegration | null;
+  onEdit: (row: SourceIntegration | null) => void;
   onSynced: () => void;
 }) {
-  const meta = SOURCE_META[item.source_system];
-  const hasUrl = !!item.url;
-  const pill = statusPill(item.last_sync_status, hasUrl);
+  const hasUrl = !!row?.url;
+  const status: SyncStatus = row?.last_sync_status ?? "never";
+  const pill = statusPill(status, hasUrl);
   const [testing, setTesting] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [banner, setBanner] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+  const [banner, setBanner] = useState<{
+    tone: "ok" | "err";
+    text: string;
+  } | null>(null);
 
   async function handleTest() {
     setTesting(true);
     setBanner(null);
     try {
-      const r = await testIntegration(item.source_system);
+      const r = await testIntegration(entry.source_system);
       if (r.ok) {
         setBanner({
           tone: "ok",
-          text: `Connection OK (HTTP ${r.http_status}${r.record_count != null ? `, ${r.record_count} records` : ""})`,
+          text: `Connection OK (HTTP ${r.http_status}${
+            r.record_count != null ? `, ${r.record_count} records` : ""
+          })`,
         });
       } else {
         setBanner({ tone: "err", text: r.detail ?? "Connection failed." });
@@ -133,7 +228,7 @@ function IntegrationCard({
     setSyncing(true);
     setBanner(null);
     try {
-      const r = await runSyncIntegration(item.source_system);
+      const r = await runSyncIntegration(entry.source_system);
       if (r.ok) {
         setBanner({
           tone: "ok",
@@ -159,7 +254,7 @@ function IntegrationCard({
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-base font-semibold text-gray-900">
-              {sourceLabel(item.source_system)}
+              {entry.label}
             </h3>
             <span
               className={`rounded-full px-2 py-0.5 text-xs font-medium ${pill.className}`}
@@ -167,9 +262,7 @@ function IntegrationCard({
               {pill.label}
             </span>
           </div>
-          {meta?.description && (
-            <p className="mt-1 text-sm text-gray-600">{meta.description}</p>
-          )}
+          <p className="mt-1 text-sm text-gray-600">{entry.description}</p>
         </div>
       </div>
 
@@ -177,28 +270,36 @@ function IntegrationCard({
         <div className="flex justify-between">
           <dt className="text-gray-500">URL</dt>
           <dd className="max-w-[60%] truncate font-mono text-xs text-gray-700">
-            {item.url || <span className="italic text-gray-400">not set — using fixture</span>}
+            {row?.url || (
+              <span className="italic text-gray-400">
+                not set — using fixture
+              </span>
+            )}
           </dd>
         </div>
         <div className="flex justify-between">
           <dt className="text-gray-500">Token</dt>
           <dd className="font-mono text-xs text-gray-700">
-            {item.token_preview || <span className="italic text-gray-400">not set</span>}
+            {row?.token_preview || (
+              <span className="italic text-gray-400">not set</span>
+            )}
           </dd>
         </div>
         <div className="flex justify-between">
           <dt className="text-gray-500">Last sync</dt>
           <dd className="text-xs text-gray-700">
-            {item.last_synced_at
-              ? `${new Date(item.last_synced_at).toLocaleString()} — ${item.last_sync_created} new / ${item.last_sync_updated} updated`
+            {row?.last_synced_at
+              ? `${new Date(row.last_synced_at).toLocaleString()} — ${
+                  row.last_sync_created
+                } new / ${row.last_sync_updated} updated`
               : "never"}
           </dd>
         </div>
       </dl>
 
-      {item.last_sync_error && (
+      {row?.last_sync_error && (
         <p className="mt-2 rounded bg-rose-50 p-2 text-xs text-rose-800">
-          {item.last_sync_error}
+          {row.last_sync_error}
         </p>
       )}
 
@@ -217,7 +318,7 @@ function IntegrationCard({
       <div className="mt-4 flex flex-wrap gap-2">
         <button
           type="button"
-          onClick={onEdit}
+          onClick={() => onEdit(row)}
           className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50"
         >
           {hasUrl ? "Edit" : "Connect"}
@@ -243,18 +344,43 @@ function IntegrationCard({
   );
 }
 
+function ComingSoonCard({ entry }: { entry: IntegrationCatalogEntry }) {
+  return (
+    <div className="rounded-lg border border-dashed border-gray-300 bg-gray-50 p-4">
+      <div className="flex items-start justify-between gap-2">
+        <h3 className="text-sm font-semibold text-gray-800">{entry.label}</h3>
+        <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+          Coming soon
+        </span>
+      </div>
+      <p className="mt-1 text-xs text-gray-600 line-clamp-3">
+        {entry.description}
+      </p>
+      <button
+        type="button"
+        disabled
+        className="mt-3 w-full cursor-not-allowed rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-400"
+      >
+        Connect
+      </button>
+    </div>
+  );
+}
+
 function IntegrationDialog({
-  integration,
+  entry,
+  row,
   onClose,
   onSaved,
 }: {
-  integration: SourceIntegration;
+  entry: IntegrationCatalogEntry;
+  row: SourceIntegration | null;
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [url, setUrl] = useState(integration.url ?? "");
+  const [url, setUrl] = useState(row?.url ?? "");
   const [token, setToken] = useState("");
-  const [isActive, setIsActive] = useState(integration.is_active);
+  const [isActive, setIsActive] = useState(row?.is_active ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -264,9 +390,8 @@ function IntegrationDialog({
     setError("");
     try {
       await upsertIntegration({
-        source_system: integration.source_system,
+        source_system: entry.source_system,
         url: url.trim(),
-        // Blank token = keep existing (backend contract).
         ...(token.trim() ? { token: token.trim() } : {}),
         is_active: isActive,
       });
@@ -285,7 +410,7 @@ function IntegrationDialog({
         className="w-full max-w-lg rounded-lg bg-white p-6 shadow-xl"
       >
         <h2 className="text-lg font-semibold text-gray-900">
-          Configure {sourceLabel(integration.source_system)}
+          Configure {entry.label}
         </h2>
         <p className="mt-1 text-sm text-gray-600">
           BehaviorOS will GET the URL with{" "}
@@ -300,16 +425,16 @@ function IntegrationDialog({
           type="url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://leadbridge.example.com/api/v1/conversations"
+          placeholder={`https://${entry.source_system}.example.com/api/v1/evidence`}
           className="mt-1 w-full rounded-md border border-gray-300 p-2 text-sm focus:border-indigo-500 focus:outline-none"
           required
         />
 
         <label className="mt-4 block text-sm font-medium text-gray-700">
           Service token{" "}
-          {integration.token_preview && (
+          {row?.token_preview && (
             <span className="ml-2 text-xs text-gray-500">
-              current: {integration.token_preview} — leave blank to keep
+              current: {row.token_preview} — leave blank to keep
             </span>
           )}
         </label>
@@ -318,7 +443,7 @@ function IntegrationDialog({
           value={token}
           onChange={(e) => setToken(e.target.value)}
           placeholder={
-            integration.token_preview
+            row?.token_preview
               ? "Leave blank to keep the existing token"
               : "Bearer token"
           }

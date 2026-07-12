@@ -325,34 +325,193 @@ export function runSyncIntegration(sourceSystem: string): Promise<RunSyncRespons
   return apiPost<RunSyncResponse>(`${INTEGRATIONS_BASE}/${sourceSystem}/run-sync/`);
 }
 
-// Labels + copy for the three canonical Phase 1 sources.
-export const SOURCE_META: Record<
-  string,
-  { label: string; description: string; docs_url: string }
-> = {
-  leadbridge: {
+// ---- Integration catalog ----
+//
+// Roadmap of every source BehaviorOS will consume evidence from. The
+// active entries have real adapters (matching the /api/learning/integrations/
+// backend list). The coming-soon entries render as disabled cards so the
+// full map is visible from day one — architecturally split by whether the
+// data flows through the Callio/Sigcore communications platform or comes
+// direct to BehaviorOS.
+
+export type IntegrationStatus = "available" | "coming_soon";
+
+// Provider path — matters for how the connection is wired later:
+// - "callio" sources register once against Callio/Sigcore's shared
+//   provider API; BehaviorOS just subscribes to the normalized stream.
+// - "direct" sources talk to BehaviorOS's own adapter (no Callio in the path).
+export type IntegrationProvider = "active" | "callio" | "direct";
+
+export interface IntegrationCatalogEntry {
+  source_system: string;
+  label: string;
+  description: string;
+  status: IntegrationStatus;
+  provider: IntegrationProvider;
+}
+
+export const INTEGRATION_CATALOG: IntegrationCatalogEntry[] = [
+  // --- Active adapters (Phase 1 canonical three) ---
+  {
+    source_system: "leadbridge",
     label: "LeadBridge",
     description:
       "Chat conversations from Thumbtack and Yelp with AI Playbook version + outcome.",
-    docs_url: "https://github.com/goscha01/LeadBridge",
+    status: "available",
+    provider: "active",
   },
-  callio: {
+  {
+    source_system: "callio",
     label: "Callio",
     description:
       "Voice call transcripts with speaker labels and captured lead.",
-    docs_url: "",
+    status: "available",
+    provider: "active",
   },
-  serviceflow: {
+  {
+    source_system: "serviceflow",
     label: "ServiceFlow",
     description:
       "Booking lifecycle events — booked, cancelled, completed, recurring, revenue.",
-    docs_url: "",
+    status: "available",
+    provider: "active",
   },
-};
+
+  // --- Coming soon via Callio/Sigcore (shared communications backbone) ---
+  {
+    source_system: "quo",
+    label: "Quo",
+    description:
+      "Multi-channel messaging. Connects through Callio — no duplicated OAuth or webhooks.",
+    status: "coming_soon",
+    provider: "callio",
+  },
+  {
+    source_system: "whatsapp",
+    label: "WhatsApp",
+    description: "Customer chats via Callio's WhatsApp channel.",
+    status: "coming_soon",
+    provider: "callio",
+  },
+  {
+    source_system: "telegram",
+    label: "Telegram",
+    description: "Customer chats via Callio's Telegram channel.",
+    status: "coming_soon",
+    provider: "callio",
+  },
+  {
+    source_system: "sms",
+    label: "SMS",
+    description: "Two-way SMS threads via Callio.",
+    status: "coming_soon",
+    provider: "callio",
+  },
+  {
+    source_system: "messenger",
+    label: "Messenger",
+    description: "Facebook Messenger conversations via Callio.",
+    status: "coming_soon",
+    provider: "callio",
+  },
+  {
+    source_system: "email",
+    label: "Email",
+    description: "Inbound + outbound email threads via Callio.",
+    status: "coming_soon",
+    provider: "callio",
+  },
+
+  // --- Coming soon direct-to-BehaviorOS (not owned by Callio) ---
+  {
+    source_system: "bookingkoala",
+    label: "BookingKoala",
+    description: "Booking lifecycle + reviews from BookingKoala.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "jobber",
+    label: "Jobber",
+    description: "Jobs, invoices, and client history from Jobber.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "housecallpro",
+    label: "Housecall Pro",
+    description: "Estimates, jobs, and customer notes from Housecall Pro.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "servicetitan",
+    label: "ServiceTitan",
+    description: "Enterprise jobs, quotes, and technicians from ServiceTitan.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "google_ads",
+    label: "Google Ads",
+    description: "Campaign spend + conversions from Google Ads.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "google_business_profile",
+    label: "Google Business Profile",
+    description: "Reviews, Q&A, and messages from GBP.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "facebook_ads",
+    label: "Facebook Ads",
+    description: "Campaign spend + lead-form submissions from Facebook Ads.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "stripe",
+    label: "Stripe",
+    description: "Payments, refunds, and churn signals from Stripe.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "quickbooks",
+    label: "QuickBooks",
+    description: "Invoices and payment history from QuickBooks.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+  {
+    source_system: "generic_crm",
+    label: "Generic CRM",
+    description: "Custom CRM webhook — for CRMs BehaviorOS doesn't have a first-class adapter for yet.",
+    status: "coming_soon",
+    provider: "direct",
+  },
+];
+
+export function catalogEntry(sourceSystem: string): IntegrationCatalogEntry | undefined {
+  return INTEGRATION_CATALOG.find((e) => e.source_system === sourceSystem);
+}
 
 export function sourceLabel(sourceSystem: string): string {
-  return SOURCE_META[sourceSystem]?.label ?? sourceSystem;
+  return catalogEntry(sourceSystem)?.label ?? sourceSystem;
 }
+
+// Legacy alias for the old three-source metadata map (kept for any callers
+// that haven't been updated to catalogEntry() yet).
+export const SOURCE_META: Record<string, { label: string; description: string }> =
+  Object.fromEntries(
+    INTEGRATION_CATALOG.filter((e) => e.status === "available").map((e) => [
+      e.source_system,
+      { label: e.label, description: e.description },
+    ])
+  );
 
 
 // ---------- UI helpers ----------
