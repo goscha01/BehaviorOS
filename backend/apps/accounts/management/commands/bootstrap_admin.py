@@ -53,20 +53,17 @@ class Command(BaseCommand):
             user=user, org=org, defaults={'role': Membership.Role.OWNER}
         )
 
+        # accounts.signals auto-creates an "{username}'s Organization" on user creation.
+        # For the single-tenant Phase 1 admin, that personal org is empty and misleads
+        # the middleware (which picks the first membership). Prune anything that
+        # isn't our canonical org so the user has exactly one membership.
+        pruned = Membership.objects.filter(user=user).exclude(org=org).delete()
+        Organization.objects.exclude(pk=org.pk).filter(memberships__isnull=True).delete()
+
         self.stdout.write(self.style.SUCCESS(
             f'bootstrap_admin: user={username} ({"created" if user_created else "updated"}) '
             f'org={org_name} ({"created" if org_created else "exists"}) '
             f'membership={"created" if mem_created else "exists"}'
         ))
 
-        # Diagnostic — dump all orgs + this user's memberships + suggestion counts.
-        from apps.learning.models import LearningSuggestion, LearningJob
-        self.stdout.write('--- DIAG ---')
-        for o in Organization.objects.all():
-            n_sugg = LearningSuggestion.objects.filter(org=o).count()
-            n_jobs = LearningJob.objects.filter(org=o).count()
-            self.stdout.write(f'  org id={o.id} name={o.name!r} suggestions={n_sugg} jobs={n_jobs}')
-        for m in Membership.objects.filter(user=user).select_related('org'):
-            self.stdout.write(f'  membership user={user.username} → org id={m.org.id} name={m.org.name!r} role={m.role}')
-        self.stdout.write(f'  bootstrap_admin used org id={org.id}')
-        self.stdout.write('--- /DIAG ---')
+        self.stdout.write(f'  pruned={pruned[0]} stray memberships/orgs')
