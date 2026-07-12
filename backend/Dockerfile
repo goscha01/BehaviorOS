@@ -28,4 +28,4 @@ EXPOSE 8000
 # yet. After the first successful boot, extract migrations from the
 # container, commit them to the repo, and remove `makemigrations` from
 # this line to avoid ORM/git drift on subsequent redeploys.
-CMD ["sh", "-c", "python manage.py makemigrations --noinput && python manage.py migrate --noinput && python manage.py bootstrap_admin && (if [ \"$RUN_SEED\" = \"1\" ]; then python manage.py seed_learning || true; fi) && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3 --access-logfile - --error-logfile -"]
+CMD ["sh", "-c", "python manage.py makemigrations --noinput && python manage.py migrate --noinput && python manage.py ensure_schema && python manage.py bootstrap_admin && (if [ \"$RUN_SEED\" = \"1\" ]; then python manage.py seed_learning || true; fi) && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3 --access-logfile - --error-logfile -"]
