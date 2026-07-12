@@ -58,3 +58,15 @@ class Command(BaseCommand):
             f'org={org_name} ({"created" if org_created else "exists"}) '
             f'membership={"created" if mem_created else "exists"}'
         ))
+
+        # Diagnostic — dump all orgs + this user's memberships + suggestion counts.
+        from apps.learning.models import LearningSuggestion, LearningJob
+        self.stdout.write('--- DIAG ---')
+        for o in Organization.objects.all():
+            n_sugg = LearningSuggestion.objects.filter(org=o).count()
+            n_jobs = LearningJob.objects.filter(org=o).count()
+            self.stdout.write(f'  org id={o.id} name={o.name!r} suggestions={n_sugg} jobs={n_jobs}')
+        for m in Membership.objects.filter(user=user).select_related('org'):
+            self.stdout.write(f'  membership user={user.username} → org id={m.org.id} name={m.org.name!r} role={m.role}')
+        self.stdout.write(f'  bootstrap_admin used org id={org.id}')
+        self.stdout.write('--- /DIAG ---')
