@@ -58,12 +58,20 @@ export default function LearningMorningBriefPage() {
           </h1>
           <p className="mt-1 text-gray-500">{lastJobLine}</p>
         </div>
-        <Link
-          href="/dashboard/learning/queue"
-          className="shrink-0 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
-        >
-          Open review queue →
-        </Link>
+        <div className="flex shrink-0 gap-2">
+          <Link
+            href="/dashboard/integrations"
+            className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+          >
+            Integrations
+          </Link>
+          <Link
+            href="/dashboard/learning/queue"
+            className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+          >
+            Open review queue →
+          </Link>
+        </div>
       </div>
 
       {/* Today's suggestions */}

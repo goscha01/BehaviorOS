@@ -75,7 +75,7 @@ class EvidenceIngestionService:
     ) -> SourceResult:
         result = SourceResult(source_system=adapter.source_system)
         try:
-            evidences: Iterable[Evidence] = adapter.fetch_since(since)
+            evidences: Iterable[Evidence] = adapter.fetch_since(since, org=self.org)
             for evidence in evidences:
                 created = self._upsert(evidence)
                 if created:

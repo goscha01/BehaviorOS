@@ -6,7 +6,24 @@ from apps.learning.models import (
     LearningJob,
     LearningSuggestion,
     RejectedSuggestionSignature,
+    SourceIntegration,
 )
+
+
+@admin.register(SourceIntegration)
+class SourceIntegrationAdmin(admin.ModelAdmin):
+    list_display = (
+        'source_system', 'org', 'is_active',
+        'last_sync_status', 'last_synced_at',
+        'last_sync_created', 'last_sync_updated',
+    )
+    list_filter = ('source_system', 'is_active', 'last_sync_status')
+    search_fields = ('source_system', 'org__name')
+    readonly_fields = (
+        'last_synced_at', 'last_sync_status', 'last_sync_error',
+        'last_sync_created', 'last_sync_updated',
+        'created_at', 'updated_at',
+    )
 
 
 @admin.register(LearningJob)

@@ -26,6 +26,7 @@ from apps.learning.models import (
     EvidenceInsight,
     LearningJob,
     LearningSuggestion,
+    SourceIntegration,
 )
 
 
@@ -186,3 +187,45 @@ class MarkMeasuredSerializer(serializers.Serializer):
         help_text='Before/after metrics, e.g. '
                   '{"win_rate_before": 0.42, "win_rate_after": 0.51, "sample_size": 320}.',
     )
+
+
+class SourceIntegrationSerializer(serializers.ModelSerializer):
+    token_preview = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SourceIntegration
+        fields = (
+            'id', 'source_system', 'url',
+            # token itself is write-only; we surface only a preview on read.
+            'token_preview',
+            'is_active',
+            'last_synced_at', 'last_sync_status', 'last_sync_error',
+            'last_sync_created', 'last_sync_updated',
+            'created_at', 'updated_at',
+        )
+        read_only_fields = (
+            'id', 'token_preview',
+            'last_synced_at', 'last_sync_status', 'last_sync_error',
+            'last_sync_created', 'last_sync_updated',
+            'created_at', 'updated_at',
+        )
+
+    def get_token_preview(self, obj: SourceIntegration) -> str:
+        if not obj.token:
+            return ''
+        # Only expose the last 4 chars so the UI can confirm which token is
+        # active without leaking the whole secret over the read path.
+        return f'••••{obj.token[-4:]}'
+
+
+class SourceIntegrationUpsertSerializer(serializers.Serializer):
+    """Write-side serializer. Accepts a token; never echoes it back."""
+    source_system = serializers.CharField(max_length=64)
+    url = serializers.CharField(
+        max_length=500, allow_blank=True, required=False, default='',
+    )
+    token = serializers.CharField(
+        max_length=512, allow_blank=True, required=False, default='',
+        # Blank on update = keep existing token.
+    )
+    is_active = serializers.BooleanField(required=False, default=True)

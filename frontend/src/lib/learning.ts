@@ -269,6 +269,92 @@ export function getTrends(windowDays = 30): Promise<TrendsResponse> {
   return apiGet<TrendsResponse>(`${BASE}/trends/?window_days=${windowDays}`);
 }
 
+// ---- Integrations ----
+
+export type SyncStatus = "never" | "ok" | "error";
+
+export interface SourceIntegration {
+  id: string | null;
+  source_system: string;
+  url: string;
+  token_preview: string;
+  is_active: boolean;
+  last_synced_at: string | null;
+  last_sync_status: SyncStatus;
+  last_sync_error: string;
+  last_sync_created: number;
+  last_sync_updated: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TestConnectionResponse {
+  ok: boolean;
+  http_status?: number;
+  record_count?: number | null;
+  detail?: string;
+}
+
+export interface RunSyncResponse {
+  ok: boolean;
+  created: number;
+  updated: number;
+  error: string;
+}
+
+const INTEGRATIONS_BASE = "/api/learning/integrations";
+
+export function listIntegrations(): Promise<SourceIntegration[]> {
+  return apiGet<SourceIntegration[]>(`${INTEGRATIONS_BASE}/`);
+}
+
+export function upsertIntegration(body: {
+  source_system: string;
+  url: string;
+  token?: string;
+  is_active?: boolean;
+}): Promise<SourceIntegration> {
+  return apiPost<SourceIntegration>(`${INTEGRATIONS_BASE}/`, body);
+}
+
+export function testIntegration(sourceSystem: string): Promise<TestConnectionResponse> {
+  return apiPost<TestConnectionResponse>(`${INTEGRATIONS_BASE}/${sourceSystem}/test/`);
+}
+
+export function runSyncIntegration(sourceSystem: string): Promise<RunSyncResponse> {
+  return apiPost<RunSyncResponse>(`${INTEGRATIONS_BASE}/${sourceSystem}/run-sync/`);
+}
+
+// Labels + copy for the three canonical Phase 1 sources.
+export const SOURCE_META: Record<
+  string,
+  { label: string; description: string; docs_url: string }
+> = {
+  leadbridge: {
+    label: "LeadBridge",
+    description:
+      "Chat conversations from Thumbtack and Yelp with AI Playbook version + outcome.",
+    docs_url: "https://github.com/goscha01/LeadBridge",
+  },
+  callio: {
+    label: "Callio",
+    description:
+      "Voice call transcripts with speaker labels and captured lead.",
+    docs_url: "",
+  },
+  serviceflow: {
+    label: "ServiceFlow",
+    description:
+      "Booking lifecycle events — booked, cancelled, completed, recurring, revenue.",
+    docs_url: "",
+  },
+};
+
+export function sourceLabel(sourceSystem: string): string {
+  return SOURCE_META[sourceSystem]?.label ?? sourceSystem;
+}
+
+
 // ---------- UI helpers ----------
 
 export const STATUS_LABEL: Record<SuggestionStatus, string> = {

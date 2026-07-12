@@ -4,6 +4,57 @@ from django.db import models
 from apps.common.models import BaseModel
 
 
+class SourceIntegration(BaseModel):
+    """Per-org credentials + status for one evidence source system.
+
+    When an adapter runs, it looks for an active SourceIntegration row
+    for its `source_system` key first, then falls back to settings, then
+    to bundled fixtures. This lets an operator wire real endpoints from
+    the dashboard without a code deploy.
+    """
+
+    class SyncStatus(models.TextChoices):
+        NEVER = 'never', 'Never synced'
+        OK = 'ok', 'OK'
+        ERROR = 'error', 'Error'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE, related_name='source_integrations'
+    )
+    source_system = models.CharField(
+        max_length=64,
+        help_text='Adapter key: leadbridge / callio / serviceflow / ...',
+    )
+    url = models.CharField(
+        max_length=500, blank=True,
+        help_text='HTTPS endpoint the adapter GETs from.',
+    )
+    token = models.CharField(
+        max_length=512, blank=True,
+        help_text='Bearer token sent in Authorization header. Plain text in Phase 1; '
+                  'move to a secret manager once we ship real integrations.',
+    )
+    is_active = models.BooleanField(default=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    last_sync_status = models.CharField(
+        max_length=20, choices=SyncStatus.choices, default=SyncStatus.NEVER,
+    )
+    last_sync_error = models.TextField(blank=True)
+    last_sync_created = models.PositiveIntegerField(default=0)
+    last_sync_updated = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['org', 'source_system'],
+                name='learning_source_integration_unique',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.source_system} ({self.org})'
+
+
 class LearningJob(BaseModel):
     class Status(models.TextChoices):
         PENDING = 'pending', 'Pending'

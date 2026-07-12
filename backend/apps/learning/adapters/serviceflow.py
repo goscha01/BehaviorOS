@@ -5,11 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Iterable
 
-from django.conf import settings
 from django.utils.dateparse import parse_datetime
 
 from apps.learning.adapters._http import http_fetch_list, load_fixture
-from apps.learning.adapters.base import EvidenceSourceAdapter, register
+from apps.learning.adapters.base import EvidenceSourceAdapter, register, resolve_credentials
 from apps.learning.adapters.dto import Evidence
 
 
@@ -18,12 +17,11 @@ class ServiceFlowAdapter(EvidenceSourceAdapter):
     source_system = 'serviceflow'
     fixture_filename = 'serviceflow_sample.json'
 
-    def fetch_since(self, since: datetime | None) -> Iterable[Evidence]:
-        url = getattr(settings, 'SERVICEFLOW_LEARNING_URL', '')
-        token = getattr(settings, 'SERVICEFLOW_LEARNING_TOKEN', '')
-        if url and token:
-            records = http_fetch_list(url, token, since)
-            source_url = url
+    def fetch_since(self, since: datetime | None, *, org=None) -> Iterable[Evidence]:
+        creds = resolve_credentials(self.source_system, org=org)
+        if creds.source in ('integration', 'settings'):
+            records = http_fetch_list(creds.url, creds.token, since)
+            source_url = creds.url
         else:
             records = load_fixture(self.fixture_filename)
             source_url = f'fixture://{self.fixture_filename}'
