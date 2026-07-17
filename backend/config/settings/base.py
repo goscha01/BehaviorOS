@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     'apps.billing',
     'apps.training',
     'apps.learning',
+    'apps.context',
 ]
 
 MIDDLEWARE = [
@@ -239,6 +240,25 @@ CALLIO_LEARNING_URL = os.environ.get('CALLIO_LEARNING_URL', '')
 CALLIO_LEARNING_TOKEN = os.environ.get('CALLIO_LEARNING_TOKEN', '')
 SERVICEFLOW_LEARNING_URL = os.environ.get('SERVICEFLOW_LEARNING_URL', '')
 SERVICEFLOW_LEARNING_TOKEN = os.environ.get('SERVICEFLOW_LEARNING_TOKEN', '')
+
+# BehaviorOS Context Provider (Phase 1)
+# Shadow mode is DEFAULT ON — the /v1/context endpoint still runs and logs
+# every request, but responds `{"status": "no_context"}` regardless of what
+# the providers found. That keeps the LeadBridge / Callio prompt byte-for-byte
+# identical to today's implementation while we compare provider quality
+# against real traffic. Flip to True per environment when you're ready to
+# start actually feeding runtimes.
+BEHAVIOR_CONTEXT_ENABLED = os.environ.get(
+    'BEHAVIOR_CONTEXT_ENABLED', 'false'
+).lower() in ('1', 'true', 'yes', 'on')
+
+# Shared bearer token that LeadBridge / Callio present in the
+# `Authorization: Bearer ...` header when calling POST /v1/context. When
+# empty, the endpoint accepts anonymous calls (dev-friendly). Always set
+# in staging/prod so runtimes can't accidentally hit the wrong environment.
+BEHAVIOR_CONTEXT_SERVICE_TOKEN = os.environ.get(
+    'BEHAVIOR_CONTEXT_SERVICE_TOKEN', ''
+)
 
 # LLM provider credentials. When ANTHROPIC_API_KEY is unset, the learning
 # LLM client falls back to a StubProvider that returns canned structured
