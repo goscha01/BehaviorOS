@@ -176,6 +176,14 @@ class EvidenceEvent(BaseModel):
         help_text='Full request body (runtime) or record body (historical). '
                   'Anything the sender wanted us to know.',
     )
+    promoted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Timestamp at which this event was promoted into an '
+                  '`apps.learning.EvidenceInsight` row. Null means the '
+                  'event is still on the promotion queue. Same '
+                  '"resume via null timestamp" pattern used for the '
+                  'analysis + clustering resume queues.',
+    )
 
     class Meta:
         ordering = ['-occurred_at']
@@ -192,6 +200,13 @@ class EvidenceEvent(BaseModel):
             models.Index(fields=['org', 'customer_id', '-occurred_at']),
             models.Index(fields=['org', 'runtime', '-occurred_at']),
             models.Index(fields=['org', 'source_kind', '-occurred_at']),
+            # Fast lookup for the promotion queue: unpromoted runtime events
+            # for a given org, oldest-first. Matches the query pattern in
+            # apps.learning.services.promotion.
+            models.Index(
+                fields=['org', 'promoted_at', 'occurred_at'],
+                name='ctx_event_promo_queue_idx',
+            ),
             models.Index(fields=['conversation_id']),
         ]
 
