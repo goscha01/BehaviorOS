@@ -195,24 +195,57 @@ def promote_evidence_events(
 ) -> PromotionResult:
     """Promote pending EvidenceEvents for an org into EvidenceInsights.
 
-    Idempotent — safe to run repeatedly. Only PENDING runtime events are
-    scanned (other statuses are terminal). Every scanned event reaches a
-    terminal state within the call.
+    Idempotent — safe to run repeatedly. Only PENDING events are scanned
+    (other statuses are terminal). Every scanned event reaches a terminal
+    state within the call.
+
+    **Concurrency**: uses `SELECT ... FOR UPDATE SKIP LOCKED` on the
+    initial batch claim so multiple Celery workers running the same task
+    in parallel never claim the same event. Whichever worker claims a
+    row holds the lock until the outer transaction commits — a crashed
+    worker's rows automatically revert to PENDING on rollback.
+
+    The entire per-org batch runs in one transaction so a worker crash
+    mid-batch leaves the queue in a clean state (rollback restores
+    every claimed event to PENDING). Nested `atomic()` savepoints
+    isolate per-event ingest failures so one bad event doesn't taint
+    siblings.
     """
     result = PromotionResult()
     ingest = EvidenceIngestionService(org=org, job=job)
 
-    qs = EvidenceEvent.objects.filter(
-        org=org,
-        promotion_status=EvidenceEvent.PromotionStatus.PENDING,
-    ).order_by('occurred_at')
-    if since is not None:
-        qs = qs.filter(occurred_at__gte=since)
-    if limit is not None:
-        qs = qs[:limit]
+    # Hard ceiling in case caller passed no limit — protects against
+    # worker starvation on a runaway backlog. Beat cadence + eligibility
+    # filtering should keep real batches well under this.
+    max_events = limit if limit is not None else 10_000
 
-    events = list(qs)  # snapshot before we start mutating status
+    with transaction.atomic():
+        qs = (
+            EvidenceEvent.objects
+            .select_for_update(skip_locked=True)
+            .filter(
+                org=org,
+                promotion_status=EvidenceEvent.PromotionStatus.PENDING,
+            )
+            .order_by('occurred_at')
+        )
+        if since is not None:
+            qs = qs.filter(occurred_at__gte=since)
+        events = list(qs[:max_events])
 
+        # Process INSIDE the transaction so row locks stay held for the
+        # duration of each event's processing. A worker crash rolls back
+        # the whole batch (rows revert to PENDING), keeping the queue
+        # consistent.
+        _process_batch(events, ingest, result)
+
+    _emit_run_summary(org, result)
+    return result
+
+
+def _process_batch(events, ingest, result):
+    """Process a claimed batch. Called INSIDE the SKIP LOCKED transaction
+    of `promote_evidence_events` — do not invoke from anywhere else."""
     for event in events:
         result.scanned += 1
         eligibility: EligibilityResult = evaluate_eligibility(event)
@@ -272,9 +305,11 @@ def promote_evidence_events(
         else:
             result.updated += 1
 
-    # ONE structured summary log per run — Grafana "outcome distribution"
-    # panel keys off this line's fields. Order + spelling of keys is a
-    # dashboard contract; do not rename without updating the panel.
+
+def _emit_run_summary(org, result) -> None:
+    """ONE structured summary log per run — Grafana "outcome distribution"
+    panel keys off this line's fields. Order + spelling of keys is a
+    dashboard contract; do not rename without updating the panel."""
     logger.info(
         'promotion.run org=%s '
         'promotion_attempts_total=%d '
@@ -289,4 +324,3 @@ def promote_evidence_events(
         result.failed,
         dict(result.skipped_by_reason),
     )
-    return result
