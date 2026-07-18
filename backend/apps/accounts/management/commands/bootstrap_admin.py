@@ -58,7 +58,17 @@ class Command(BaseCommand):
         # the middleware (which picks the first membership). Prune anything that
         # isn't our canonical org so the user has exactly one membership.
         pruned = Membership.objects.filter(user=user).exclude(org=org).delete()
-        Organization.objects.exclude(pk=org.pk).filter(memberships__isnull=True).delete()
+        # Only sweep the auto-created personal-org pattern. Any real tenant
+        # provisioned via admin / API / management command has a bespoke name
+        # ("Spotless Homes", "Acme HVAC", …) and MUST survive redeploys even
+        # if its first membership hasn't been attached yet — otherwise the
+        # bootstrap wipes real customer state on every container boot.
+        # See incident 2026-07-18: Spotless Homes org was silently deleted
+        # by this sweep during a routine env-var redeploy.
+        Organization.objects.exclude(pk=org.pk) \
+            .filter(memberships__isnull=True) \
+            .filter(name__endswith="'s Organization") \
+            .delete()
 
         self.stdout.write(self.style.SUCCESS(
             f'bootstrap_admin: user={username} ({"created" if user_created else "updated"}) '
