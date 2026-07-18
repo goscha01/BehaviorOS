@@ -178,11 +178,49 @@ class EvidenceEvent(BaseModel):
     )
     promoted_at = models.DateTimeField(
         null=True, blank=True,
-        help_text='Timestamp at which this event was promoted into an '
-                  '`apps.learning.EvidenceInsight` row. Null means the '
-                  'event is still on the promotion queue. Same '
-                  '"resume via null timestamp" pattern used for the '
-                  'analysis + clustering resume queues.',
+        help_text='Timestamp at which this event was SUCCESSFULLY promoted '
+                  'into an `apps.learning.EvidenceInsight` row. Only set when '
+                  'promotion_status=PROMOTED. Null otherwise (pending, skipped, '
+                  'or failed).',
+    )
+
+    class PromotionStatus(models.TextChoices):
+        # Never evaluated by the eligibility gate. All EvidenceEvents start here.
+        PENDING = 'pending', 'Pending eligibility check'
+        # Evaluator said eligible AND ingestion into EvidenceInsight succeeded.
+        PROMOTED = 'promoted', 'Promoted into EvidenceInsight'
+        # Evaluator said skip — see promotion_reason for the specific category.
+        # Skipped events are RETAINED (still useful operational evidence) but
+        # do NOT enter the learning corpus. Terminal state.
+        SKIPPED = 'skipped', 'Skipped per eligibility rules'
+        # Evaluator said eligible but ingestion / persistence raised.
+        # promotion_reason carries the exception summary. Retryable — the
+        # promoter may reset to PENDING once the root cause is fixed.
+        FAILED = 'failed', 'Ingestion failure — retryable'
+
+    promotion_status = models.CharField(
+        max_length=16,
+        choices=PromotionStatus.choices,
+        default=PromotionStatus.PENDING,
+        help_text='Terminal state of the promotion pipeline for this event. '
+                  'Every event reaches a non-PENDING state after the eligibility '
+                  'evaluator runs — no event stays perpetually unprocessed.',
+    )
+    promotion_reason = models.CharField(
+        max_length=64,
+        blank=True,
+        default='',
+        help_text='Detail on the promotion decision. For SKIPPED: one of '
+                  '"skip_diagnostic" | "skip_incomplete" | "skip_synthetic" | '
+                  '"skip_duplicate" | "skip_unsupported". For FAILED: '
+                  '"failed:<ExceptionName>". Empty for PENDING / PROMOTED.',
+    )
+    promotion_checked_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When the eligibility evaluator last ran against this event. '
+                  'Separate from promoted_at (only success time) so operators '
+                  'can tell "we looked at this and rejected it" from "we never '
+                  'looked at it yet".',
     )
 
     class Meta:
@@ -206,6 +244,14 @@ class EvidenceEvent(BaseModel):
             models.Index(
                 fields=['org', 'promoted_at', 'occurred_at'],
                 name='ctx_event_promo_queue_idx',
+            ),
+            # Fast queue query for pending-status events + fast filtered
+            # aggregation of skip-reason distribution. Reason lives on the
+            # tail so the (org, status) prefix is still selective when
+            # counting reasons irrespective of order.
+            models.Index(
+                fields=['org', 'promotion_status', 'promotion_reason'],
+                name='ctx_event_promo_status_idx',
             ),
             models.Index(fields=['conversation_id']),
         ]

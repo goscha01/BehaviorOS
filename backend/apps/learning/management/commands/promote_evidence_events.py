@@ -60,11 +60,17 @@ class Command(BaseCommand):
         exit_code = 0
         for org in orgs:
             result: PromotionResult = promote_evidence_events(org=org, limit=limit)
+            skip_summary = (
+                ' '.join(f'{k}={v}' for k, v in sorted(result.skipped_by_reason.items()))
+                or '(none)'
+            )
             self.stdout.write(
                 f'org={org.id} name={org.name!r} '
                 f'scanned={result.scanned} '
-                f'created={result.created} updated={result.updated} '
-                f'failed={result.failed}'
+                f'promoted={result.promoted} '
+                f'skipped={result.skipped} '
+                f'failed={result.failed} '
+                f'skips={skip_summary}'
             )
             for err in result.errors:
                 self.stderr.write(f'  ! {err}')
