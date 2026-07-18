@@ -167,19 +167,56 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 
-# Nightly learning job — runs the full BehaviorOS pipeline for every org.
-# Time chosen for after upstream systems have settled (LeadBridge /
-# Callio / ServiceFlow finish end-of-day writes). Override in an env
-# with LEARNING_NIGHTLY_HOUR if needed.
+# Beat cadence — each task gated behind an ENABLED flag so ops can bring
+# schedules online one at a time. This staged approach is a lesson from
+# Phase 2A rollout: the smallest possible schedule during first-cycle
+# observation makes any anomaly trivial to isolate.
+#
+# All intervals are configurable so testing (e.g. "promote every minute
+# for 10 minutes to seed the pipeline") is env-var only, no code change.
+from celery.schedules import crontab  # noqa: E402
+
+_PROMOTION_ENABLED = os.environ.get('BEAT_PROMOTION_ENABLED', 'false').lower() in ('true', '1', 'yes')
+_ANALYZER_ENABLED = os.environ.get('BEAT_ANALYZER_ENABLED', 'false').lower() in ('true', '1', 'yes')
+_AGGREGATE_ENABLED = os.environ.get('BEAT_AGGREGATE_ENABLED', 'false').lower() in ('true', '1', 'yes')
+_NIGHTLY_ENABLED = os.environ.get('BEAT_NIGHTLY_ENABLED', 'false').lower() in ('true', '1', 'yes')
+
+PROMOTION_INTERVAL_MINUTES = int(os.environ.get('PROMOTION_INTERVAL_MINUTES', '5'))
+ANALYZER_INTERVAL_MINUTES = int(os.environ.get('ANALYZER_INTERVAL_MINUTES', '10'))
+AGGREGATE_INTERVAL_MINUTES = int(os.environ.get('AGGREGATE_INTERVAL_MINUTES', '60'))
+
 _learning_nightly_hour = int(os.environ.get('LEARNING_NIGHTLY_HOUR', '2'))
 _learning_nightly_minute = int(os.environ.get('LEARNING_NIGHTLY_MINUTE', '0'))
-from celery.schedules import crontab  # noqa: E402
-CELERY_BEAT_SCHEDULE = {
-    'behavioros-nightly-learning': {
+
+CELERY_BEAT_SCHEDULE: dict = {}
+
+if _PROMOTION_ENABLED:
+    CELERY_BEAT_SCHEDULE['behavioros-promote-all-orgs'] = {
+        'task': 'apps.learning.tasks.promote_all_orgs_task',
+        'schedule': crontab(minute=f'*/{PROMOTION_INTERVAL_MINUTES}'),
+    }
+
+# Analyzer + aggregate placeholders — schedules ready, tasks not yet built.
+# Per Phase 2B staged rollout: enable after promotion soaks clean, then
+# analyzer, then aggregate, then nightly. Kept commented rather than
+# added-and-flagged-off so a stray env flip can't fire a task that
+# doesn't exist.
+# if _ANALYZER_ENABLED:
+#     CELERY_BEAT_SCHEDULE['behavioros-analyze-recent'] = {
+#         'task': 'apps.learning.tasks.analyze_recent_insights_task',
+#         'schedule': crontab(minute=f'*/{ANALYZER_INTERVAL_MINUTES}'),
+#     }
+# if _AGGREGATE_ENABLED:
+#     CELERY_BEAT_SCHEDULE['behavioros-refresh-aggregates'] = {
+#         'task': 'apps.learning.tasks.refresh_aggregates_task',
+#         'schedule': crontab(minute=0),  # top of every hour
+#     }
+
+if _NIGHTLY_ENABLED:
+    CELERY_BEAT_SCHEDULE['behavioros-nightly-learning'] = {
         'task': 'apps.learning.tasks.run_nightly_learning_job_for_all_orgs',
         'schedule': crontab(hour=_learning_nightly_hour, minute=_learning_nightly_minute),
-    },
-}
+    }
 
 # Stripe
 STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')

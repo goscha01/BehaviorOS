@@ -192,6 +192,7 @@ def promote_evidence_events(
     limit: int | None = None,
     job: LearningJob | None = None,
     since=None,
+    task_id: str | None = None,
 ) -> PromotionResult:
     """Promote pending EvidenceEvents for an org into EvidenceInsights.
 
@@ -239,7 +240,7 @@ def promote_evidence_events(
         # consistent.
         _process_batch(events, ingest, result)
 
-    _emit_run_summary(org, result)
+    _emit_run_summary(org, result, task_id=task_id)
     return result
 
 
@@ -306,17 +307,22 @@ def _process_batch(events, ingest, result):
             result.updated += 1
 
 
-def _emit_run_summary(org, result) -> None:
+def _emit_run_summary(org, result, *, task_id: str | None = None) -> None:
     """ONE structured summary log per run — Grafana "outcome distribution"
     panel keys off this line's fields. Order + spelling of keys is a
-    dashboard contract; do not rename without updating the panel."""
+    dashboard contract; do not rename without updating the panel.
+
+    task_id (when supplied by the Celery task wrapper) is emitted first so
+    beat → fan-out → per-org run can be joined on one identifier.
+    """
     logger.info(
-        'promotion.run org=%s '
+        'promotion.run task_id=%s org=%s '
         'promotion_attempts_total=%d '
         'promotion_success_total=%d '
         'promotion_skipped_total=%d '
         'promotion_failed_total=%d '
         'skipped_by_reason=%s',
+        task_id or '',
         org.id,
         result.scanned,
         result.promoted,

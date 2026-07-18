@@ -100,18 +100,35 @@ def promote_evidence_events_task(self, org_id: str, limit: int | None = None) ->
     schedule this task before the previous run has completed without
     causing double-processing.
     """
+    task_id = self.request.id or ''
+    # Structured log line at task boundary — matched by promotion.run below
+    # on the same task_id so Grafana can trace beat → queue → worker.
+    logger.info(
+        'promote_task.start task_id=%s org=%s limit=%s',
+        task_id, org_id, limit,
+    )
+
     try:
         org = Organization.objects.get(pk=org_id)
     except Organization.DoesNotExist:
-        logger.warning('promote_evidence_events_task: unknown org=%s', org_id)
-        return {'org_id': org_id, 'skipped': 'org_not_found'}
+        logger.warning(
+            'promote_task.skip task_id=%s org=%s reason=org_not_found',
+            task_id, org_id,
+        )
+        return {'org_id': org_id, 'task_id': task_id, 'skipped': 'org_not_found'}
 
     effective_limit = limit if limit is not None else getattr(
         settings, 'PROMOTION_TASK_DEFAULT_BATCH', _DEFAULT_PROMOTION_BATCH,
     )
-    result = promote_evidence_events(org=org, limit=effective_limit)
+    result = promote_evidence_events(org=org, limit=effective_limit, task_id=task_id)
+
+    logger.info(
+        'promote_task.end task_id=%s org=%s scanned=%d promoted=%d skipped=%d failed=%d',
+        task_id, org_id, result.scanned, result.promoted, result.skipped, result.failed,
+    )
     return {
         'org_id': str(org.pk),
+        'task_id': task_id,
         'scanned': result.scanned,
         'promoted': result.promoted,
         'skipped': result.skipped,
@@ -120,16 +137,40 @@ def promote_evidence_events_task(self, org_id: str, limit: int | None = None) ->
     }
 
 
-@shared_task(name='apps.learning.tasks.promote_all_orgs_task')
-def promote_all_orgs_task(limit: int | None = None) -> dict:
+@shared_task(
+    name='apps.learning.tasks.promote_all_orgs_task',
+    bind=True,
+)
+def promote_all_orgs_task(self, limit: int | None = None) -> dict:
     """Fan out promotion tasks — one per org.
 
     Beat wires this on the 5-minute cadence. It only enqueues — the
     actual promotion happens in per-org tasks so one org's backlog
     doesn't block another's. Kept out of the beat's own execution
     thread for the same reason.
+
+    Emits one log line per enqueued child with (parent_task_id, child_task_id,
+    org) so Grafana can trace beat → fan-out → per-org worker in one query.
     """
+    parent_task_id = self.request.id or ''
     org_ids = list(Organization.objects.values_list('id', flat=True))
+    logger.info(
+        'promote_fanout.start task_id=%s org_count=%d limit=%s',
+        parent_task_id, len(org_ids), limit,
+    )
+
+    child_ids: list[str] = []
     for org_id in org_ids:
-        promote_evidence_events_task.delay(str(org_id), limit)
-    return {'orgs_queued': len(org_ids), 'limit_per_org': limit}
+        r = promote_evidence_events_task.delay(str(org_id), limit)
+        logger.info(
+            'promote_fanout.enqueue parent_task_id=%s child_task_id=%s org=%s',
+            parent_task_id, r.id, org_id,
+        )
+        child_ids.append(r.id)
+
+    return {
+        'parent_task_id': parent_task_id,
+        'orgs_queued': len(org_ids),
+        'limit_per_org': limit,
+        'child_task_ids': child_ids,
+    }
