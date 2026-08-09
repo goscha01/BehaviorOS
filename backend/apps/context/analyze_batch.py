@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 from django.conf import settings
@@ -36,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 MAX_CONVERSATIONS = 100
 MAX_MESSAGES_PER_CONVERSATION = 500
+# Parallel worker cap. The Anthropic SDK is sync, so we thread-fan-out to
+# avoid the naive N×~5s serial timeline that trips gunicorn's timeout on
+# batches of 10+ real conversations. Anthropic Tier-2 has plenty of RPM
+# headroom for concurrency of this size; if we hit 429s we'll back off.
+ANALYZER_MAX_WORKERS = 10
 
 
 class MessageSerializer(serializers.Serializer):
@@ -103,38 +109,55 @@ class AnalyzeBatchView(APIView):
 
         batch_id = 'anab_' + uuid.uuid4().hex[:16]
         started = time.monotonic()
-        results = []
         total_cost = Decimal('0')
         successes = 0
         failures = 0
 
+        # Pre-build ephemeral insights per conversation. Deterministic order
+        # preserved via idx→client_id map so results ship back in input order.
+        tasks = []
         for idx, conv in enumerate(conversations):
             client_id = conv.get('id') or f'conv_{idx}'
             insight = self._build_ephemeral_insight(conv)
+            tasks.append((idx, client_id, insight))
+
+        def analyze_one(item):
+            idx, client_id, insight = item
             try:
-                result = analyzer.analyze(insight, llm, model)
-            except Exception as exc:
-                failures += 1
-                results.append({
-                    'id': client_id,
-                    'error': type(exc).__name__,
-                })
-                logger.warning(
-                    'analyze-batch conversation failed batch=%s idx=%d id=%s error=%s',
-                    batch_id, idx, client_id, type(exc).__name__,
-                )
-                continue
+                res = analyzer.analyze(insight, llm, model)
+                return idx, client_id, res, None
+            except Exception as exc:  # noqa: BLE001
+                return idx, client_id, None, exc
 
-            successes += 1
-            total_cost += result.cost_usd
-            results.append({
-                'id': client_id,
-                'analysis': result.analysis_json,
-                'cost_usd': str(result.cost_usd),
-                'model_used': result.model_used,
-                'prompt_version': result.prompt_version,
-            })
+        # Fan out — Anthropic calls dominate the batch wall time; running
+        # them sequentially blows past gunicorn's timeout on real batches.
+        max_workers = min(ANALYZER_MAX_WORKERS, len(tasks))
+        indexed_results = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for future in as_completed(pool.submit(analyze_one, t) for t in tasks):
+                idx, client_id, res, exc = future.result()
+                if exc is not None:
+                    failures += 1
+                    indexed_results[idx] = {
+                        'id': client_id,
+                        'error': type(exc).__name__,
+                    }
+                    logger.warning(
+                        'analyze-batch conversation failed batch=%s idx=%d id=%s error=%s',
+                        batch_id, idx, client_id, type(exc).__name__,
+                    )
+                else:
+                    successes += 1
+                    total_cost += res.cost_usd
+                    indexed_results[idx] = {
+                        'id': client_id,
+                        'analysis': res.analysis_json,
+                        'cost_usd': str(res.cost_usd),
+                        'model_used': res.model_used,
+                        'prompt_version': res.prompt_version,
+                    }
 
+        results = [r for r in indexed_results if r is not None]
         elapsed_ms = int((time.monotonic() - started) * 1000)
         # Never log message bodies — only IDs, counts, timing, model, cost.
         logger.info(
