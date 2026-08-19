@@ -301,6 +301,13 @@ SERVICEFLOW_LEARNING_TOKEN = os.environ.get('SERVICEFLOW_LEARNING_TOKEN', '')
 #     LEADBRIDGE_QUO_PROXY_URL, LEADBRIDGE_QUO_PROXY_TOKEN
 SIGCORE_URL = os.environ.get('SIGCORE_URL', '')
 SIGCORE_API_KEY = os.environ.get('SIGCORE_API_KEY', '')
+# Transcript fetching is N+1 (one GET per call). Default OFF so smoke
+# runs are fast; flip ON for learning-data imports where semantic
+# analysis needs the transcript body. Efficient bulk / parallel
+# transcript retrieval is a follow-up before the 100–500 analysis import.
+SIGCORE_FETCH_TRANSCRIPTS = os.environ.get(
+    'SIGCORE_FETCH_TRANSCRIPTS', 'false',
+).lower() in ('1', 'true', 'yes', 'on')
 
 # BehaviorOS Context Provider (Phase 1)
 # Shadow mode is DEFAULT ON — the /v1/context endpoint still runs and logs

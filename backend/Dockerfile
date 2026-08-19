@@ -23,9 +23,12 @@ EXPOSE 8000
 # migrate runs on every container start — safe because it's idempotent
 # and Phase 1 runs single-instance so there's no race. If we ever scale
 # horizontally, move this to a Railway pre-deploy command.
-# NOTE: `makemigrations --noinput` runs here to bootstrap the initial DB
-# schema on the very first deploy — no app has migration files checked in
-# yet. After the first successful boot, extract migrations from the
-# container, commit them to the repo, and remove `makemigrations` from
-# this line to avoid ORM/git drift on subsequent redeploys.
-CMD ["sh", "-c", "python manage.py makemigrations --noinput && python manage.py migrate --noinput && python manage.py ensure_schema && python manage.py bootstrap_admin && (if [ \"$RUN_SEED\" = \"1\" ]; then python manage.py seed_learning || true; fi) && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3 --timeout ${GUNICORN_TIMEOUT:-300} --access-logfile - --error-logfile -"]
+#
+# Removed 2026-08-19: the boot-time `makemigrations --noinput` safety net.
+# Prod's `django_migrations` table was verified via the bootstrap_admin
+# diagnostic (commit 4eeae7e) to exactly match the checked-in file set
+# (commit 01c8b07 baseline + conversations.0001_initial). Regenerating
+# migrations at boot on every deploy was a bootstrap workaround, and
+# leaving it in place risks silent drift between what git says vs what
+# prod actually applied. `migrate` alone is now sufficient.
+CMD ["sh", "-c", "python manage.py migrate --noinput && python manage.py ensure_schema && python manage.py bootstrap_admin && (if [ \"$RUN_SEED\" = \"1\" ]; then python manage.py seed_learning || true; fi) && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3 --timeout ${GUNICORN_TIMEOUT:-300} --access-logfile - --error-logfile -"]

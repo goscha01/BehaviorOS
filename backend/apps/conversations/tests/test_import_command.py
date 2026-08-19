@@ -2,12 +2,17 @@
 
 Uses the bundled Quo fixtures as the record source (adapter fixture backend)
 and in-memory LB/SF resolvers (default when --use-http-resolvers is off).
+
+`@override_settings(SIGCORE_URL='', SIGCORE_API_KEY='')` on the class
+forces the QuoAdapter to use the fixture backend — critical when
+running locally with a populated `.env` that sets those vars for real
+smoke imports.
 """
 
 from io import StringIO
 
 from django.core.management import CommandError, call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.accounts.models import Organization
 from apps.context.models import EvidenceEvent
@@ -18,6 +23,7 @@ from apps.conversations.models import (
 )
 
 
+@override_settings(SIGCORE_URL='', SIGCORE_API_KEY='')
 class ImportCommandTests(TestCase):
     def test_org_required(self):
         with self.assertRaises(CommandError):

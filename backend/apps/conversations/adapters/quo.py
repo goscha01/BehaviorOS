@@ -20,21 +20,32 @@ breaks the product principle that sources are independently connectable.
 
 Selection is driven by settings:
 
-    SIGCORE_URL       — empty → fixture mode, set → HTTP mode
-    SIGCORE_API_KEY   — workspace-scoped `sc_<hex>` external key
-                        (x-api-key header — auto-scopes to one Sigcore
-                        workspace, so no separate X-Workspace-Id needed)
+    SIGCORE_URL                 — empty → fixture mode, set → HTTP mode
+    SIGCORE_API_KEY             — workspace-scoped `sc_<hex>` external key
+                                  (x-api-key header — auto-scopes to one
+                                  Sigcore workspace, no X-Workspace-Id needed)
+    SIGCORE_FETCH_TRANSCRIPTS   — 0/false = smoke/integration runs
+                                  (default; call marker + metadata only,
+                                  no N+1 transcript fetch)
+                                  1/true  = learning-data import
+                                  (fetches full transcripts — expensive
+                                  but required for Pipeline 1B)
 
 Sigcore endpoints consumed (all already exist per audit 2026-08-19):
 
     GET /conversations?page&limit&startDate&endDate&provider=openphone
-        → paginated list of conversations
+        → paginated list of conversations (server-side pagination)
     GET /conversations/:id/messages?limit&before
-        → messages for one conversation (cursor pagination via `before`)
+        → messages for one conversation. Sort: ASCENDING by createdAt.
+          Cursor: `before=<batch[0].createdAt>` (OLDEST in current page).
+          Inclusive on the cursor value, so client-side dedupe by ID is
+          required. See probe 2026-08-19: using batch[-1] as cursor
+          creates a near-duplicate infinite loop.
     GET /conversations/:id/calls
         → calls for one conversation
     GET /calls/:id/transcript
-        → bulk transcript text (not per-segment)
+        → bulk transcript text (not per-segment). Only fetched when
+          SIGCORE_FETCH_TRANSCRIPTS is truthy.
 
 Auth headers on every request:
 
@@ -97,6 +108,7 @@ class QuoAdapter(ConversationSourceAdapter):
         *,
         sigcore_url: Optional[str] = None,
         sigcore_api_key: Optional[str] = None,
+        fetch_transcripts: Optional[bool] = None,
         fixture_root: Optional[Path] = None,
     ):
         # Empty string sentinel — treat as "not configured" so an unset
@@ -111,6 +123,19 @@ class QuoAdapter(ConversationSourceAdapter):
             if sigcore_api_key is not None
             else getattr(settings, 'SIGCORE_API_KEY', '')
         )
+        # Transcripts are the highest-value data for Pipeline 1B (semantic
+        # analysis), but fetching them is N+1 costly today — one
+        # `GET /calls/:id/transcript` per call in each conversation.
+        # Default OFF for smoke/integration runs; flip ON via
+        # SIGCORE_FETCH_TRANSCRIPTS=1 or fetch_transcripts=True for the
+        # learning-data import. Efficient bulk / parallel transcript
+        # retrieval is a follow-up before the 100–500 analysis import.
+        if fetch_transcripts is not None:
+            self._fetch_transcripts = bool(fetch_transcripts)
+        else:
+            self._fetch_transcripts = getattr(
+                settings, 'SIGCORE_FETCH_TRANSCRIPTS', False,
+            )
         self._fixture_root = fixture_root or FIXTURE_ROOT
 
     def fetch_records(
@@ -266,8 +291,20 @@ class QuoAdapter(ConversationSourceAdapter):
         if not external_id:
             return None
 
-        # Fetch messages (cursor-paginated).
+        # Fetch messages (cursor-paginated backwards through history).
+        #
+        # Sigcore's messages endpoint:
+        # - returns messages sorted ASCENDING by createdAt (oldest first)
+        # - `before=<ts>` returns messages with createdAt <= ts, capped at
+        #   `limit`, still sorted ascending — i.e. the latest N older than ts
+        # - is inclusive on the cursor value, so we dedupe by ID
+        #
+        # Correct backward-pagination cursor is `batch[0].createdAt`
+        # (the OLDEST message in the current page). Using `batch[-1]`
+        # (newest) as I did originally causes an infinite near-duplicate
+        # loop — see git blame + smoke run on 2026-08-19.
         messages: list[dict] = []
+        seen_msg_ids: set = set()
         message_cursor: Optional[str] = None
         while True:
             params = {'limit': 100}
@@ -287,17 +324,30 @@ class QuoAdapter(ConversationSourceAdapter):
                 )
                 break
             batch = mbody.get('data', [])
+            new_in_batch = 0
             for m in batch:
-                if isinstance(m, dict):
-                    messages.append(_transform_sigcore_message(m))
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get('id') or m.get('providerMessageId')
+                if mid and mid in seen_msg_ids:
+                    continue  # inclusive-cursor overlap; skip
+                if mid:
+                    seen_msg_ids.add(mid)
+                messages.append(_transform_sigcore_message(m))
+                new_in_batch += 1
             has_more = (mbody.get('meta') or {}).get('hasMore')
             if not has_more or not batch:
                 break
-            # Use oldest message's createdAt as next cursor (Sigcore uses `before`).
-            last = batch[-1]
-            message_cursor = last.get('createdAt') if isinstance(last, dict) else None
-            if not message_cursor:
+            # No forward progress → stop (guards against a cursor scheme we
+            # don't understand or a page of only-duplicates).
+            if new_in_batch == 0:
                 break
+            first = batch[0]
+            next_cursor = first.get('createdAt') if isinstance(first, dict) else None
+            # Cursor didn't advance → stop (defence in depth).
+            if not next_cursor or next_cursor == message_cursor:
+                break
+            message_cursor = next_cursor
 
         # Fetch calls.
         calls: list[dict] = []
@@ -313,9 +363,13 @@ class QuoAdapter(ConversationSourceAdapter):
                 transformed = _transform_sigcore_call(c)
                 # Sigcore stores bulk transcript text under a separate endpoint
                 # per call — fetch and inject as a single-segment transcript
-                # so the normalizer's segment loop still applies.
+                # so the normalizer's segment loop still applies. Gated by
+                # SIGCORE_FETCH_TRANSCRIPTS because the N+1 cost is real.
+                # When OFF, the call still becomes a "call happened" marker
+                # turn via the normalizer's call_no_transcript path — no
+                # evidence is lost, just no transcript body.
                 call_sc_id = c.get('id')
-                if call_sc_id:
+                if self._fetch_transcripts and call_sc_id:
                     try:
                         tresp = session.get(
                             f'{base}/calls/{call_sc_id}/transcript',
