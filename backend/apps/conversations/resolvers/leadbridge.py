@@ -13,15 +13,16 @@ Two backends today:
    backend returns no matches for every call and logs a WARN so ops
    can see resolution silently degraded to unmatched.
 
-Required LeadBridge endpoint (not yet implemented on LB side):
+LeadBridge endpoint (shipped 2026-08-19 in commit b69eae1b of the LB
+repo, at `src/learning/`):
 
     POST /api/v1/learning/leads/lookup
-    Authorization: Bearer <BEHAVIOR_LB_LEARNING_TOKEN>
+    Authorization: Bearer <LEADBRIDGE_LEARNING_TOKEN>
     Content-Type: application/json
 
     Body:
       {
-        "workspace_id": "<lb-workspace-uuid>",  # optional if scoped-by-token
+        "userId": "<lb-user-uuid>",             # LB's tenant key
         "identifiers": {
           "external_id":  "<optional stable ID from source system>",
           "phone_e164":   "+18135551234",
@@ -38,7 +39,7 @@ Required LeadBridge endpoint (not yet implemented on LB side):
       }
       — empty `leads` list means no match. Never a 404 for "not found."
 
-    Response 401/403: token invalid / not authorized for workspace
+    Response 401/403: token invalid / not accepted by LB
     Response 5xx: LB itself failed; caller treats as infrastructure error
 
 Deterministic matching priority (LB side must enforce this order):
@@ -150,7 +151,7 @@ class HttpLeadBridgeResolver(BaseResolver):
         *,
         base_url: Optional[str] = None,
         token: Optional[str] = None,
-        workspace_id: Optional[str] = None,
+        lb_user_id: Optional[str] = None,
         timeout: float = 10.0,
     ):
         self._base_url = base_url or getattr(
@@ -159,13 +160,18 @@ class HttpLeadBridgeResolver(BaseResolver):
         self._token = token or getattr(
             settings, 'LEADBRIDGE_LEARNING_TOKEN', '',
         )
-        self._workspace_id = workspace_id
+        # LB's tenant key is `userId` (a LB user UUID). One BehaviorOS
+        # org maps to exactly one LB user. Passed per-resolver-instance
+        # for MVP; long-term this lives on Organization or a
+        # SourceIntegration row.
+        self._lb_user_id = lb_user_id
         self._timeout = timeout
 
     def resolve(self, conversation: Conversation) -> Iterable[ResolutionResult]:
-        if not self._base_url or not self._token:
+        if not self._base_url or not self._token or not self._lb_user_id:
             logger.debug(
-                'leadbridge resolver: not configured (base_url/token missing)'
+                'leadbridge resolver: not configured '
+                '(base_url/token/lb_user_id missing)'
             )
             return
 
@@ -177,7 +183,7 @@ class HttpLeadBridgeResolver(BaseResolver):
             import requests
 
             payload = {
-                'workspace_id': self._workspace_id,
+                'userId': self._lb_user_id,
                 'identifiers': {
                     'external_id': external_id or None,
                     'phone_e164': conversation.customer_phone or None,

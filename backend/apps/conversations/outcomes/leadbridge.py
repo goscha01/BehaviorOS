@@ -1,15 +1,13 @@
 """LeadBridge outcome fetcher.
 
-In-memory backend for tests / dev. HTTP backend is stubbed pending the
-LB-side endpoint.
-
-Required LeadBridge endpoint (not yet implemented on LB side):
+In-memory backend for tests / dev. HTTP backend calls the shipped LB
+endpoint (commit b69eae1b in the LB repo, at `src/learning/`).
 
     POST /api/v1/learning/leads/outcomes
     Authorization: Bearer <LEADBRIDGE_LEARNING_TOKEN>
     Content-Type: application/json
 
-    Body:  {"lead_ids": ["lb-uuid-1", "lb-uuid-2"]}
+    Body:  {"userId": "<lb-user-uuid>", "lead_ids": ["lb-uuid-1", ...]}
 
     Response 200:
       {
@@ -66,15 +64,18 @@ class HttpLeadBridgeOutcomeFetcher(BaseLeadBridgeOutcomeFetcher):
         *,
         base_url: Optional[str] = None,
         token: Optional[str] = None,
+        lb_user_id: Optional[str] = None,
         timeout: float = 15.0,
     ):
         self._base_url = base_url or getattr(settings, 'LEADBRIDGE_LEARNING_URL', '')
         self._token = token or getattr(settings, 'LEADBRIDGE_LEARNING_TOKEN', '')
+        # LB's tenant key. See HttpLeadBridgeResolver docstring.
+        self._lb_user_id = lb_user_id
         self._timeout = timeout
 
     def fetch_outcomes(self, lead_ids: Iterable[str]) -> list[LeadBridgeOutcome]:
         lead_ids = [lid for lid in lead_ids if lid]
-        if not lead_ids or not self._base_url or not self._token:
+        if not lead_ids or not self._base_url or not self._token or not self._lb_user_id:
             return []
 
         try:
@@ -82,7 +83,7 @@ class HttpLeadBridgeOutcomeFetcher(BaseLeadBridgeOutcomeFetcher):
 
             resp = requests.post(
                 self._base_url.rstrip('/') + self.ENDPOINT_PATH,
-                json={'lead_ids': lead_ids},
+                json={'userId': self._lb_user_id, 'lead_ids': lead_ids},
                 headers={
                     'Authorization': f'Bearer {self._token}',
                     'X-BehaviorOS-Client': 'conversations-lb-outcomes',
