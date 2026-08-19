@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     'apps.training',
     'apps.learning',
     'apps.context',
+    'apps.conversations',
 ]
 
 MIDDLEWARE = [
