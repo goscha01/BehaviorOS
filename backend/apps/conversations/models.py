@@ -588,3 +588,155 @@ class SemanticEventEvaluation(BaseModel):
 
     def __str__(self) -> str:
         return f'{self.judgment}: event={self.event_id or "(missed)"}'
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1B-2: candidate behavioral pattern discovery
+# ---------------------------------------------------------------------------
+
+
+class PatternDiscoveryRun(BaseModel):
+    """One end-to-end pattern-discovery run on (corpus × extraction_run).
+
+    Rerunning with the same (corpus, extraction_run, analyzer_version,
+    split_seed) is a no-op via the unique constraint — different seeds
+    or analyzer versions yield NEW runs, old candidates preserved.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='pattern_discovery_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='pattern_discovery_runs',
+    )
+    extraction_run = models.ForeignKey(
+        SemanticExtractionRun, on_delete=models.CASCADE,
+        related_name='pattern_discovery_runs',
+    )
+    analyzer_version = models.CharField(max_length=64)
+    split_seed = models.PositiveIntegerField(
+        help_text='Random seed for the stratified 80/20 split. Same seed = same split.',
+    )
+    config = models.JSONField(default=dict, blank=True,
+                              help_text='Discovery config snapshot')
+    status = models.CharField(max_length=16, choices=Status.choices,
+                              default=Status.PENDING)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    discovery_conversation_ids = models.JSONField(default=list, blank=True)
+    holdout_conversation_ids = models.JSONField(default=list, blank=True)
+    positive_class_statuses = models.JSONField(default=list, blank=True)
+    negative_class_statuses = models.JSONField(default=list, blank=True)
+
+    n_discovery_positive = models.PositiveIntegerField(default=0)
+    n_discovery_negative = models.PositiveIntegerField(default=0)
+    n_holdout_positive = models.PositiveIntegerField(default=0)
+    n_holdout_negative = models.PositiveIntegerField(default=0)
+
+    candidates_found = models.PositiveIntegerField(default=0)
+    candidates_reproduced_on_holdout = models.PositiveIntegerField(default=0)
+    error_summary = models.TextField(blank=True, default='')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['corpus', 'extraction_run', 'analyzer_version', 'split_seed'],
+                name='pattern_run_key_unique',
+            ),
+        ]
+        indexes = [models.Index(fields=['corpus', 'status'])]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'PatternRun {self.corpus.name}@{self.corpus.version} seed={self.split_seed}'
+
+
+class CandidatePattern(BaseModel):
+    """One candidate behavioral pattern. Never mutated — reruns under a
+    new (analyzer_version, split_seed) produce a NEW discovery_run with
+    fresh candidates."""
+
+    class Kind(models.TextChoices):
+        SINGLE_EVENT = 'single_event', 'Single event presence'
+        ORDERED_SEQUENCE = 'ordered_sequence', 'Ordered N-gram sequence'
+
+    class HoldoutStatus(models.TextChoices):
+        REPRODUCED = 'reproduced', 'Direction reproduced'
+        NOT_REPRODUCED = 'not_reproduced', 'Direction did NOT reproduce'
+        UNDERPOWERED = 'underpowered', 'Holdout n too small'
+
+    class TemporalClass(models.TextChoices):
+        PRE_OUTCOME = 'PRE_OUTCOME', 'Pre-outcome (predictive candidate)'
+        OUTCOME_PROXY = 'OUTCOME_PROXY', 'Near-tautological with label'
+        POST_OUTCOME = 'POST_OUTCOME', 'After outcome determined'
+        UNKNOWN = 'UNKNOWN', 'Ambiguous / mixed timing'
+        MIXED = 'MIXED', 'Sequence spans multiple classes'
+
+    discovery_run = models.ForeignKey(
+        PatternDiscoveryRun, on_delete=models.CASCADE, related_name='candidates',
+    )
+    pattern_id = models.CharField(max_length=32,
+                                   help_text='Like P0017 within the discovery_run')
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    # SINGLE_EVENT: [event_type]. ORDERED_SEQUENCE: [e1, e2, ...].
+    sequence = models.JSONField()
+    temporal_class = models.CharField(max_length=16, choices=TemporalClass.choices)
+
+    # Discovery — raw presence rates
+    discovery_positive_present = models.PositiveIntegerField(default=0)
+    discovery_positive_total = models.PositiveIntegerField(default=0)
+    discovery_negative_present = models.PositiveIntegerField(default=0)
+    discovery_negative_total = models.PositiveIntegerField(default=0)
+    discovery_positive_rate = models.FloatField(default=0.0)
+    discovery_negative_rate = models.FloatField(default=0.0)
+    discovery_effect_size = models.FloatField(default=0.0,
+                                               help_text='pos_rate - neg_rate')
+    discovery_effect_ci_low = models.FloatField(default=0.0)
+    discovery_effect_ci_high = models.FloatField(default=0.0)
+
+    # Length-adjustment: direction on short (below-median turns) vs long
+    # halves of the discovery set. 'positive', 'negative', 'null', or
+    # empty when the stratum has too few records.
+    length_adjusted_direction_short = models.CharField(max_length=16, blank=True, default='')
+    length_adjusted_direction_long = models.CharField(max_length=16, blank=True, default='')
+
+    # Holdout
+    holdout_positive_present = models.PositiveIntegerField(default=0)
+    holdout_positive_total = models.PositiveIntegerField(default=0)
+    holdout_negative_present = models.PositiveIntegerField(default=0)
+    holdout_negative_total = models.PositiveIntegerField(default=0)
+    holdout_positive_rate = models.FloatField(default=0.0)
+    holdout_negative_rate = models.FloatField(default=0.0)
+    holdout_effect_size = models.FloatField(default=0.0)
+    holdout_status = models.CharField(max_length=32, choices=HoldoutStatus.choices,
+                                       blank=True, default='')
+
+    # Evidence — up to 50 conversation IDs per side (rest recoverable
+    # by re-scanning). Keeps row size sane.
+    evidence_positive_ids = models.JSONField(default=list, blank=True)
+    evidence_negative_ids = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['discovery_run', 'pattern_id'],
+                name='candidate_pattern_id_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['discovery_run', 'temporal_class']),
+            models.Index(fields=['discovery_run', '-discovery_effect_size']),
+        ]
+        ordering = ['discovery_run', 'pattern_id']
+
+    def __str__(self) -> str:
+        return f'{self.pattern_id} [{self.kind}] {self.sequence}'

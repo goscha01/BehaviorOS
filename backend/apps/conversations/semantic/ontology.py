@@ -146,6 +146,92 @@ def is_valid_actor(value: str) -> bool:
     return value in ACTORS
 
 
+# ---------------------------------------------------------------------------
+# Temporal / analytical classification for Pipeline 1B-2
+# ---------------------------------------------------------------------------
+#
+# Analyzing SATISFACTION_SIGNAL as a predictor of 'completed' outcome is
+# tautology — the customer only left a satisfaction signal BECAUSE a
+# cleaning was completed. Same for COMPLAINT, RESCHEDULE_*, etc.
+#
+# BOOKING_CONFIRMED is the outcome itself for booked+ statuses. Same with
+# CUSTOMER_DECLINED being ≈ 'lost'. These are OUTCOME_PROXY events.
+#
+# Pipeline 1B-2 uses this classification to (a) truncate each conversation
+# at its FIRST OUTCOME_PROXY event before extracting predictive sequences,
+# and (b) exclude POST_OUTCOME events from candidate pattern generation.
+
+PRE_OUTCOME_EVENTS: frozenset[str] = frozenset({
+    # customer intent / signalling — predictive candidates
+    SERVICE_INQUIRY, SERVICE_DETAILS_PROVIDED, PRICE_REQUESTED,
+    AVAILABILITY_REQUESTED, BOOKING_REQUESTED, CALL_REQUESTED, QUESTION_FAQ,
+    # qualification exchanges
+    QUALIFICATION_QUESTION, QUALIFICATION_ANSWER,
+    PROPERTY_DETAILS_PROVIDED, SERVICE_SCOPE_CLARIFIED,
+    # pricing
+    PRICE_GIVEN, PRICE_RANGE_GIVEN, DISCOUNT_OFFERED, DISCOUNT_REQUESTED,
+    PRICE_EXPLAINED,
+    # availability offered by agent
+    AVAILABILITY_GIVEN, TIME_SLOT_OFFERED, BOOKING_ATTEMPT,
+    # objections
+    PRICE_OBJECTION, TIMING_OBJECTION, TRUST_OBJECTION, SERVICE_OBJECTION,
+    COMPETITOR_MENTIONED, CUSTOMER_HESITATION, CUSTOMER_DEFERRED,
+    # sales behaviors
+    FOLLOW_UP_SENT, URGENCY_CREATED, SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
+    CUSTOMER_RESPONDED, CONVERSATION_STALLED,
+    # LEAD_MISMATCH is pre-outcome — it EXPLAINS a loss, doesn't ARE a loss.
+    LEAD_MISMATCH,
+})
+
+
+OUTCOME_PROXY_EVENTS: frozenset[str] = frozenset({
+    BOOKING_CONFIRMED,             # ≈ booking outcome itself
+    CUSTOMER_DECLINED,             # ≈ lost outcome itself
+    CUSTOMER_STOPPED_RESPONDING,   # near-lost for the LB status pipeline
+})
+
+
+POST_OUTCOME_EVENTS: frozenset[str] = frozenset({
+    # only meaningful if a booking already happened
+    RESCHEDULE_REQUESTED, RESCHEDULE_CONFIRMED,
+    # observed after a cleaning
+    SATISFACTION_SIGNAL, COMPLAINT,
+    # imply prior interaction
+    CUSTOMER_REENGAGED, CONVERSATION_RESUMED,
+    EXISTING_CUSTOMER_REFERENCE, PREVIOUS_SERVICE_REFERENCE,
+})
+
+
+UNKNOWN_TIMING_EVENTS: frozenset[str] = frozenset({
+    # could be initial outbound OR post-booking follow-up
+    CALL_ATTEMPT,
+    HUMAN_HANDOFF,
+})
+
+
+def event_temporal_class(event_type: str) -> str:
+    """Return 'PRE_OUTCOME' | 'OUTCOME_PROXY' | 'POST_OUTCOME' | 'UNKNOWN'."""
+    if event_type in PRE_OUTCOME_EVENTS:
+        return 'PRE_OUTCOME'
+    if event_type in OUTCOME_PROXY_EVENTS:
+        return 'OUTCOME_PROXY'
+    if event_type in POST_OUTCOME_EVENTS:
+        return 'POST_OUTCOME'
+    return 'UNKNOWN'
+
+
+# Sanity: every ontology event type must be classified somewhere.
+_ALL_CLASSIFIED = (
+    PRE_OUTCOME_EVENTS | OUTCOME_PROXY_EVENTS
+    | POST_OUTCOME_EVENTS | UNKNOWN_TIMING_EVENTS
+)
+assert _ALL_CLASSIFIED == EVENT_TYPES, (
+    f'ontology / temporal classification drift: '
+    f'unclassified = {sorted(EVENT_TYPES - _ALL_CLASSIFIED)}, '
+    f'unknown types classified = {sorted(_ALL_CLASSIFIED - EVENT_TYPES)}'
+)
+
+
 def event_types_by_category() -> dict[str, list[str]]:
     """For docs, prompt construction, distribution reports."""
     return {
