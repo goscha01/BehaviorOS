@@ -283,19 +283,24 @@ SERVICEFLOW_LEARNING_TOKEN = os.environ.get('SERVICEFLOW_LEARNING_TOKEN', '')
 # BehaviorOS never holds Quo credentials directly. Sigcore is the shared
 # communications layer that owns the Quo/OpenPhone integration and
 # persists conversations, messages, calls, and transcripts. BehaviorOS
-# reads them via Sigcore's existing endpoints using the same
-# service-to-service auth pattern Callio uses (X-Sigcore-Key +
-# X-Workspace-Id). When SIGCORE_URL is empty, the QuoAdapter falls
-# back to bundled JSON fixtures so the pipeline is fully exercised in
-# test + dev without an outbound HTTP dependency.
+# reads them via Sigcore's existing endpoints using a workspace-scoped
+# `sc_<hex>` API key (Sigcore's external x-api-key pattern — distinct
+# from the internal X-Sigcore-Key service token Callio uses). The key
+# scopes queries to one Sigcore workspace automatically, so no separate
+# X-Workspace-Id header is needed.
 #
-# Per-org Sigcore workspace ID is NOT a global setting — it is passed
-# per-import (management command --sigcore-workspace flag) until a
-# per-Organization mapping lands. Retire the following LB-proxy vars
-# on prod as soon as this is deployed:
+# When SIGCORE_URL is empty, the QuoAdapter falls back to bundled JSON
+# fixtures so the pipeline is fully exercised in test + dev without an
+# outbound HTTP dependency.
+#
+# Multi-tenant BehaviorOS will eventually need per-org Sigcore API keys
+# (one Sigcore workspace per BehaviorOS org). MVP uses one env var,
+# one key.
+#
+# Retire the following LB-proxy vars on prod as soon as this is deployed:
 #     LEADBRIDGE_QUO_PROXY_URL, LEADBRIDGE_QUO_PROXY_TOKEN
 SIGCORE_URL = os.environ.get('SIGCORE_URL', '')
-SIGCORE_SERVICE_KEY = os.environ.get('SIGCORE_SERVICE_KEY', '')
+SIGCORE_API_KEY = os.environ.get('SIGCORE_API_KEY', '')
 
 # BehaviorOS Context Provider (Phase 1)
 # Shadow mode is DEFAULT ON — the /v1/context endpoint still runs and logs

@@ -8,9 +8,9 @@ Two backends supported today:
 
 2. **HTTP (via Sigcore, the shared communications layer)** — Sigcore
    already ingests Quo/OpenPhone conversations, messages, calls, and
-   participants. BehaviorOS consumes them directly from Sigcore, matching
-   the same pattern Callio uses (`sigcore-proxy/sigcore-client.service.ts`).
-   BehaviorOS never holds Quo credentials — Sigcore owns them.
+   participants. BehaviorOS consumes them directly from Sigcore using
+   a workspace-scoped external API key. BehaviorOS never holds Quo
+   credentials — Sigcore owns them.
 
 Why Sigcore and not LeadBridge: per the source-ownership model, each
 source connects independently. Quo data is owned by the shared
@@ -20,9 +20,10 @@ breaks the product principle that sources are independently connectable.
 
 Selection is driven by settings:
 
-    SIGCORE_URL           — empty → fixture mode, set → HTTP mode
-    SIGCORE_SERVICE_KEY   — service-to-service token (X-Sigcore-Key)
-    (workspace id is per-org and passed to the adapter constructor)
+    SIGCORE_URL       — empty → fixture mode, set → HTTP mode
+    SIGCORE_API_KEY   — workspace-scoped `sc_<hex>` external key
+                        (x-api-key header — auto-scopes to one Sigcore
+                        workspace, so no separate X-Workspace-Id needed)
 
 Sigcore endpoints consumed (all already exist per audit 2026-08-19):
 
@@ -37,8 +38,7 @@ Sigcore endpoints consumed (all already exist per audit 2026-08-19):
 
 Auth headers on every request:
 
-    X-Sigcore-Key:    <SIGCORE_SERVICE_KEY>
-    X-Workspace-Id:   <sigcore_workspace_id passed to the adapter>
+    x-api-key:  <SIGCORE_API_KEY>   # workspace-scoped `sc_<hex>` key
 
 Envelope shape produced by both backends (fed to the normalizer
 unchanged — see `apps/conversations/normalization/quo.py`):
@@ -96,8 +96,7 @@ class QuoAdapter(ConversationSourceAdapter):
         self,
         *,
         sigcore_url: Optional[str] = None,
-        sigcore_service_key: Optional[str] = None,
-        sigcore_workspace_id: Optional[str] = None,
+        sigcore_api_key: Optional[str] = None,
         fixture_root: Optional[Path] = None,
     ):
         # Empty string sentinel — treat as "not configured" so an unset
@@ -107,15 +106,11 @@ class QuoAdapter(ConversationSourceAdapter):
             if sigcore_url is not None
             else getattr(settings, 'SIGCORE_URL', '')
         )
-        self._sigcore_key = (
-            sigcore_service_key
-            if sigcore_service_key is not None
-            else getattr(settings, 'SIGCORE_SERVICE_KEY', '')
+        self._sigcore_api_key = (
+            sigcore_api_key
+            if sigcore_api_key is not None
+            else getattr(settings, 'SIGCORE_API_KEY', '')
         )
-        # Sigcore's workspace ID is per-org. Long-term this lives on the
-        # Organization or a SourceIntegration row; for MVP the caller
-        # passes it explicitly (management command --sigcore-workspace).
-        self._sigcore_workspace_id = sigcore_workspace_id or ''
         self._fixture_root = fixture_root or FIXTURE_ROOT
 
     def fetch_records(
@@ -126,7 +121,7 @@ class QuoAdapter(ConversationSourceAdapter):
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
     ) -> Iterator[Mapping]:
-        if self._sigcore_url and self._sigcore_key and self._sigcore_workspace_id:
+        if self._sigcore_url and self._sigcore_api_key:
             yield from self._fetch_sigcore(
                 since=since, until=until, limit=limit,
             )
@@ -193,8 +188,7 @@ class QuoAdapter(ConversationSourceAdapter):
 
         session = requests.Session()
         headers = {
-            'X-Sigcore-Key': self._sigcore_key,
-            'X-Workspace-Id': self._sigcore_workspace_id,
+            'x-api-key': self._sigcore_api_key,
             'X-BehaviorOS-Client': 'conversations-quo-adapter',
             'Accept': 'application/json',
         }
