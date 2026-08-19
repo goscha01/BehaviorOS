@@ -279,6 +279,15 @@ CALLIO_LEARNING_TOKEN = os.environ.get('CALLIO_LEARNING_TOKEN', '')
 SERVICEFLOW_LEARNING_URL = os.environ.get('SERVICEFLOW_LEARNING_URL', '')
 SERVICEFLOW_LEARNING_TOKEN = os.environ.get('SERVICEFLOW_LEARNING_TOKEN', '')
 
+# BehaviorOS Conversations (Pipeline 1A — Quo ingestion via LeadBridge proxy).
+# BehaviorOS never holds Quo credentials directly. LeadBridge exposes a
+# proxy endpoint (GET /api/v1/learning/quo/conversations) that resolves
+# the per-tenant Quo API key and returns normalized envelopes. When
+# LEADBRIDGE_QUO_PROXY_URL is empty, the adapter falls back to bundled
+# JSON fixtures so the pipeline is fully exercised in test + dev.
+LEADBRIDGE_QUO_PROXY_URL = os.environ.get('LEADBRIDGE_QUO_PROXY_URL', '')
+LEADBRIDGE_QUO_PROXY_TOKEN = os.environ.get('LEADBRIDGE_QUO_PROXY_TOKEN', '')
+
 # BehaviorOS Context Provider (Phase 1)
 # Shadow mode is DEFAULT ON — the /v1/context endpoint still runs and logs
 # every request, but responds `{"status": "no_context"}` regardless of what

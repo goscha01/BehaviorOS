@@ -1,0 +1,20 @@
+{
+  "id": "CN_outbound_sms_001",
+  "channel": "sms",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "+19045550303",
+  "createdAt": "2026-06-03T09:00:00Z",
+  "lastActivityAt": "2026-06-03T09:00:00Z",
+  "messages": [
+    {
+      "id": "MSG_o001",
+      "body": "Reminder: your cleaning is scheduled for tomorrow at 10am.",
+      "direction": "out",
+      "fromNumber": "+18139212100",
+      "toNumber": "+19045550303",
+      "createdAt": "2026-06-03T09:00:00Z",
+      "status": "delivered"
+    }
+  ],
+  "calls": []
+}

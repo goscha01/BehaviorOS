@@ -1,0 +1,20 @@
+{
+  "id": "CN_inbound_sms_001",
+  "channel": "sms",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "+19045550202",
+  "createdAt": "2026-06-02T10:15:00Z",
+  "lastActivityAt": "2026-06-02T10:15:00Z",
+  "messages": [
+    {
+      "id": "MSG_i001",
+      "body": "Hi, do you clean move-out apartments?",
+      "direction": "in",
+      "fromNumber": "+19045550202",
+      "toNumber": "+18139212100",
+      "createdAt": "2026-06-02T10:15:00Z",
+      "status": "delivered"
+    }
+  ],
+  "calls": []
+}

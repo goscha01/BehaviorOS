@@ -1,0 +1,27 @@
+{
+  "id": "CN_partial_001",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "+19045550606",
+  "messages": [
+    {
+      "id": "MSG_p001",
+      "body": "First message with no createdAt — should be skipped",
+      "direction": "in",
+      "fromNumber": "+19045550606",
+      "toNumber": "+18139212100"
+    },
+    {
+      "id": "MSG_p002",
+      "body": "Second message, valid",
+      "direction": "in",
+      "fromNumber": "+19045550606",
+      "toNumber": "+18139212100",
+      "createdAt": "2026-06-07T15:00:00Z"
+    },
+    {
+      "body": "Third message, missing id",
+      "direction": "in",
+      "createdAt": "2026-06-07T15:01:00Z"
+    }
+  ]
+}

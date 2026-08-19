@@ -1,0 +1,20 @@
+{
+  "id": "CN_no_transcript_001",
+  "channel": "voice",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "+19045550505",
+  "createdAt": "2026-06-05T11:00:00Z",
+  "lastActivityAt": "2026-06-05T11:04:35Z",
+  "messages": [],
+  "calls": [
+    {
+      "id": "CALL_nt001",
+      "direction": "in",
+      "duration": 275,
+      "recordingUrl": "https://api.quo.com/recordings/CALL_nt001.mp3",
+      "createdAt": "2026-06-05T11:00:00Z",
+      "answeredAt": "2026-06-05T11:00:03Z",
+      "endedAt": "2026-06-05T11:04:35Z"
+    }
+  ]
+}

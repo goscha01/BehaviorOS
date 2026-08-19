@@ -1,0 +1,65 @@
+{
+  "id": "CN_multi_thread_001",
+  "channel": "sms",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "+19045550404",
+  "createdAt": "2026-06-04T08:30:00Z",
+  "lastActivityAt": "2026-06-04T09:12:00Z",
+  "messages": [
+    {
+      "id": "MSG_m001",
+      "body": "Hi looking for a quote for weekly cleaning, 2br condo",
+      "direction": "in",
+      "fromNumber": "+19045550404",
+      "toNumber": "+18139212100",
+      "createdAt": "2026-06-04T08:30:00Z",
+      "status": "delivered"
+    },
+    {
+      "id": "MSG_m002",
+      "body": "Hi! We can do weekly for $95 per visit for a 2br. Would you like to schedule an initial deep clean?",
+      "direction": "out",
+      "fromNumber": "+18139212100",
+      "toNumber": "+19045550404",
+      "createdAt": "2026-06-04T08:34:00Z",
+      "status": "delivered"
+    },
+    {
+      "id": "MSG_m003",
+      "body": "How much is the deep clean?",
+      "direction": "in",
+      "fromNumber": "+19045550404",
+      "toNumber": "+18139212100",
+      "createdAt": "2026-06-04T08:40:00Z",
+      "status": "delivered"
+    },
+    {
+      "id": "MSG_m004",
+      "body": "The initial deep is $220 for a 2br condo. After that it's $95/week.",
+      "direction": "out",
+      "fromNumber": "+18139212100",
+      "toNumber": "+19045550404",
+      "createdAt": "2026-06-04T08:44:00Z",
+      "status": "delivered"
+    },
+    {
+      "id": "MSG_m005",
+      "body": "Ok let's book for this Saturday morning",
+      "direction": "in",
+      "fromNumber": "+19045550404",
+      "toNumber": "+18139212100",
+      "createdAt": "2026-06-04T09:10:00Z",
+      "status": "delivered"
+    },
+    {
+      "id": "MSG_m006",
+      "body": "Perfect, you're booked Saturday 9am. Confirmation link: https://…",
+      "direction": "out",
+      "fromNumber": "+18139212100",
+      "toNumber": "+19045550404",
+      "createdAt": "2026-06-04T09:12:00Z",
+      "status": "delivered"
+    }
+  ],
+  "calls": []
+}

@@ -1,0 +1,20 @@
+{
+  "id": "CN_no_phone_001",
+  "channel": "sms",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "call me maybe",
+  "createdAt": "2026-06-06T13:00:00Z",
+  "lastActivityAt": "2026-06-06T13:00:00Z",
+  "messages": [
+    {
+      "id": "MSG_np001",
+      "body": "Test with an invalid participant identifier",
+      "direction": "in",
+      "fromNumber": null,
+      "toNumber": "+18139212100",
+      "createdAt": "2026-06-06T13:00:00Z",
+      "status": "delivered"
+    }
+  ],
+  "calls": []
+}

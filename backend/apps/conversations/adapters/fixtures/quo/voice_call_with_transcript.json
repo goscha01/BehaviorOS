@@ -1,0 +1,54 @@
+{
+  "id": "CN_voice_transcript_001",
+  "channel": "voice",
+  "workspaceNumber": "+18139212100",
+  "participantNumber": "+19045550101",
+  "createdAt": "2026-06-01T14:30:00Z",
+  "lastActivityAt": "2026-06-01T14:34:12Z",
+  "messages": [],
+  "calls": [
+    {
+      "id": "CALL_v001",
+      "direction": "in",
+      "duration": 252,
+      "recordingUrl": "https://api.quo.com/recordings/CALL_v001.mp3",
+      "createdAt": "2026-06-01T14:30:00Z",
+      "answeredAt": "2026-06-01T14:30:04Z",
+      "endedAt": "2026-06-01T14:34:12Z",
+      "transcript": [
+        {
+          "id": "seg_1",
+          "speaker": "agent",
+          "text": "Thanks for calling Spotless Homes, this is Maya, how can I help?",
+          "startedAt": "2026-06-01T14:30:04Z",
+          "confidence": 0.97
+        },
+        {
+          "id": "seg_2",
+          "speaker": "customer",
+          "text": "Hi, I'd like to get a quote for a deep clean on my three-bedroom in Tampa.",
+          "startedAt": "2026-06-01T14:30:12Z",
+          "confidence": 0.94
+        },
+        {
+          "id": "seg_3",
+          "speaker": "agent",
+          "text": "Absolutely, when were you thinking?",
+          "startedAt": "2026-06-01T14:30:24Z",
+          "confidence": 0.98
+        },
+        {
+          "id": "seg_4",
+          "speaker": "customer",
+          "text": "Ideally next Friday afternoon.",
+          "startedAt": "2026-06-01T14:30:30Z",
+          "confidence": 0.95
+        }
+      ]
+    }
+  ],
+  "raw": {
+    "quo_conversation_type": "voice_only",
+    "workspace_id": "ws_spotless_tampa_001"
+  }
+}
