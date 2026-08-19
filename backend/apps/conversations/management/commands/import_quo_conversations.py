@@ -74,9 +74,16 @@ class Command(BaseCommand):
         parser.add_argument(
             '--use-http-resolvers', action='store_true',
             help='Use HTTP LB/SF resolvers + outcome fetchers instead of '
-                 'the empty in-memory ones. Requires LEADBRIDGE_LEARNING_URL '
-                 '/ SERVICEFLOW_LEARNING_URL to be set. Endpoints are stubbed '
-                 'today — see resolver docstrings.',
+                 'the empty in-memory ones. Requires LEADBRIDGE_LEARNING_URL, '
+                 'LEADBRIDGE_LEARNING_TOKEN, and --lb-user-id to be set. SF '
+                 'endpoints are still stubbed — see resolver docstrings.',
+        )
+        parser.add_argument(
+            '--lb-user-id', default='',
+            help='LeadBridge tenant key (userId UUID) for this org. Required '
+                 'when --use-http-resolvers is set. One BehaviorOS org maps '
+                 'to exactly one LB user; long-term this lives on a '
+                 'SourceIntegration row.',
         )
         parser.add_argument(
             '--import-run-id', default='',
@@ -98,8 +105,16 @@ class Command(BaseCommand):
             f'dry_run={dry_run} run_id={import_run_id}'
         ))
 
+        lb_user_id = (options.get('lb_user_id') or '').strip() or None
+        if use_http and not lb_user_id:
+            raise CommandError(
+                '--lb-user-id is required when --use-http-resolvers is set '
+                '(LB endpoints refuse requests without a tenant key)',
+            )
+
         pipeline = self._build_pipeline(
             org=org, import_run_id=import_run_id, use_http=use_http,
+            lb_user_id=lb_user_id,
         )
         adapter = QuoAdapter()
 
@@ -145,11 +160,12 @@ class Command(BaseCommand):
 
     def _build_pipeline(
         self, *, org, import_run_id: str, use_http: bool,
+        lb_user_id: str | None = None,
     ) -> ConversationIngestionPipeline:
         if use_http:
-            lb_resolver = HttpLeadBridgeResolver()
+            lb_resolver = HttpLeadBridgeResolver(lb_user_id=lb_user_id)
             sf_resolver = HttpServiceFlowResolver()
-            lb_outcomes = HttpLeadBridgeOutcomeFetcher()
+            lb_outcomes = HttpLeadBridgeOutcomeFetcher(lb_user_id=lb_user_id)
             sf_outcomes = HttpServiceFlowOutcomeFetcher()
         else:
             lb_resolver = InMemoryLeadBridgeResolver()
