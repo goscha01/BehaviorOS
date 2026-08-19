@@ -33,6 +33,13 @@ except ImportError:
     Anthropic = None  # type: ignore
     ANTHROPIC_AVAILABLE = False
 
+try:
+    from openai import OpenAI  # type: ignore
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OpenAI = None  # type: ignore
+    OPENAI_AVAILABLE = False
+
 
 @dataclass
 class LLMResult:
@@ -59,6 +66,8 @@ class BaseProvider:
         system_prompt: str,
         user_prompt: str,
         model: str,
+        *,
+        max_tokens: int = 1500,
     ) -> LLMResult:
         raise NotImplementedError
 
@@ -78,12 +87,17 @@ class StubProvider(BaseProvider):
         system_prompt: str,
         user_prompt: str,
         model: str,
+        *,
+        max_tokens: int = 1500,
     ) -> LLMResult:
         # Detect which caller is asking based on the system prompt.
         # The synthesis prompt asks for one consolidated recommendation
         # across candidates; the analyzer prompt asks for structured
-        # learnings from one piece of evidence.
-        if 'synthesize' in system_prompt.lower():
+        # learnings from one piece of evidence; the semantic-event
+        # extractor prompt asks for a bounded event array.
+        if 'semantic-event extractor' in system_prompt.lower():
+            payload = self._stub_semantic_events(user_prompt)
+        elif 'synthesize' in system_prompt.lower():
             payload = self._stub_synthesis(user_prompt)
         else:
             payload = self._stub_analysis(user_prompt)
@@ -124,6 +138,28 @@ class StubProvider(BaseProvider):
         }
 
     @staticmethod
+    def _stub_semantic_events(user_prompt: str) -> dict:
+        """Return a plausible-but-empty event list for the semantic extractor.
+
+        Enough to exercise the persist/validate pipeline in tests. Real
+        extraction requires an actual LLM (OpenAI or Anthropic key set).
+        Emits ONE event referencing turn index 0 so validation passes.
+        """
+        return {
+            'events': [
+                {
+                    'event_type': 'SERVICE_INQUIRY',
+                    'actor': 'customer',
+                    'turn_start': 0,
+                    'turn_end': 0,
+                    'confidence': 0.5,
+                    'attributes': {'stub': True},
+                    'evidence': '[stub] StubProvider — set OPENAI_API_KEY or ANTHROPIC_API_KEY for real extraction.',
+                },
+            ],
+        }
+
+    @staticmethod
     def _stub_synthesis(user_prompt: str) -> dict:
         return {
             'title': '[stub] Consolidated recommendation from cluster',
@@ -154,13 +190,15 @@ class AnthropicProvider(BaseProvider):
         system_prompt: str,
         user_prompt: str,
         model: str,
+        *,
+        max_tokens: int = 1500,
     ) -> LLMResult:
         # Prefill with `{` to strongly bias output toward JSON. The
         # analyzer's schema validator handles the rest.
         try:
             response = self._client.messages.create(
                 model=model,
-                max_tokens=1500,
+                max_tokens=max_tokens,
                 system=[
                     {
                         'type': 'text',
@@ -203,6 +241,68 @@ class AnthropicProvider(BaseProvider):
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            cost_usd=cost,
+            model_used=model,
+            provider=self.name,
+        )
+
+
+class OpenAIProvider(BaseProvider):
+    """Calls OpenAI Responses/Chat Completions API.
+
+    Uses JSON mode (`response_format={"type": "json_object"}`) so the
+    validator's job is bounded — no prefill hack needed.
+    """
+
+    name = 'openai'
+
+    def __init__(self, api_key: str):
+        if not OPENAI_AVAILABLE:
+            raise LLMProviderError('openai SDK not installed')
+        self._client = OpenAI(api_key=api_key)
+
+    def complete(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: str,
+        *,
+        max_tokens: int = 1500,
+    ) -> LLMResult:
+        try:
+            resp = self._client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                response_format={'type': 'json_object'},
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+            )
+        except Exception as exc:
+            raise LLMProviderError(f'OpenAI call failed: {exc}') from exc
+
+        raw = resp.choices[0].message.content or ''
+        parsed = _try_parse_json(raw)
+        usage = resp.usage
+        input_tokens = getattr(usage, 'prompt_tokens', 0) or 0
+        output_tokens = getattr(usage, 'completion_tokens', 0) or 0
+        cost = compute_cost(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        logger.info(
+            'openai call model=%s input=%d output=%d cost_usd=%s',
+            model, input_tokens, output_tokens, cost,
+        )
+        return LLMResult(
+            raw_response=raw,
+            parsed_json=parsed,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
             cost_usd=cost,
             model_used=model,
             provider=self.name,
@@ -278,9 +378,11 @@ class LearningLLMClient:
         system_prompt: str,
         user_prompt: str,
         model: str,
+        *,
+        max_tokens: int = 1500,
     ) -> LLMResult:
         provider = self._resolve(model)
-        return provider.complete(system_prompt, user_prompt, model)
+        return provider.complete(system_prompt, user_prompt, model, max_tokens=max_tokens)
 
     def _resolve(self, model: str) -> BaseProvider:
         provider_key = self._provider_key(model)
@@ -312,7 +414,17 @@ class LearningLLMClient:
                     bool(api_key), ANTHROPIC_AVAILABLE,
                 )
             return StubProvider()
-        # OpenAI not wired in Phase 1 — fall through to stub.
         if provider_key == 'openai':
-            logger.info('OpenAI provider not yet implemented; using stub')
+            api_key = getattr(settings, 'OPENAI_API_KEY', '')
+            if api_key and OPENAI_AVAILABLE:
+                try:
+                    return OpenAIProvider(api_key=api_key)
+                except LLMProviderError as exc:
+                    logger.warning('Falling back to stub provider: %s', exc)
+            else:
+                logger.info(
+                    'OpenAI provider unavailable (api_key=%s, sdk_installed=%s); using stub',
+                    bool(api_key), OPENAI_AVAILABLE,
+                )
+            return StubProvider()
         return StubProvider()

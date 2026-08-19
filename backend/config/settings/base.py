@@ -357,4 +357,24 @@ LEARNING_MODEL_PRICING = {
         'cache_write_multiplier': 1.25,
         'cache_read_multiplier': 0.10,
     },
+    # OpenAI pricing (per Sep 2025 published rates). Verify before large runs.
+    'gpt-4o-mini': {
+        'input_per_mtok': 0.15,
+        'output_per_mtok': 0.60,
+    },
+    'gpt-4o': {
+        'input_per_mtok': 2.50,
+        'output_per_mtok': 10.00,
+    },
+    'gpt-4.1-mini': {
+        'input_per_mtok': 0.40,
+        'output_per_mtok': 1.60,
+    },
 }
+# Pipeline 1B-1 semantic-event extraction model. Default gpt-4o-mini
+# because it's fast, cheap ($0.75/M tokens combined), and reliably
+# produces structured JSON for bounded ontologies. Override for
+# quality comparisons.
+SEMANTIC_EXTRACTION_MODEL = os.environ.get(
+    'SEMANTIC_EXTRACTION_MODEL', 'gpt-4o-mini',
+)

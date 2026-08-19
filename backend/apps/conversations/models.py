@@ -336,3 +336,255 @@ class OutcomeSnapshot(BaseModel):
 
     def __str__(self) -> str:
         return f'outcome@{self.captured_at.isoformat()} for {self.conversation_id}'
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1B-1: corpus, semantic extraction, evaluation
+# ---------------------------------------------------------------------------
+
+
+class LearningCorpus(BaseModel):
+    """Frozen, versioned subset of Conversations for Pipeline 1B analysis.
+
+    Rerunning any Pipeline 1B stage against `spotless_lb_quo_v1` MUST see
+    the same conversations unless a new corpus version is created.
+    Membership is stored explicitly in LearningCorpusMember rather than
+    re-derived from a query, so a lead added to LB tomorrow can't
+    accidentally sneak into an existing corpus.
+    """
+
+    org = models.ForeignKey(
+        'accounts.Organization',
+        on_delete=models.CASCADE,
+        related_name='learning_corpora',
+    )
+    name = models.CharField(max_length=128)
+    version = models.CharField(max_length=64)
+    # Freeform description of how the corpus was assembled — e.g.
+    #   {"source": "lb_anchored", "turn_count_min": 5,
+    #    "statuses": ["lost","engaged",...], "notes": "..."}
+    selection_criteria = models.JSONField(default=dict, blank=True)
+    # Denormalized member count for fast reads.
+    member_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['org', 'name', 'version'],
+                name='learning_corpus_org_name_version_unique',
+            ),
+        ]
+        indexes = [models.Index(fields=['org', 'name'])]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'{self.name}@{self.version} (n={self.member_count})'
+
+
+class LearningCorpusMember(BaseModel):
+    """One conversation's membership in one corpus. Preserves the lead-id
+    at capture time even if EntityLinks later change."""
+
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE, related_name='members',
+    )
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE,
+        related_name='corpus_memberships',
+    )
+    # Snapshot of the primary LB link at corpus-freeze time (nullable —
+    # unmatched conversations may still be legitimate members later).
+    lb_lead_id = models.CharField(max_length=128, blank=True, default='')
+    # Snapshot of the outcome status at freeze time. Later outcome
+    # snapshots on the Conversation don't affect the corpus's own labels.
+    lb_status_at_freeze = models.CharField(max_length=64, blank=True, default='')
+    turn_count_at_freeze = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['corpus', 'conversation'],
+                name='corpus_member_conv_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['corpus', 'lb_status_at_freeze']),
+            models.Index(fields=['conversation']),
+        ]
+        ordering = ['created_at']
+
+
+class SemanticExtractionRun(BaseModel):
+    """One (corpus × extractor × ontology × prompt × model) invocation.
+
+    Multiple runs against the same corpus coexist so ontology/prompt
+    changes can be compared without losing history. Old events NEVER
+    get overwritten.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        PARTIAL = 'partial', 'Partial (some records failed)'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization',
+        on_delete=models.CASCADE,
+        related_name='semantic_extraction_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='extraction_runs',
+    )
+    extractor_version = models.CharField(max_length=64)
+    ontology_version = models.CharField(max_length=64)
+    prompt_version = models.CharField(max_length=64)
+    model = models.CharField(max_length=64)
+    provider = models.CharField(max_length=32, blank=True, default='')
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING,
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    records_processed = models.PositiveIntegerField(default=0)
+    records_failed = models.PositiveIntegerField(default=0)
+    events_created = models.PositiveIntegerField(default=0)
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
+    cost_usd = models.DecimalField(max_digits=10, decimal_places=4, default=0)
+    error_summary = models.TextField(blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['corpus', 'extractor_version', 'ontology_version',
+                        'prompt_version', 'model'],
+                name='extraction_run_version_key_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['corpus', 'status']),
+            models.Index(fields=['-started_at']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (
+            f'{self.corpus.name}@{self.corpus.version} '
+            f'{self.extractor_version}+{self.ontology_version}+{self.prompt_version} '
+            f'({self.model})'
+        )
+
+
+class ConversationSemanticEvent(BaseModel):
+    """One extracted semantic event within one conversation.
+
+    Never mutated after write — reruns produce NEW events under a new
+    extraction_run. The (conversation, extraction_run, ordinal) tuple
+    uniquely identifies an event within a run.
+    """
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='semantic_events',
+    )
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE,
+        related_name='semantic_events',
+    )
+    # Optional pointer to the specific LB link this event relates to —
+    # allows attributing events to a specific lead when a conversation
+    # has multiple links.
+    entity_link = models.ForeignKey(
+        EntityLink, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='semantic_events',
+    )
+    extraction_run = models.ForeignKey(
+        SemanticExtractionRun, on_delete=models.CASCADE,
+        related_name='events',
+    )
+    # Position within this run's event set for the conversation.
+    # Preserves LLM's original ordering.
+    ordinal = models.PositiveIntegerField()
+
+    event_type = models.CharField(max_length=64)  # validated against ontology
+    actor = models.CharField(max_length=16)       # validated against ontology
+    turn_start = models.PositiveIntegerField()
+    turn_end = models.PositiveIntegerField()
+    occurred_at = models.DateTimeField(null=True, blank=True)
+    confidence = models.FloatField()
+    attributes = models.JSONField(default=dict, blank=True)
+    # Verbatim excerpt from the conversation supporting the event.
+    # Truncated at 1000 chars — full evidence is recoverable via
+    # (conversation, turn_start..turn_end).
+    evidence_text = models.CharField(max_length=1000, blank=True, default='')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['extraction_run', 'conversation', 'ordinal'],
+                name='semantic_event_run_conv_ordinal_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['extraction_run', 'event_type']),
+            models.Index(fields=['conversation', 'extraction_run']),
+            models.Index(fields=['event_type']),
+            models.Index(fields=['actor']),
+        ]
+        ordering = ['extraction_run', 'conversation', 'ordinal']
+
+    def __str__(self) -> str:
+        return f'{self.event_type} by {self.actor} t{self.turn_start}-{self.turn_end}'
+
+
+class SemanticEventEvaluation(BaseModel):
+    """Human review of one extracted event. Used to build a semantic
+    eval set that survives prompt/model changes."""
+
+    class Judgment(models.TextChoices):
+        CORRECT = 'correct', 'Correct'
+        PARTIALLY_CORRECT = 'partially_correct', 'Partially correct'
+        INCORRECT = 'incorrect', 'Incorrect'
+        MISSED_EVENT = 'missed_event', 'Missed event (should exist)'
+        WRONG_EVENT_TYPE = 'wrong_event_type', 'Wrong event type'
+        WRONG_ACTOR = 'wrong_actor', 'Wrong actor'
+        WRONG_SPAN = 'wrong_span', 'Wrong turn span'
+
+    # `event` is nullable so evaluators can log MISSED_EVENT judgments
+    # that don't correspond to an existing extracted row.
+    event = models.ForeignKey(
+        ConversationSemanticEvent, on_delete=models.CASCADE,
+        null=True, blank=True,
+        related_name='evaluations',
+    )
+    # Free identifier — email, name, or "auto" for eventual programmatic checks.
+    reviewer = models.CharField(max_length=128, blank=True, default='')
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE,
+        related_name='semantic_evaluations',
+    )
+    extraction_run = models.ForeignKey(
+        SemanticExtractionRun, on_delete=models.CASCADE,
+        related_name='evaluations',
+    )
+    judgment = models.CharField(max_length=32, choices=Judgment.choices)
+    # For MISSED_EVENT: what type SHOULD have been extracted (from ontology).
+    expected_event_type = models.CharField(max_length=64, blank=True, default='')
+    expected_turn_start = models.PositiveIntegerField(null=True, blank=True)
+    expected_turn_end = models.PositiveIntegerField(null=True, blank=True)
+    notes = models.TextField(blank=True, default='')
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['extraction_run', 'judgment']),
+            models.Index(fields=['conversation']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'{self.judgment}: event={self.event_id or "(missed)"}'
