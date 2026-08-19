@@ -1,8 +1,8 @@
 """QuoAdapter fixture-backend tests.
 
-The HTTP backend is covered separately in Phase 10 when the LB proxy
-endpoint is available; today we only test that the URL toggle correctly
-selects the backend, not the HTTP request/response cycle.
+The Sigcore HTTP backend is exercised end-to-end during the smoke import
+against real Sigcore; today we only test that the settings toggle
+correctly selects fixture vs HTTP backend, not the HTTP cycle itself.
 """
 
 from datetime import datetime, timezone
@@ -14,7 +14,7 @@ from apps.conversations.adapters.quo import QuoAdapter
 
 class QuoAdapterFixtureTests(SimpleTestCase):
     def test_fixture_backend_yields_expected_scenarios(self):
-        adapter = QuoAdapter(proxy_url='', proxy_token='')
+        adapter = QuoAdapter(sigcore_url='', sigcore_service_key='')
         records = list(adapter.fetch_records())
         ids = [r['id'] for r in records]
 
@@ -32,12 +32,12 @@ class QuoAdapterFixtureTests(SimpleTestCase):
         self.assertEqual(ids.count('CN_inbound_sms_001'), 2)
 
     def test_limit_caps_records(self):
-        adapter = QuoAdapter(proxy_url='', proxy_token='')
+        adapter = QuoAdapter(sigcore_url='', sigcore_service_key='')
         records = list(adapter.fetch_records(limit=3))
         self.assertEqual(len(records), 3)
 
     def test_since_filters_fixture_records(self):
-        adapter = QuoAdapter(proxy_url='', proxy_token='')
+        adapter = QuoAdapter(sigcore_url='', sigcore_service_key='')
         # Only records with lastActivityAt >= 2026-06-05 should pass.
         cutoff = datetime(2026, 6, 5, tzinfo=timezone.utc)
         records = list(adapter.fetch_records(since=cutoff))
@@ -48,7 +48,7 @@ class QuoAdapterFixtureTests(SimpleTestCase):
         self.assertNotIn('CN_inbound_sms_001', ids)       # 2026-06-02
 
     def test_until_filters_fixture_records(self):
-        adapter = QuoAdapter(proxy_url='', proxy_token='')
+        adapter = QuoAdapter(sigcore_url='', sigcore_service_key='')
         cutoff = datetime(2026, 6, 3, tzinfo=timezone.utc)
         records = list(adapter.fetch_records(until=cutoff))
         ids = {r['id'] for r in records}
@@ -58,23 +58,27 @@ class QuoAdapterFixtureTests(SimpleTestCase):
 
 
 class QuoAdapterBackendSelectionTests(SimpleTestCase):
-    @override_settings(
-        LEADBRIDGE_QUO_PROXY_URL='',
-        LEADBRIDGE_QUO_PROXY_TOKEN='',
-    )
-    def test_empty_url_uses_fixture_backend(self):
+    @override_settings(SIGCORE_URL='', SIGCORE_SERVICE_KEY='')
+    def test_empty_sigcore_url_uses_fixture_backend(self):
         adapter = QuoAdapter()
         # Fixtures exist so we should get results.
         records = list(adapter.fetch_records(limit=1))
         self.assertEqual(len(records), 1)
 
     @override_settings(
-        LEADBRIDGE_QUO_PROXY_URL='https://leadbridge.example/api/v1/learning/quo/conversations',
-        LEADBRIDGE_QUO_PROXY_TOKEN='test-token',
+        SIGCORE_URL='https://sigcore.example',
+        SIGCORE_SERVICE_KEY='test-service-key',
     )
-    def test_configured_url_switches_backend_selection(self):
-        # We don't actually make an HTTP call in this test — just confirm
-        # the adapter would take the HTTP path. If it took the fixture path,
-        # it'd yield without touching requests at all.
-        adapter = QuoAdapter()
-        self.assertTrue(adapter._proxy_url)  # noqa: SLF001 — testing the selector
+    def test_sigcore_selected_only_when_workspace_id_supplied(self):
+        # All three of (url, key, workspace_id) must be present to switch
+        # to the HTTP backend. Without a workspace_id we still fall through
+        # to fixtures — matches the constructor contract.
+        adapter_no_ws = QuoAdapter()
+        # Fixture backend produces at least one record.
+        self.assertGreater(len(list(adapter_no_ws.fetch_records(limit=1))), 0)
+
+        # With a workspace_id, the adapter would take the HTTP path — we
+        # verify the internal state, not the network call.
+        adapter_ws = QuoAdapter(sigcore_workspace_id='ws-test-1')
+        self.assertTrue(adapter_ws._sigcore_url)  # noqa: SLF001
+        self.assertTrue(adapter_ws._sigcore_workspace_id)  # noqa: SLF001

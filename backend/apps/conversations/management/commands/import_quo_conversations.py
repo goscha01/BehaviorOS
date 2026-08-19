@@ -2,12 +2,15 @@
 
 Usage:
     python manage.py import_quo_conversations \\
-        --org <uuid> [--since 2026-01-01] [--until 2026-08-01] \\
+        --org <uuid> [--sigcore-workspace <sigcore-workspace-uuid>] \\
+        [--since 2026-01-01] [--until 2026-08-01] \\
         [--limit 200] [--dry-run] [--use-http-resolvers]
 
 The command:
-- Iterates records from the QuoAdapter (fixtures by default, LB proxy
-  when LEADBRIDGE_QUO_PROXY_URL is set).
+- Iterates records from the QuoAdapter (fixtures by default; Sigcore
+  HTTP when SIGCORE_URL + SIGCORE_SERVICE_KEY + --sigcore-workspace
+  are all set. Sigcore owns the Quo integration; BehaviorOS never holds
+  Quo credentials directly).
 - For each record, runs the full ConversationIngestionPipeline:
   normalize → persist → LB resolve → SF resolve → outcomes → EvidenceEvent.
 - One failed conversation does NOT abort the batch — every failure is
@@ -62,6 +65,12 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--org', required=True, help='Organization UUID')
+        parser.add_argument(
+            '--sigcore-workspace', default='',
+            help='Sigcore workspace UUID to pull Quo data from. Required '
+                 'to switch the adapter to the Sigcore HTTP backend; '
+                 'without it, fixtures are used.',
+        )
         parser.add_argument('--since', help='ISO-8601 inclusive start')
         parser.add_argument('--until', help='ISO-8601 exclusive end')
         parser.add_argument('--limit', type=int, default=None,
@@ -98,7 +107,9 @@ class Command(BaseCommand):
         pipeline = self._build_pipeline(
             org=org, import_run_id=import_run_id, use_http=use_http,
         )
-        adapter = QuoAdapter()
+        adapter = QuoAdapter(
+            sigcore_workspace_id=options.get('sigcore_workspace') or None,
+        )
 
         counters = _Counters()
 
