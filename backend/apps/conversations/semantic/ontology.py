@@ -13,7 +13,11 @@ add new event types deliberately — never silently.
 
 from __future__ import annotations
 
-ONTOLOGY_VERSION = 'ontology-v1'
+ONTOLOGY_VERSION = 'ontology-v2'
+# v1 → v2 additions (2026-08-19): CUSTOMER_DEFERRED (deferral, not decline)
+# + LEAD_MISMATCH (wrong-intent lead — e.g. customer applying for a job).
+# No other ontology changes; deliberate discipline to avoid ontology drift
+# before sequence analysis reveals which gaps actually matter.
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +77,10 @@ SERVICE_OBJECTION = 'SERVICE_OBJECTION'
 COMPETITOR_MENTIONED = 'COMPETITOR_MENTIONED'
 CUSTOMER_HESITATION = 'CUSTOMER_HESITATION'
 CUSTOMER_DECLINED = 'CUSTOMER_DECLINED'
+# v2: distinct from CUSTOMER_DECLINED. Deferral ("get back to you next
+# week", "not right now, maybe later") is NOT a decline — the sales
+# process is still alive.
+CUSTOMER_DEFERRED = 'CUSTOMER_DEFERRED'
 
 # Sales behavior
 FOLLOW_UP_SENT = 'FOLLOW_UP_SENT'
@@ -94,6 +102,11 @@ EXISTING_CUSTOMER_REFERENCE = 'EXISTING_CUSTOMER_REFERENCE'
 PREVIOUS_SERVICE_REFERENCE = 'PREVIOUS_SERVICE_REFERENCE'
 COMPLAINT = 'COMPLAINT'
 SATISFACTION_SIGNAL = 'SATISFACTION_SIGNAL'
+# v2: customer's intent doesn't match the service being offered — e.g.
+# customer wants a cleaning JOB (employment), not to hire a cleaner.
+# Distinct from CUSTOMER_DECLINED (which implies they were considering
+# and passed) — this is "you're not talking to the right kind of lead."
+LEAD_MISMATCH = 'LEAD_MISMATCH'
 
 
 EVENT_TYPES: frozenset[str] = frozenset({
@@ -112,6 +125,7 @@ EVENT_TYPES: frozenset[str] = frozenset({
     # objections
     PRICE_OBJECTION, TIMING_OBJECTION, TRUST_OBJECTION, SERVICE_OBJECTION,
     COMPETITOR_MENTIONED, CUSTOMER_HESITATION, CUSTOMER_DECLINED,
+    CUSTOMER_DEFERRED,
     # sales behavior
     FOLLOW_UP_SENT, CUSTOMER_REENGAGED, CALL_ATTEMPT, HUMAN_HANDOFF,
     URGENCY_CREATED, SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
@@ -120,7 +134,7 @@ EVENT_TYPES: frozenset[str] = frozenset({
     CONVERSATION_STALLED, CONVERSATION_RESUMED,
     # operational
     EXISTING_CUSTOMER_REFERENCE, PREVIOUS_SERVICE_REFERENCE,
-    COMPLAINT, SATISFACTION_SIGNAL,
+    COMPLAINT, SATISFACTION_SIGNAL, LEAD_MISMATCH,
 })
 
 
@@ -155,7 +169,7 @@ def event_types_by_category() -> dict[str, list[str]]:
         'objections': [
             PRICE_OBJECTION, TIMING_OBJECTION, TRUST_OBJECTION,
             SERVICE_OBJECTION, COMPETITOR_MENTIONED,
-            CUSTOMER_HESITATION, CUSTOMER_DECLINED,
+            CUSTOMER_HESITATION, CUSTOMER_DECLINED, CUSTOMER_DEFERRED,
         ],
         'sales_behavior': [
             FOLLOW_UP_SENT, CUSTOMER_REENGAGED, CALL_ATTEMPT, HUMAN_HANDOFF,
@@ -167,6 +181,6 @@ def event_types_by_category() -> dict[str, list[str]]:
         ],
         'operational': [
             EXISTING_CUSTOMER_REFERENCE, PREVIOUS_SERVICE_REFERENCE,
-            COMPLAINT, SATISFACTION_SIGNAL,
+            COMPLAINT, SATISFACTION_SIGNAL, LEAD_MISMATCH,
         ],
     }

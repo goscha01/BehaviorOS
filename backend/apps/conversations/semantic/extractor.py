@@ -44,7 +44,9 @@ from apps.learning.services.llm_client import LearningLLMClient, LLMProviderErro
 logger = logging.getLogger(__name__)
 
 
-EXTRACTOR_VERSION = 'extractor-v1'
+EXTRACTOR_VERSION = 'extractor-v2'
+# v1 → v2 (2026-08-19): consume string turn_ids from LLM + validator's
+# TurnIdMap; bulk-transcript speaker splitting happens in preprocessing.
 
 
 @dataclass
@@ -112,15 +114,10 @@ class SemanticExtractor:
             result.skipped_reason = 'already_extracted'
             return result
 
-        turns = load_and_normalize(conversation)
+        turns, turn_id_map = load_and_normalize(conversation)
         if not turns:
             result.skipped_reason = 'no_turns_after_preprocess'
             return result
-
-        # Absolute max index — used by validator to reject out-of-range
-        # turn refs. This is the LAST NORMALIZED turn's original idx, not
-        # the count; extractors output ABSOLUTE indices.
-        max_turn_index = turns[-1].idx
 
         chunks = chunk_conversation(turns)
         result.chunks = len(chunks)
@@ -147,8 +144,11 @@ class SemanticExtractor:
             result.output_tokens += llm_result.output_tokens
             result.cost_usd += llm_result.cost_usd
 
+            # Chunks share the SAME turn_id_map — LLM must return IDs
+            # from anywhere in the conversation; validator rejects
+            # unknown IDs (kills chunk-relative fabrications dead).
             validated = validate_events(
-                llm_result.parsed_json, max_turn_index=max_turn_index,
+                llm_result.parsed_json, turn_id_map=turn_id_map,
             )
             result.events_rejected += len(validated.rejected)
             if not validated.any_valid:

@@ -67,6 +67,13 @@ class OntologyTests(SimpleTestCase):
     def test_ontology_version_present(self):
         self.assertTrue(ONTOLOGY_VERSION)
 
+    def test_v2_additions_present(self):
+        self.assertTrue(is_valid_event_type('CUSTOMER_DEFERRED'))
+        self.assertTrue(is_valid_event_type('LEAD_MISMATCH'))
+
+    def test_ontology_version_is_v2(self):
+        self.assertEqual(ONTOLOGY_VERSION, 'ontology-v2')
+
 
 # ---------------------------------------------------------------------------
 # Validator
@@ -75,6 +82,7 @@ class OntologyTests(SimpleTestCase):
 
 class ValidatorTests(SimpleTestCase):
     def _ev(self, **overrides):
+        # v1-shape base (int turn refs) — used with max_turn_index path.
         base = {
             'event_type': 'PRICE_REQUESTED',
             'actor': 'customer',
@@ -87,10 +95,48 @@ class ValidatorTests(SimpleTestCase):
         base.update(overrides)
         return base
 
+    def _ev_v2(self, **overrides):
+        base = {
+            'event_type': 'PRICE_REQUESTED',
+            'actor': 'customer',
+            'turn_start': 't0003',
+            'turn_end': 't0003',
+            'confidence': 0.9,
+            'attributes': {},
+            'evidence': 'How much?',
+        }
+        base.update(overrides)
+        return base
+
+    def _v2_map(self):
+        from apps.conversations.semantic.preprocessing import TurnIdMap
+        return TurnIdMap(id_to_parent={
+            't0003': 3, 't0005': 5, 't0007': 7, 't0010': 10,
+        })
+
     def test_valid_event_passes(self):
         r = validate_events({'events': [self._ev()]}, max_turn_index=10)
         self.assertEqual(len(r.events), 1)
         self.assertEqual(len(r.rejected), 0)
+
+    def test_valid_v2_event_with_string_turn_ids(self):
+        r = validate_events({'events': [self._ev_v2()]}, turn_id_map=self._v2_map())
+        self.assertEqual(len(r.events), 1)
+        # Turn refs resolved to int parent idx.
+        self.assertEqual(r.events[0]['turn_start'], 3)
+        self.assertEqual(r.events[0]['turn_end'], 3)
+
+    def test_v2_unknown_turn_id_rejected(self):
+        r = validate_events({'events': [self._ev_v2(turn_start='t9999', turn_end='t9999')]},
+                            turn_id_map=self._v2_map())
+        self.assertEqual(len(r.events), 0)
+        self.assertIn('unknown turn_start id', r.rejected[0]['reason'])
+
+    def test_v2_int_turn_ref_rejected_when_map_supplied(self):
+        r = validate_events({'events': [self._ev(turn_start=3, turn_end=3)]},
+                            turn_id_map=self._v2_map())
+        self.assertEqual(len(r.events), 0)
+        self.assertIn('must be string turn_ids', r.rejected[0]['reason'])
 
     def test_unknown_event_type_rejected(self):
         r = validate_events({'events': [self._ev(event_type='BOGUS')]}, max_turn_index=10)
@@ -165,21 +211,57 @@ class PreprocessingTests(TestCase):
         conv = self._conv_with_turns([
             ('hi', 'sms'), ('', 'sms'), ('', 'call_no_transcript'), ('yes', 'sms'),
         ])
-        turns = load_and_normalize(conv)
+        turns, _ = load_and_normalize(conv)
         # 3 kept: hi, call, yes. Empty SMS dropped.
         self.assertEqual([t.text for t in turns], ['hi', '', 'yes'])
         self.assertEqual(turns[1].kind, 'call_no_transcript')
 
     def test_short_customer_reply_retained(self):
         conv = self._conv_with_turns([('hi', 'sms'), ('yes', 'sms'), ('ok', 'sms')])
-        turns = load_and_normalize(conv)
+        turns, _ = load_and_normalize(conv)
         self.assertEqual(len(turns), 3)
+
+    def test_bulk_voice_transcript_split_into_speaker_subturns(self):
+        # A single bulk transcript with 3 speaker segments becomes 3 sub-turns.
+        conv = self._conv_with_turns([
+            ('hi', 'sms'),
+            ('+13164444895: Hello? Agent: Hi, this is Kate. '
+             '+13164444895: I need a cleaning next Tuesday.', 'call_transcript_segment'),
+            ('ok', 'sms'),
+        ])
+        turns, id_map = load_and_normalize(conv)
+        # 1 SMS + 3 voice sub-turns + 1 SMS = 5 total
+        self.assertEqual(len(turns), 5)
+        # Speaker attribution: phone → customer, Agent → agent
+        voice_turns = [t for t in turns if t.from_bulk_transcript]
+        self.assertEqual(len(voice_turns), 3)
+        self.assertEqual(voice_turns[0].speaker, 'customer')
+        self.assertEqual(voice_turns[1].speaker, 'agent')
+        self.assertEqual(voice_turns[2].speaker, 'customer')
+        # Sub-turn IDs share parent idx, distinct sub suffixes.
+        sub_ids = [t.turn_id for t in voice_turns]
+        self.assertEqual(sub_ids, ['t0001.0', 't0001.1', 't0001.2'])
+        self.assertEqual(voice_turns[0].parent_idx, 1)
+        self.assertEqual(voice_turns[1].parent_idx, 1)
+        # All 3 sub-IDs map back to parent idx 1 for persistence.
+        for tid in sub_ids:
+            self.assertEqual(id_map.id_to_parent[tid], 1)
+
+    def test_bulk_transcript_without_speaker_markers_kept_as_one(self):
+        conv = self._conv_with_turns([
+            ('just a plain transcript blob with no speaker labels',
+             'call_transcript_segment'),
+        ])
+        turns, _ = load_and_normalize(conv)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].turn_id, 't0000')
 
 
 class ChunkingTests(SimpleTestCase):
     def _turns(self, n, char_length=100):
         return [
-            NormalizedTurn(idx=i, speaker='customer', direction='in',
+            NormalizedTurn(turn_id=f't{i:04d}', parent_idx=i,
+                           speaker='customer', direction='in',
                            text='x' * char_length, occurred_at='',
                            kind='sms', from_bulk_transcript=False)
             for i in range(n)
@@ -191,17 +273,17 @@ class ChunkingTests(SimpleTestCase):
         self.assertTrue(chunks[0].is_only_chunk)
 
     def test_multi_chunk_with_overlap(self):
-        # 20 turns × 100 chars = 2000; budget 500 → 4 chunks
         chunks = chunk_conversation(self._turns(20, 100),
                                      char_budget=500, overlap_turns=2)
         self.assertGreater(len(chunks), 1)
-        # Adjacent chunks must overlap by 2 turns.
+        # Adjacent chunks must overlap by 2 turns (identified by turn_id).
         for a, b in zip(chunks, chunks[1:]):
-            a_last_ids = {t.idx for t in a.turns[-2:]}
-            b_first_ids = {t.idx for t in b.turns[:2]}
+            a_last_ids = {t.turn_id for t in a.turns[-2:]}
+            b_first_ids = {t.turn_id for t in b.turns[:2]}
             self.assertTrue(a_last_ids & b_first_ids, 'no overlap between chunks')
 
     def test_merge_dedupes_events(self):
+        # Post-validator events already carry INT parent idx.
         e1 = {'event_type': 'PRICE_REQUESTED', 'actor': 'customer',
               'turn_start': 3, 'turn_end': 3, 'confidence': 0.9, 'evidence': 'a'}
         e2 = {'event_type': 'PRICE_REQUESTED', 'actor': 'customer',
@@ -213,22 +295,21 @@ class ChunkingTests(SimpleTestCase):
         types = [m['event_type'] for m in merged]
         self.assertEqual(types, ['PRICE_REQUESTED', 'PRICE_GIVEN'])
 
-    def test_render_uses_absolute_indices(self):
-        # Simulate a chunk whose turns already carry absolute indices
-        # from the middle of a longer conversation.
+    def test_render_uses_stable_turn_ids(self):
+        # Chunk turns carry their stable turn_ids regardless of chunk position.
         turns = [
-            NormalizedTurn(idx=100 + i, speaker='customer', direction='in',
+            NormalizedTurn(turn_id=f't{100 + i:04d}', parent_idx=100 + i,
+                           speaker='customer', direction='in',
                            text=f'msg {i}', occurred_at='',
                            kind='sms', from_bulk_transcript=False)
             for i in range(3)
         ]
         chunk = ConversationChunk(
-            turns=turns, turn_index_offset=100,
-            chunk_index=0, is_only_chunk=False,
+            turns=turns, chunk_index=0, is_only_chunk=False,
         )
         text = render_turns_for_prompt(chunk)
-        self.assertIn('[100]', text)
-        self.assertIn('[102]', text)
+        self.assertIn('[t0100]', text)
+        self.assertIn('[t0102]', text)
 
 
 # ---------------------------------------------------------------------------

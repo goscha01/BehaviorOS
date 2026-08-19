@@ -150,8 +150,10 @@ class StubProvider(BaseProvider):
                 {
                     'event_type': 'SERVICE_INQUIRY',
                     'actor': 'customer',
-                    'turn_start': 0,
-                    'turn_end': 0,
+                    # v2: extractor accepts STRING turn_ids resolved via
+                    # TurnIdMap. "t0000" is the first turn's default ID.
+                    'turn_start': 't0000',
+                    'turn_end': 't0000',
                     'confidence': 0.5,
                     'attributes': {'stub': True},
                     'evidence': '[stub] StubProvider — set OPENAI_API_KEY or ANTHROPIC_API_KEY for real extraction.',
