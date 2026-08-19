@@ -232,6 +232,132 @@ assert _ALL_CLASSIFIED == EVENT_TYPES, (
 )
 
 
+# ---------------------------------------------------------------------------
+# Behavioral / controllability classification for Pipeline 1B-3
+# ---------------------------------------------------------------------------
+#
+# Orthogonal to the temporal classification above. Answers a different
+# question: which of these events is the AGENT choosing to do, vs. which
+# describes something the customer signalled, vs. which is a state?
+#
+# The frame: BehaviorOS ships behavior rules to LeadBridge (text) and
+# Callio (voice). A rule can only fire on an agent action. So Pipeline
+# 1B-3 enumerates comparisons of the form:
+#
+#   given customer_signal C occurred
+#     → which AGENT_ACTION response A appeared to work best?
+#
+# CONVERSATION_STATE events (currently LEAD_MISMATCH, CONVERSATION_STALLED)
+# are neither a customer intent expression nor an agent choice — they
+# describe the situation. LEAD_MISMATCH specifically triggers conversation
+# exclusion from sales-effectiveness comparisons (asking about a cleaning
+# job is not a failed cleaning sale).
+#
+# One event type has exactly ONE behavioral role. If a new analysis needs
+# a state like "customer stalled", derive it in the analyzer from timing
+# + event absence — do NOT dual-classify existing events.
+
+CUSTOMER_SIGNAL_EVENTS: frozenset[str] = frozenset({
+    # customer need / intent
+    SERVICE_INQUIRY, SERVICE_DETAILS_PROVIDED, PRICE_REQUESTED,
+    AVAILABILITY_REQUESTED, BOOKING_REQUESTED, CALL_REQUESTED, QUESTION_FAQ,
+    # qualification info coming FROM the customer
+    QUALIFICATION_ANSWER, PROPERTY_DETAILS_PROVIDED,
+    # discount ask
+    DISCOUNT_REQUESTED,
+    # objections + hesitation + deferral (all customer-initiated)
+    PRICE_OBJECTION, TIMING_OBJECTION, TRUST_OBJECTION, SERVICE_OBJECTION,
+    COMPETITOR_MENTIONED, CUSTOMER_HESITATION, CUSTOMER_DEFERRED,
+    # weak signal: customer replied at all
+    CUSTOMER_RESPONDED,
+})
+
+
+AGENT_ACTION_EVENTS: frozenset[str] = frozenset({
+    # qualification led by agent
+    QUALIFICATION_QUESTION, SERVICE_SCOPE_CLARIFIED,
+    # pricing plays
+    PRICE_GIVEN, PRICE_RANGE_GIVEN, DISCOUNT_OFFERED, PRICE_EXPLAINED,
+    # availability + booking plays
+    AVAILABILITY_GIVEN, TIME_SLOT_OFFERED, BOOKING_ATTEMPT,
+    # outbound / cadence / persuasion
+    FOLLOW_UP_SENT, CALL_ATTEMPT, HUMAN_HANDOFF, URGENCY_CREATED,
+    SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
+})
+
+
+CONVERSATION_STATE_EVENTS: frozenset[str] = frozenset({
+    # inferred conversation state, not a choice by either party
+    CONVERSATION_STALLED,
+    # wrong-intent lead — triggers sales-effectiveness exclusion downstream
+    LEAD_MISMATCH,
+})
+
+
+# OUTCOME_PROXY_EVENTS and POST_OUTCOME_EVENTS above serve BOTH the
+# temporal and behavioral classifications — an event's temporal role of
+# OUTCOME_PROXY implies the same behavioral role, and same for
+# POST_OUTCOME. We do not re-declare them here; the behavioral lookup
+# below defers to those sets for those two classes.
+
+
+def event_behavioral_class(event_type: str) -> str:
+    """Return one of:
+    'CUSTOMER_SIGNAL' | 'AGENT_ACTION' | 'CONVERSATION_STATE' |
+    'OUTCOME_PROXY' | 'POST_OUTCOME'.
+
+    Guaranteed to return one of the above for any type in EVENT_TYPES
+    (see sanity assert below).
+    """
+    if event_type in CUSTOMER_SIGNAL_EVENTS:
+        return 'CUSTOMER_SIGNAL'
+    if event_type in AGENT_ACTION_EVENTS:
+        return 'AGENT_ACTION'
+    if event_type in CONVERSATION_STATE_EVENTS:
+        return 'CONVERSATION_STATE'
+    if event_type in OUTCOME_PROXY_EVENTS:
+        return 'OUTCOME_PROXY'
+    if event_type in POST_OUTCOME_EVENTS:
+        return 'POST_OUTCOME'
+    # UNKNOWN_TIMING_EVENTS all happen to be AGENT_ACTION (CALL_ATTEMPT,
+    # HUMAN_HANDOFF). Enforce that in the sanity check below.
+    raise ValueError(f'unclassified event_type: {event_type!r}')
+
+
+# Sanity: every ontology event type must have exactly one behavioral role,
+# AND UNKNOWN_TIMING events must all resolve to AGENT_ACTION (which is
+# where the current members belong).
+_ALL_BEHAVIORAL_CLASSIFIED = (
+    CUSTOMER_SIGNAL_EVENTS | AGENT_ACTION_EVENTS | CONVERSATION_STATE_EVENTS
+    | OUTCOME_PROXY_EVENTS | POST_OUTCOME_EVENTS
+)
+assert _ALL_BEHAVIORAL_CLASSIFIED == EVENT_TYPES, (
+    f'ontology / behavioral classification drift: '
+    f'unclassified = {sorted(EVENT_TYPES - _ALL_BEHAVIORAL_CLASSIFIED)}, '
+    f'unknown types classified = {sorted(_ALL_BEHAVIORAL_CLASSIFIED - EVENT_TYPES)}'
+)
+# Behavioral classes must not overlap with each other (a type has ONE role).
+_BEHAVIORAL_SETS = [
+    ('CUSTOMER_SIGNAL', CUSTOMER_SIGNAL_EVENTS),
+    ('AGENT_ACTION', AGENT_ACTION_EVENTS),
+    ('CONVERSATION_STATE', CONVERSATION_STATE_EVENTS),
+    ('OUTCOME_PROXY', OUTCOME_PROXY_EVENTS),
+    ('POST_OUTCOME', POST_OUTCOME_EVENTS),
+]
+for _i, (_n_a, _s_a) in enumerate(_BEHAVIORAL_SETS):
+    for _n_b, _s_b in _BEHAVIORAL_SETS[_i + 1:]:
+        _overlap = _s_a & _s_b
+        assert not _overlap, (
+            f'behavioral classification overlap: {_n_a} ∩ {_n_b} = '
+            f'{sorted(_overlap)}'
+        )
+# UNKNOWN_TIMING events all belong to AGENT_ACTION behaviorally.
+assert UNKNOWN_TIMING_EVENTS <= AGENT_ACTION_EVENTS, (
+    f'UNKNOWN_TIMING events must be behavioral AGENT_ACTION; '
+    f'stragglers = {sorted(UNKNOWN_TIMING_EVENTS - AGENT_ACTION_EVENTS)}'
+)
+
+
 def event_types_by_category() -> dict[str, list[str]]:
     """For docs, prompt construction, distribution reports."""
     return {

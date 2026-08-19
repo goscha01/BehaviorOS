@@ -740,3 +740,204 @@ class CandidatePattern(BaseModel):
 
     def __str__(self) -> str:
         return f'{self.pattern_id} [{self.kind}] {self.sequence}'
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1B-3: conditional (customer signal → agent action) analysis
+# ---------------------------------------------------------------------------
+
+
+class ConditionalAnalysisRun(BaseModel):
+    """One end-to-end conditional-action analysis run.
+
+    Same 80/20 stratified split model as PatternDiscoveryRun, but the
+    unit of analysis is (condition_event, action_event) cells rather
+    than event-sequence presence.
+
+    Unique on (corpus, extraction_run, analyzer_version, split_seed) so
+    reruns with the same parameters are no-ops; changing the seed or
+    analyzer version yields a new run and preserves old results.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='conditional_analysis_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='conditional_analysis_runs',
+    )
+    extraction_run = models.ForeignKey(
+        SemanticExtractionRun, on_delete=models.CASCADE,
+        related_name='conditional_analysis_runs',
+    )
+    analyzer_version = models.CharField(max_length=64)
+    split_seed = models.PositiveIntegerField(
+        help_text='Same-seed convention as PatternDiscoveryRun for split reproducibility.',
+    )
+    config = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices,
+                              default=Status.PENDING)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    discovery_conversation_ids = models.JSONField(default=list, blank=True)
+    holdout_conversation_ids = models.JSONField(default=list, blank=True)
+    positive_class_statuses = models.JSONField(default=list, blank=True)
+    negative_class_statuses = models.JSONField(default=list, blank=True)
+
+    n_discovery_positive = models.PositiveIntegerField(default=0)
+    n_discovery_negative = models.PositiveIntegerField(default=0)
+    n_holdout_positive = models.PositiveIntegerField(default=0)
+    n_holdout_negative = models.PositiveIntegerField(default=0)
+
+    # LEAD_MISMATCH conversations are excluded from all denominators —
+    # they were never sales opportunities. Preserved in the DB (events
+    # are not deleted); this counter is the audit trail for what got
+    # dropped and why.
+    n_excluded_lead_mismatch = models.PositiveIntegerField(default=0)
+    n_excluded_status = models.PositiveIntegerField(default=0)
+
+    # Total per-conversation (C, first-response) observations enumerated
+    # across each split. Diagnostic — one conversation with three distinct
+    # C-types contributes 3 observations.
+    n_discovery_observations = models.PositiveIntegerField(default=0)
+    n_holdout_observations = models.PositiveIntegerField(default=0)
+
+    patterns_found = models.PositiveIntegerField(default=0)
+    patterns_supported = models.PositiveIntegerField(default=0)
+    patterns_reproduced_on_holdout = models.PositiveIntegerField(default=0)
+    error_summary = models.TextField(blank=True, default='')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['corpus', 'extraction_run', 'analyzer_version', 'split_seed'],
+                name='conditional_run_key_unique',
+            ),
+        ]
+        indexes = [models.Index(fields=['corpus', 'status'])]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'ConditionalRun {self.corpus.name}@{self.corpus.version} seed={self.split_seed}'
+
+
+class ConditionalActionPattern(BaseModel):
+    """One (condition_event, action_event) comparison cell.
+
+    Primary comparison: rate(positive | C + A) vs rate(positive | C + other AGENT_ACTION).
+    Secondary baseline: rate(positive | C + A) vs rate(positive | C + no response).
+
+    A "supported" pattern has enough conversations in BOTH the C+A cell
+    and the C+other-A comparator (>= min_cell_support in each). Cells
+    where only C+A meets support are marked DIRECTIONAL_ONLY — the rate
+    is reportable but the comparison is not.
+    """
+
+    class OverallStatus(models.TextChoices):
+        SUPPORTED = 'SUPPORTED', 'Enough support in both cells for a comparison'
+        DIRECTIONAL_ONLY = 'DIRECTIONAL_ONLY', 'C+A cell supported but comparator too small'
+        UNDERPOWERED = 'UNDERPOWERED', 'C+A cell below min_cell_support'
+
+    class HoldoutStatus(models.TextChoices):
+        REPRODUCED = 'HOLDOUT_REPRODUCED', 'Primary direction reproduced on holdout'
+        FAILED = 'HOLDOUT_FAILED', 'Primary direction did NOT reproduce'
+        UNDERPOWERED = 'UNDERPOWERED', 'Holdout cell too small'
+
+    analysis_run = models.ForeignKey(
+        ConditionalAnalysisRun, on_delete=models.CASCADE,
+        related_name='patterns',
+    )
+    pattern_id = models.CharField(
+        max_length=32,
+        help_text='Like CA0017 within the analysis_run',
+    )
+    condition_event = models.CharField(
+        max_length=64,
+        help_text='CUSTOMER_SIGNAL ontology event type',
+    )
+    action_event = models.CharField(
+        max_length=64,
+        help_text='AGENT_ACTION ontology event type',
+    )
+
+    # Discovery cell counts. CA = condition + this action. CO = condition
+    # + other AGENT_ACTION (primary comparator). CN = condition + no
+    # eligible response in window (secondary baseline).
+    d_ca_positive = models.PositiveIntegerField(default=0)
+    d_ca_negative = models.PositiveIntegerField(default=0)
+    d_co_positive = models.PositiveIntegerField(default=0)
+    d_co_negative = models.PositiveIntegerField(default=0)
+    d_cn_positive = models.PositiveIntegerField(default=0)
+    d_cn_negative = models.PositiveIntegerField(default=0)
+
+    # Discovery rates (pos / (pos + neg) per cell) — 0 if cell empty.
+    d_ca_rate = models.FloatField(default=0.0)
+    d_co_rate = models.FloatField(default=0.0)
+    d_cn_rate = models.FloatField(default=0.0)
+
+    # Effect sizes on discovery (rate_a - rate_b).
+    d_primary_effect = models.FloatField(
+        default=0.0, help_text='rate(CA) - rate(CO) — the business question')
+    d_primary_ci_low = models.FloatField(default=0.0)
+    d_primary_ci_high = models.FloatField(default=0.0)
+    d_secondary_effect = models.FloatField(
+        default=0.0, help_text='rate(CA) - rate(CN) — reported, not ranked on')
+    d_secondary_ci_low = models.FloatField(default=0.0)
+    d_secondary_ci_high = models.FloatField(default=0.0)
+
+    # Length-adjusted primary direction — same convention as 1B-2.
+    length_adjusted_direction_short = models.CharField(
+        max_length=16, blank=True, default='')
+    length_adjusted_direction_long = models.CharField(
+        max_length=16, blank=True, default='')
+
+    # Holdout cell counts + effects.
+    h_ca_positive = models.PositiveIntegerField(default=0)
+    h_ca_negative = models.PositiveIntegerField(default=0)
+    h_co_positive = models.PositiveIntegerField(default=0)
+    h_co_negative = models.PositiveIntegerField(default=0)
+    h_cn_positive = models.PositiveIntegerField(default=0)
+    h_cn_negative = models.PositiveIntegerField(default=0)
+    h_primary_effect = models.FloatField(default=0.0)
+    h_secondary_effect = models.FloatField(default=0.0)
+
+    overall_status = models.CharField(
+        max_length=32, choices=OverallStatus.choices,
+        default=OverallStatus.UNDERPOWERED)
+    holdout_status = models.CharField(
+        max_length=32, choices=HoldoutStatus.choices,
+        default=HoldoutStatus.UNDERPOWERED)
+
+    # Up to 50 conversation IDs per side of the C+A cell for evidence.
+    evidence_positive_ids = models.JSONField(default=list, blank=True)
+    evidence_negative_ids = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['analysis_run', 'pattern_id'],
+                name='conditional_pattern_id_unique',
+            ),
+            models.UniqueConstraint(
+                fields=['analysis_run', 'condition_event', 'action_event'],
+                name='conditional_pattern_ca_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['analysis_run', 'condition_event']),
+            models.Index(fields=['analysis_run', 'overall_status']),
+            models.Index(fields=['analysis_run', '-d_primary_effect']),
+        ]
+        ordering = ['analysis_run', 'pattern_id']
+
+    def __str__(self) -> str:
+        return (f'{self.pattern_id} {self.condition_event} → '
+                f'{self.action_event} ({self.overall_status})')
