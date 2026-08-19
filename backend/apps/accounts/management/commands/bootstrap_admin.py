@@ -77,3 +77,22 @@ class Command(BaseCommand):
         ))
 
         self.stdout.write(f'  pruned={pruned[0]} stray memberships/orgs')
+
+        # Boot-time diagnostic: dump orgs + applied migrations. Cheap, low
+        # volume (~5 orgs, ~10 migrations), runs once per deploy. Gives ops
+        # a way to see prod state without needing DB access — every deploy
+        # log answers "what orgs exist?" and "is migration baseline in sync?".
+        all_orgs = list(Organization.objects.all().order_by('name'))
+        self.stdout.write(f'bootstrap_diagnostic orgs count={len(all_orgs)}:')
+        for o in all_orgs:
+            self.stdout.write(f'  org id={o.id} name={o.name!r}')
+
+        from django.db.migrations.recorder import MigrationRecorder
+        applied = list(
+            MigrationRecorder.Migration.objects
+            .order_by('app', 'name')
+            .values_list('app', 'name')
+        )
+        self.stdout.write(f'bootstrap_diagnostic migrations applied count={len(applied)}:')
+        for app_label, mig_name in applied:
+            self.stdout.write(f'  migration {app_label}.{mig_name}')
