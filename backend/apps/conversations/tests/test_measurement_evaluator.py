@@ -343,10 +343,12 @@ class FinalizedGuardTests(TestCase):
 
 
 class AttributionWindowTests(TestCase):
-    def test_conversation_inside_attribution_window_but_still_open_not_scored(self):
-        """A conversation that's eligible + has the signal but is
-        younger than attribution_window_days: counts toward the
-        denominator + eligible bucket, but is NOT scored yet."""
+    def test_conversation_not_yet_matured_counted_but_not_scored(self):
+        """A conversation that's eligible + has the signal but hasn't
+        matured (started_at + attribution_window_days > now) counts
+        toward provenance_eligible_n but NOT toward post_matured_n /
+        post_n / post_positive_n. Under terminal_known_after_maturity_v1,
+        we wait for the full maturity gate before scoring."""
         b = _bootstrap()
         prov = {
             'status': 'OK',
@@ -357,7 +359,7 @@ class AttributionWindowTests(TestCase):
             'behavior_os_managed_hash_at_start': TREATMENT_MANAGED,
         }
         # applied_at was 30 days ago; attribution window is 14 days.
-        # A conversation started 5 days ago has an open window.
+        # A conversation started 5 days ago has NOT matured.
         recent = timezone.now() - timedelta(days=5)
         _mk_conv(
             b['org'], b['extraction'], recent,
@@ -366,6 +368,100 @@ class AttributionWindowTests(TestCase):
         evaluate(b['measurement'])
         m = RecommendationOutcomeMeasurement.objects.get(id=b['measurement'].id)
         self.assertEqual(m.provenance_eligible_n, 1)
-        # NOT scored — the outcome could still change
+        # NOT matured, NOT scored — the outcome could still change
+        self.assertEqual(m.post_matured_n, 0)
         self.assertEqual(m.post_n, 0)
         self.assertEqual(m.post_positive_n, 0)
+        self.assertEqual(m.post_unresolved_n, 0)
+
+    def test_matured_conversation_scored_regardless_of_captured_at(self):
+        """A matured conv is scored using the latest known snapshot
+        even if captured_at is FAR in the future (async resolver)."""
+        b = _bootstrap()
+        prov = {
+            'status': 'OK',
+            'effective_config_schema_version': (
+                EFFECTIVE_CONFIG_SCHEMA_VERSION
+            ),
+            'effective_config_hash_at_start': TREATMENT_FULL,
+            'behavior_os_managed_hash_at_start': TREATMENT_MANAGED,
+        }
+        # Conv started 20 days ago — well past 14d maturity gate.
+        # OutcomeSnapshot captured_at is BEFORE now (so it's visible
+        # under `captured_at <= now`) but far after the conversation.
+        started = timezone.now() - timedelta(days=20)
+        from apps.conversations.models import Conversation as _Conv
+        from apps.conversations.models import (
+            ConversationSemanticEvent as _CSE,
+        )
+        conv = _Conv.objects.create(
+            org=b['org'], source='leadbridge',
+            source_conversation_id='c-matured-late-snap',
+            started_at=started,
+            metadata={'config_provenance': prov},
+        )
+        _CSE.objects.create(
+            org=b['org'], conversation=conv,
+            extraction_run=b['extraction'],
+            ordinal=0, event_type='DISCOUNT_REQUESTED',
+            actor='customer', turn_start=1, turn_end=1, confidence=0.9,
+        )
+        OutcomeSnapshot.objects.create(
+            conversation=conv,
+            captured_at=timezone.now() - timedelta(hours=1),
+            lb_booked=True,
+        )
+        evaluate(b['measurement'])
+        m = RecommendationOutcomeMeasurement.objects.get(id=b['measurement'].id)
+        self.assertEqual(m.post_matured_n, 1)
+        self.assertEqual(m.post_positive_n, 1)
+        self.assertEqual(m.post_n, 1)
+
+
+class OutcomeResolutionCoverageGateTests(TestCase):
+    """The new outcome_resolution_coverage gate — READY is refused
+    when too many matured conversations have no known terminal."""
+
+    def _prov_ok(self):
+        return {
+            'status': 'OK',
+            'effective_config_schema_version': (
+                EFFECTIVE_CONFIG_SCHEMA_VERSION
+            ),
+            'effective_config_hash_at_start': TREATMENT_FULL,
+            'behavior_os_managed_hash_at_start': TREATMENT_MANAGED,
+        }
+
+    def test_low_outcome_coverage_stays_collecting(self):
+        b = _bootstrap()
+        prov = self._prov_ok()
+        # 40 matured, 30 with terminals (75%) — meets 60% floor. Add
+        # 30 more unresolved to drop below floor: 30/70 = 43% < 60%.
+        for i in range(30):
+            _mk_conv(
+                b['org'], b['extraction'],
+                b['applied_at'] + timedelta(days=1),
+                provenance=prov, outcome={'lb_booked': True},
+                started_id=i,
+            )
+        for i in range(40):
+            # matured (> 14d ago from now given applied_at 30d ago +
+            # +1d) but no outcome snapshot at all
+            _mk_conv(
+                b['org'], b['extraction'],
+                b['applied_at'] + timedelta(days=1),
+                provenance=prov, outcome=None,
+                started_id=100 + i,
+            )
+        evaluate(b['measurement'])
+        m = RecommendationOutcomeMeasurement.objects.get(id=b['measurement'].id)
+        self.assertEqual(m.post_matured_n, 70)
+        self.assertEqual(m.post_positive_n, 30)
+        self.assertEqual(m.post_unresolved_n, 40)
+        self.assertEqual(m.post_n, 30)
+        self.assertEqual(
+            m.status,
+            RecommendationOutcomeMeasurement.Status.COLLECTING,
+        )
+        self.assertIn('outcome_resolution_coverage_below_floor',
+                       m.status_reason)

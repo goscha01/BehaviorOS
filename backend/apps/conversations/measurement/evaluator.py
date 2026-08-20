@@ -78,17 +78,27 @@ class _Counters:
     contaminated: int = 0
     treatment_moved: int = 0
 
-    # outcome scoring — only on the eligible/clean subset
+    # Maturity + outcome scoring on the eligible/clean subset only.
+    # A clean conversation contributes to `matured` once it's past
+    # started_at + attribution_window_days. Of matured, positive +
+    # negative = resolved, unresolved is the remainder.
+    matured: int = 0
     positive: int = 0
-    negative: int = 0  # unresolved excluded from both
+    negative: int = 0
+    unresolved: int = 0
 
     def eligible_resolved_n(self) -> int:
         return self.positive + self.negative
 
-    def coverage(self) -> Optional[float]:
+    def provenance_coverage(self) -> Optional[float]:
         if self.target_signal_total == 0:
             return None
         return self.provenance_eligible / self.target_signal_total
+
+    def outcome_resolution_coverage(self) -> Optional[float]:
+        if self.matured == 0:
+            return None
+        return self.eligible_resolved_n() / self.matured
 
 
 def evaluate(
@@ -126,12 +136,16 @@ def _score_post_cohort(
     outcome = spec.primary_outcome
     applied_at = measurement.applied_at
     now = timezone.now()
-    # Post-cohort candidate window: conversations that STARTED after
-    # applied_at AND have had at least attribution_window_days to
-    # accumulate outcomes. Later starts are still counted toward the
-    # target_signal denominator but won't be scorable until their
-    # window closes.
-    window_close = now - timedelta(days=outcome.attribution_window_days)
+    # Maturity gate under `terminal_known_after_maturity_v1`: a
+    # conversation becomes score-eligible once it has had the full
+    # attribution_window_days from its `started_at`. Not-yet-matured
+    # conversations still count toward the target_signal denominator
+    # and the provenance breakdown so the operator can see the
+    # eligible pipeline; they just don't contribute to
+    # positive/negative until they mature.
+    maturity_gate = now - timedelta(
+        days=outcome.attribution_window_days,
+    )
 
     # Post-cohort candidates: any conversation on the tenant's org
     # (all sources) started after applied_at. Provenance
@@ -201,37 +215,33 @@ def _score_post_cohort(
         if eligibility != 'eligible':
             continue
 
-        # Skip conversations whose attribution window hasn't closed
-        # yet — outcome may not be resolved. They still count toward
-        # target_signal_total + provenance_eligible so the operator
-        # sees them ("N eligible but too new to score").
-        if conv.started_at > window_close:
+        # Maturity gate. Not-yet-matured convs still counted in
+        # provenance_eligible (visible in the coverage numerator) but
+        # do not contribute to positive/negative/unresolved.
+        if conv.started_at > maturity_gate:
             continue
+        counters.matured += 1
 
-        window_end = conv.started_at + timedelta(
-            days=outcome.attribution_window_days,
+        # Latest known terminal, regardless of captured_at, per
+        # outcome_semantics=terminal_known_after_maturity_v1.
+        snap = (
+            OutcomeSnapshot.objects
+            .filter(conversation_id=conv.id, captured_at__lte=now)
+            .only(
+                'lb_booked', 'lb_lost', 'lb_cancelled',
+                'sf_booked', 'sf_completed', 'sf_cancelled',
+                'captured_at',
+            )
+            .order_by('-captured_at')
+            .first()
         )
-        outcome_qs = OutcomeSnapshot.objects.filter(
-            conversation_id=conv.id,
-            captured_at__lte=window_end,
-        ).only(
-            'lb_booked', 'lb_lost', 'lb_cancelled',
-            'sf_booked', 'sf_completed', 'sf_cancelled',
-        )
-        reached_positive = False
-        reached_negative = False
-        for snap in outcome_qs:
-            tokens = _outcome_tokens(snap)
-            if positive_events & tokens:
-                reached_positive = True
-                break
-            if negative_events & tokens:
-                reached_negative = True
-        if reached_positive:
+        tokens = _outcome_tokens(snap) if snap is not None else frozenset()
+        if tokens & positive_events:
             counters.positive += 1
-        elif reached_negative:
+        elif tokens & negative_events:
             counters.negative += 1
-        # else unresolved — not counted in either arm
+        else:
+            counters.unresolved += 1
 
     return counters
 
@@ -352,10 +362,15 @@ def _compute_verdict(
             pre_pos, pre_n - pre_pos,
         )
 
-    coverage = counters.coverage()
-    coverage_ok = (
-        coverage is not None
-        and coverage >= gates.min_provenance_coverage
+    prov_coverage = counters.provenance_coverage()
+    prov_coverage_ok = (
+        prov_coverage is not None
+        and prov_coverage >= gates.min_provenance_coverage
+    )
+    outcome_coverage = counters.outcome_resolution_coverage()
+    outcome_coverage_ok = (
+        outcome_coverage is not None
+        and outcome_coverage >= gates.min_outcome_resolution_coverage
     )
     sample_ok = (
         pre_n >= gates.min_sample_per_arm
@@ -364,29 +379,49 @@ def _compute_verdict(
 
     # Deadline reached — no more waiting.
     if deadline_reached:
-        if not sample_ok or not coverage_ok or effect_pp is None:
+        if (not sample_ok or not prov_coverage_ok
+                or not outcome_coverage_ok or effect_pp is None):
             return _Verdict(
                 status=Status.INCONCLUSIVE,
                 reason=(
                     f'deadline_reached_thresholds_unmet: '
-                    f'sample_ok={sample_ok} coverage_ok={coverage_ok} '
-                    f'coverage={coverage!r}'
+                    f'sample_ok={sample_ok} '
+                    f'prov_ok={prov_coverage_ok} '
+                    f'outcome_ok={outcome_coverage_ok} '
+                    f'prov_cov={prov_coverage!r} '
+                    f'outcome_cov={outcome_coverage!r}'
                 ),
                 effect_size_pp=effect_pp,
                 ci_low_pp=ci_low_pp, ci_high_pp=ci_high_pp,
                 p_value=p_value,
             )
-        # Sample + coverage OK. Verdict from stats:
+        # All gates OK. Verdict from stats:
         return _terminal_from_stats(
             effect_pp, ci_low_pp, ci_high_pp, p_value, gates,
             deadline_reached=True,
         )
 
     # Not at deadline yet.
-    if not coverage_ok:
+    if not prov_coverage_ok:
         return _Verdict(
             status=Status.COLLECTING,
-            reason=f'provenance_coverage_below_floor coverage={coverage!r}',
+            reason=(
+                f'provenance_coverage_below_floor '
+                f'coverage={prov_coverage!r}'
+            ),
+            effect_size_pp=effect_pp,
+            ci_low_pp=ci_low_pp, ci_high_pp=ci_high_pp,
+            p_value=p_value,
+        )
+    if not outcome_coverage_ok:
+        return _Verdict(
+            status=Status.COLLECTING,
+            reason=(
+                f'outcome_resolution_coverage_below_floor '
+                f'coverage={outcome_coverage!r} '
+                f'matured={counters.matured} '
+                f'resolved={counters.eligible_resolved_n()}'
+            ),
             effect_size_pp=effect_pp,
             ci_low_pp=ci_low_pp, ci_high_pp=ci_high_pp,
             p_value=p_value,
@@ -507,8 +542,11 @@ def _persist(
         m.contaminated_n = counters.contaminated
         m.treatment_moved_n = counters.treatment_moved
 
+        m.post_matured_n = counters.matured
         m.post_n = counters.eligible_resolved_n()
         m.post_positive_n = counters.positive
+        m.post_negative_n = counters.negative
+        m.post_unresolved_n = counters.unresolved
         m.post_rate = (
             counters.positive / m.post_n if m.post_n > 0 else None
         )
@@ -532,7 +570,8 @@ def _persist(
         f'(pre={m.pre_positive_n}/{m.pre_n} '
         f'post={m.post_positive_n}/{m.post_n} '
         f'effect={m.effect_size_pp!r} p={m.p_value!r} '
-        f'coverage={counters.coverage()!r})'
+        f'prov_cov={counters.provenance_coverage()!r} '
+        f'outcome_cov={counters.outcome_resolution_coverage()!r})'
     )
     return m
 
@@ -563,6 +602,11 @@ def _rehydrate_spec_from_dict(d: dict) -> FrozenMeasurementSpec:
         ),
         primary_outcome=PrimaryOutcomeDefinition(
             kind=po['kind'],
+            # Older frozen rows may not have `outcome_semantics`;
+            # default to the v1 rule for compatibility.
+            outcome_semantics=po.get(
+                'outcome_semantics', 'terminal_known_after_maturity_v1',
+            ),
             attribution_window_days=po['attribution_window_days'],
             baseline_window_days=po['baseline_window_days'],
             positive_terminal_events=tuple(po['positive_terminal_events']),
@@ -576,6 +620,9 @@ def _rehydrate_spec_from_dict(d: dict) -> FrozenMeasurementSpec:
                 vg['uncertainty_significance_alpha']
             ),
             min_provenance_coverage=vg['min_provenance_coverage'],
+            min_outcome_resolution_coverage=vg.get(
+                'min_outcome_resolution_coverage', 0.60,
+            ),
             max_window_days_for_inconclusive=(
                 vg['max_window_days_for_inconclusive']
             ),

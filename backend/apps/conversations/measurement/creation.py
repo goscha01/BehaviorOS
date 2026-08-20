@@ -136,11 +136,16 @@ def create_measurement(
     org = rec.run.org
 
     # Baseline cohort computation — FROZEN once at creation.
-    baseline_cohort_ids, baseline_pos, baseline_neg = _compute_baseline_cohort(
+    freeze_time = timezone.now()
+    (
+        baseline_cohort_ids, baseline_pos, baseline_neg,
+        baseline_matured, baseline_unresolved,
+    ) = _compute_baseline_cohort(
         org=org,
         tenant_external_id=tenant_external_id,
         target_signal=target_signal,
         applied_at=ctx.applied_at,
+        freeze_time=freeze_time,
         spec=frozen,
     )
     pre_n = baseline_pos + baseline_neg
@@ -180,9 +185,12 @@ def create_measurement(
             pre_cohort_conversation_ids=[
                 str(cid) for cid in baseline_cohort_ids
             ],
-            pre_cohort_frozen_at=timezone.now(),
+            pre_cohort_frozen_at=freeze_time,
+            pre_matured_n=baseline_matured,
             pre_n=pre_n,
             pre_positive_n=baseline_pos,
+            pre_negative_n=baseline_neg,
+            pre_unresolved_n=baseline_unresolved,
             pre_rate=pre_rate,
 
             status=RecommendationOutcomeMeasurement.Status.BASELINE_FROZEN,
@@ -197,7 +205,9 @@ def create_measurement(
         f'MeasurementCreation: created rom_id={row.id} '
         f'for rec={rec.recommendation_id} '
         f'lb_app={ctx.lb_recommendation_application_id} '
-        f'pre_n={pre_n} pre_rate={pre_rate!r}'
+        f'pre_matured={baseline_matured} pre_n={pre_n} '
+        f'pre_positive={baseline_pos} pre_unresolved={baseline_unresolved} '
+        f'pre_rate={pre_rate!r}'
     )
     return row
 
@@ -208,49 +218,49 @@ def _compute_baseline_cohort(
     tenant_external_id: str,
     target_signal: str,
     applied_at: datetime,
+    freeze_time: datetime,
     spec: FrozenMeasurementSpec,
-) -> tuple[list, int, int]:
+) -> tuple[list, int, int, int, int]:
     """Find pre-application conversations matching cohort_entry and
-    score their outcomes.
+    score their outcomes under the v1 maturity semantic
+    ('terminal_known_after_maturity_v1').
 
-    Returns (conversation_ids, positive_n, negative_n).
+    Returns:
+      (conversation_ids, positive_n, negative_n, matured_n,
+       unresolved_n)
+
+    - `conversation_ids`: FROZEN cohort membership — all convs matching
+      cohort_entry in the baseline window, regardless of maturity.
+    - `matured_n`: subset that have finished maturing as of
+      `freeze_time` (started_at + attribution_window_days <= freeze_time).
+      Only matured convs are score-eligible.
+    - `positive_n` / `negative_n`: matured convs whose LATEST
+      OutcomeSnapshot (as of freeze_time) shows the respective
+      terminal. Latest snapshot per conversation — `captured_at` is
+      NOT used to gate eligibility, only to break ties among snapshots.
+    - `unresolved_n`: matured convs with no terminal in their latest
+      snapshot (or with no snapshot at all).
 
     Cohort membership:
-      - Conversation.org == org (tenant scoping — v1 approximation;
-        assumes org is 1:1 with an LB tenant for now; v2 should tighten
-        via EntityLink → LB lead ownership check)
-      - source is ANY (voice via `quo`, LB SMS/webhooks via `leadbridge`,
-        etc. — all sources for the tenant's org contribute). Filtering
-        by source alone is wrong because behavior recommendations apply
-        to the tenant's WHOLE customer-conversation surface, not just
-        one ingestion channel.
+      - Conversation.org == org (tenant scoping — v1 approximation)
+      - source is ANY (voice via `quo`, LB SMS/webhooks via
+        `leadbridge`, etc.)
       - started_at in [applied_at - baseline_window_days, applied_at)
       - has at least one ConversationSemanticEvent with
         event_type == target_signal
-
-    Outcome scoring (per FrozenMeasurementSpec.primary_outcome):
-      - Look at OutcomeSnapshots for this conversation captured within
-        attribution_window_days of started_at
-      - Positive if ANY snapshot has a positive_terminal_event True
-      - Negative if ANY snapshot has a negative_terminal_event True
-        AND no positive was reached
-      - Unresolved otherwise (not counted in either arm)
     """
     outcome = spec.primary_outcome
     window_start = applied_at - timedelta(days=outcome.baseline_window_days)
+    maturity_gate = freeze_time - timedelta(
+        days=outcome.attribution_window_days,
+    )
 
-    # Candidate conversations in the baseline window. Source is NOT
-    # filtered — a tenant's customer-conversation surface spans every
-    # ingestion channel (voice via quo, LB webhooks, etc.) and the
-    # rec's target signal applies to the whole surface.
     candidate_qs = Conversation.objects.filter(
         org=org,
         started_at__gte=window_start,
         started_at__lt=applied_at,
     ).only('id', 'started_at')
 
-    # Which of those have at least one target_signal event? Do it as a
-    # single semantic-event query to avoid an N+1.
     matching_ids = set(
         ConversationSemanticEvent.objects.filter(
             org=org,
@@ -259,51 +269,66 @@ def _compute_baseline_cohort(
         ).values_list('conversation_id', flat=True).distinct()
     )
     if not matching_ids:
-        return ([], 0, 0)
+        return ([], 0, 0, 0, 0)
 
-    positive_n = 0
-    negative_n = 0
-    cohort_ids: list = []
     positive_events = frozenset(outcome.positive_terminal_events)
     negative_events = frozenset(outcome.negative_terminal_events)
 
-    # Load conversations + all outcome snapshots in the attribution
-    # window for scoring. For v1 the corpus is small enough that a
-    # loop is fine; a later optimization can push scoring into SQL.
-    convs = Conversation.objects.filter(id__in=matching_ids).only(
-        'id', 'started_at',
+    convs = list(
+        Conversation.objects.filter(id__in=matching_ids)
+        .only('id', 'started_at')
     )
-    for conv in convs:
-        cohort_ids.append(conv.id)
-        window_end = conv.started_at + timedelta(
-            days=outcome.attribution_window_days,
-        )
-        outcome_qs = OutcomeSnapshot.objects.filter(
-            conversation_id=conv.id,
-            captured_at__lte=window_end,
-        )
-        # Terminals derived from the snapshot's boolean columns via
-        # the canonical outcome tokens.
-        reached_positive = False
-        reached_negative = False
-        for snap in outcome_qs.only(
-            'lb_booked', 'lb_lost', 'lb_cancelled',
-            'sf_booked', 'sf_completed', 'sf_cancelled',
-        ):
-            tokens = _extract_outcome_tokens(snap)
-            if positive_events & tokens:
-                reached_positive = True
-            if negative_events & tokens:
-                reached_negative = True
-            if reached_positive:
-                break
-        if reached_positive:
-            positive_n += 1
-        elif reached_negative:
-            negative_n += 1
-        # else: unresolved — not counted in either arm
+    # Membership frozen — sorted for determinism.
+    cohort_ids = sorted([c.id for c in convs])
 
-    return (cohort_ids, positive_n, negative_n)
+    positive_n = 0
+    negative_n = 0
+    matured_n = 0
+    unresolved_n = 0
+
+    for conv in convs:
+        if conv.started_at > maturity_gate:
+            # Not matured yet — still counts in cohort_ids but is not
+            # score-eligible. Under v1's freeze semantics, this
+            # conversation will remain unscored (baseline is
+            # deliberately not re-evaluated).
+            continue
+        matured_n += 1
+        outcome_tokens = _latest_snapshot_tokens(conv.id, freeze_time)
+        if outcome_tokens & positive_events:
+            positive_n += 1
+        elif outcome_tokens & negative_events:
+            negative_n += 1
+        else:
+            unresolved_n += 1
+
+    return (cohort_ids, positive_n, negative_n, matured_n, unresolved_n)
+
+
+def _latest_snapshot_tokens(
+    conversation_id, as_of: datetime,
+) -> frozenset[str]:
+    """Return the terminal-token set from the LATEST OutcomeSnapshot
+    for `conversation_id` with `captured_at <= as_of`. Empty set if
+    no snapshot exists.
+
+    Latest by captured_at desc. Older snapshots are ignored — the
+    latest snapshot represents "current known outcome," which is the
+    right primitive under `terminal_known_after_maturity_v1`.
+    """
+    snap = (
+        OutcomeSnapshot.objects
+        .filter(conversation_id=conversation_id, captured_at__lte=as_of)
+        .only(
+            'lb_booked', 'lb_lost', 'lb_cancelled',
+            'sf_booked', 'sf_completed', 'sf_cancelled', 'captured_at',
+        )
+        .order_by('-captured_at')
+        .first()
+    )
+    if snap is None:
+        return frozenset()
+    return _extract_outcome_tokens(snap)
 
 
 def _extract_outcome_tokens(snap: OutcomeSnapshot) -> frozenset[str]:

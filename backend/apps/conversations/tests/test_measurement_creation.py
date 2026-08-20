@@ -162,7 +162,8 @@ class BaselineCohortTests(TestCase):
     def test_baseline_cohort_scores_positive_and_negative(self):
         b = _bootstrap_rec()
         applied_at = timezone.now()
-        # 3 conversations: 1 pos (LB_BOOKED), 1 neg (LB_LOST), 1 no-signal
+        # 3 conversations, all matured (started 30 days ago >> 14d gate).
+        # 1 positive (LB_BOOKED), 1 negative (LB_LOST), 1 no-signal.
         for i, (has_signal, positive, negative) in enumerate([
             (True, True, False),
             (True, False, True),
@@ -171,7 +172,7 @@ class BaselineCohortTests(TestCase):
             conv = Conversation.objects.create(
                 org=b['org'], source='leadbridge',
                 source_conversation_id=f'c{i}',
-                started_at=applied_at - timedelta(days=10),
+                started_at=applied_at - timedelta(days=30),
             )
             if has_signal:
                 ConversationSemanticEvent.objects.create(
@@ -181,25 +182,124 @@ class BaselineCohortTests(TestCase):
                     actor='customer', turn_start=1, turn_end=1,
                     confidence=0.9,
                 )
+            # captured_at is now IRRELEVANT under
+            # terminal_known_after_maturity_v1 — the maturity gate
+            # (started_at + 14d) is what decides eligibility. Pick a
+            # far-future captured_at to prove the point.
             if positive:
                 OutcomeSnapshot.objects.create(
                     conversation=conv,
-                    captured_at=applied_at - timedelta(days=5),
+                    captured_at=applied_at + timedelta(days=180),
                     lb_booked=True,
                 )
             if negative:
                 OutcomeSnapshot.objects.create(
                     conversation=conv,
-                    captured_at=applied_at - timedelta(days=5),
+                    captured_at=applied_at + timedelta(days=180),
                     lb_lost=True,
                 )
 
         row = create_measurement(b['rec'], _mk_ctx(applied_at=applied_at))
-        # Cohort = 2 (those with the signal). 1 positive, 1 negative.
+        # Cohort membership = 2 (both signal-matched convs).
+        # Both are matured. 1 positive, 1 negative, 0 unresolved.
+        self.assertEqual(len(row.pre_cohort_conversation_ids), 2)
+        self.assertEqual(row.pre_matured_n, 2)
         self.assertEqual(row.pre_n, 2)
         self.assertEqual(row.pre_positive_n, 1)
+        self.assertEqual(row.pre_negative_n, 1)
+        self.assertEqual(row.pre_unresolved_n, 0)
         self.assertAlmostEqual(row.pre_rate, 0.5, places=6)
-        self.assertEqual(len(row.pre_cohort_conversation_ids), 2)
+
+    def test_immature_cohort_member_counted_in_membership_but_not_scored(self):
+        """Conversation started too recently to have matured belongs
+        to the frozen cohort membership but doesn't contribute to
+        matured/positive/negative/unresolved."""
+        b = _bootstrap_rec()
+        applied_at = timezone.now()
+        # Conv started 5 days ago — inside 14d maturity gate.
+        conv = Conversation.objects.create(
+            org=b['org'], source='leadbridge',
+            source_conversation_id='c-immature',
+            started_at=applied_at - timedelta(days=5),
+        )
+        ConversationSemanticEvent.objects.create(
+            org=b['org'], conversation=conv,
+            extraction_run=b['extraction'],
+            ordinal=0, event_type='DISCOUNT_REQUESTED',
+            actor='customer', turn_start=1, turn_end=1, confidence=0.9,
+        )
+        OutcomeSnapshot.objects.create(
+            conversation=conv, captured_at=applied_at,
+            lb_booked=True,
+        )
+        row = create_measurement(b['rec'], _mk_ctx(applied_at=applied_at))
+        self.assertEqual(len(row.pre_cohort_conversation_ids), 1)
+        self.assertEqual(row.pre_matured_n, 0)
+        self.assertEqual(row.pre_n, 0)
+        self.assertEqual(row.pre_positive_n, 0)
+        self.assertEqual(row.pre_unresolved_n, 0)
+        self.assertIsNone(row.pre_rate)
+
+    def test_matured_but_unresolved_counted_separately(self):
+        """Matured conv with no OutcomeSnapshot → unresolved (NOT
+        counted as negative). Slow resolver coverage must not become
+        a rate bias."""
+        b = _bootstrap_rec()
+        applied_at = timezone.now()
+        conv = Conversation.objects.create(
+            org=b['org'], source='leadbridge',
+            source_conversation_id='c-unresolved',
+            started_at=applied_at - timedelta(days=30),
+        )
+        ConversationSemanticEvent.objects.create(
+            org=b['org'], conversation=conv,
+            extraction_run=b['extraction'],
+            ordinal=0, event_type='DISCOUNT_REQUESTED',
+            actor='customer', turn_start=1, turn_end=1, confidence=0.9,
+        )
+        # No OutcomeSnapshot created.
+        row = create_measurement(b['rec'], _mk_ctx(applied_at=applied_at))
+        self.assertEqual(row.pre_matured_n, 1)
+        self.assertEqual(row.pre_unresolved_n, 1)
+        self.assertEqual(row.pre_n, 0)
+        self.assertEqual(row.pre_positive_n, 0)
+        self.assertEqual(row.pre_negative_n, 0)
+        self.assertIsNone(row.pre_rate)
+
+    def test_latest_terminal_snapshot_wins_regardless_of_captured_at(self):
+        """If two snapshots exist for the same conv, the LATEST by
+        captured_at defines the outcome — even if an older snapshot
+        showed a different terminal."""
+        b = _bootstrap_rec()
+        applied_at = timezone.now()
+        conv = Conversation.objects.create(
+            org=b['org'], source='leadbridge',
+            source_conversation_id='c-latest-wins',
+            started_at=applied_at - timedelta(days=30),
+        )
+        ConversationSemanticEvent.objects.create(
+            org=b['org'], conversation=conv,
+            extraction_run=b['extraction'],
+            ordinal=0, event_type='DISCOUNT_REQUESTED',
+            actor='customer', turn_start=1, turn_end=1, confidence=0.9,
+        )
+        # Older snapshot: lost. Newer snapshot: booked.
+        # Latest wins → positive.
+        OutcomeSnapshot.objects.create(
+            conversation=conv,
+            captured_at=applied_at - timedelta(days=25),
+            lb_lost=True,
+        )
+        OutcomeSnapshot.objects.create(
+            conversation=conv,
+            captured_at=applied_at - timedelta(days=5),
+            lb_booked=True,
+        )
+        row = create_measurement(b['rec'], _mk_ctx(applied_at=applied_at))
+        self.assertEqual(row.pre_matured_n, 1)
+        self.assertEqual(row.pre_positive_n, 1)
+        self.assertEqual(row.pre_negative_n, 0)
+        self.assertEqual(row.pre_n, 1)
 
     def test_outside_baseline_window_excluded(self):
         b = _bootstrap_rec()
@@ -241,6 +341,7 @@ class BaselineCohortTests(TestCase):
         )
         row = create_measurement(b['rec'], _mk_ctx(applied_at=applied_at))
         self.assertEqual(row.pre_n, 0)
+        self.assertEqual(len(row.pre_cohort_conversation_ids), 0)
 
 
 class ProvenanceCoverageMethodTests(TestCase):

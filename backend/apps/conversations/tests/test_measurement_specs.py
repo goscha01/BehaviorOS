@@ -98,6 +98,14 @@ class RegistryShapeTests(TestCase):
         self.assertEqual(outcome.baseline_window_days, 90)
         self.assertNotIn('turn', outcome.kind)
 
+    def test_v1_outcome_semantics_locked(self):
+        # v1 uses maturity-gated scoring with the latest known
+        # terminal. v2 (once business-event timestamps exist) will
+        # switch to `terminal_event_occurred_within_window`.
+        outcome = HIGH_INTENT_SIGNAL_COVERAGE_V1.primary_outcome
+        self.assertEqual(outcome.outcome_semantics,
+                          'terminal_known_after_maturity_v1')
+
     def test_v1_positive_terminals_include_booking(self):
         positive = HIGH_INTENT_SIGNAL_COVERAGE_V1.primary_outcome.positive_terminal_events
         self.assertIn(OutcomeTerminal.LB_BOOKED, positive)
@@ -107,13 +115,19 @@ class RegistryShapeTests(TestCase):
     def test_v1_verdict_gates_have_all_required(self):
         gates = HIGH_INTENT_SIGNAL_COVERAGE_V1.verdict_gates
         # Not just p<.05 — sample floor + effect size + significance +
-        # provenance coverage.
+        # provenance coverage + outcome-resolution coverage.
         self.assertGreaterEqual(gates.min_sample_per_arm, 20)
         self.assertGreaterEqual(gates.min_effect_size_pp, 5.0)
         self.assertGreater(gates.uncertainty_significance_alpha, 0.0)
         self.assertLess(gates.uncertainty_significance_alpha, 0.2)
         self.assertGreaterEqual(gates.min_provenance_coverage, 0.5)
         self.assertLessEqual(gates.min_provenance_coverage, 1.0)
+        self.assertGreaterEqual(
+            gates.min_outcome_resolution_coverage, 0.5,
+        )
+        self.assertLessEqual(
+            gates.min_outcome_resolution_coverage, 1.0,
+        )
         self.assertGreater(gates.max_window_days_for_inconclusive,
                             gates.min_sample_per_arm)
 
@@ -199,12 +213,17 @@ class PersistenceContractTests(TestCase):
         self.assertEqual(
             d['primary_outcome']['baseline_window_days'], 90,
         )
+        self.assertEqual(
+            d['primary_outcome']['outcome_semantics'],
+            'terminal_known_after_maturity_v1',
+        )
         self.assertIn('LB_BOOKED',
                        d['primary_outcome']['positive_terminal_events'])
         self.assertIn('LEAD_MISMATCH', d['exclusions']['tokens'])
         for k in ('min_sample_per_arm', 'min_effect_size_pp',
                    'uncertainty_significance_alpha',
                    'min_provenance_coverage',
+                   'min_outcome_resolution_coverage',
                    'max_window_days_for_inconclusive'):
             self.assertIn(k, d['verdict_gates'])
 

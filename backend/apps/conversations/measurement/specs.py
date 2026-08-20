@@ -108,13 +108,23 @@ class CohortEntryPredicate:
 class PrimaryOutcomeDefinition:
     """Deterministic outcome scoring rule.
 
-    v1: `reaches_positive_terminal_within_days` — customer's linked
-    OutcomeSnapshot (in ANY snapshot captured within
-    `attribution_window_days` of conversation start) contains at least
-    one of `positive_terminal_events`. Absence of a positive terminal
-    within the window is scored as negative if a negative terminal was
-    reached; otherwise the customer is UNRESOLVED and does not count
-    toward either arm's outcome rate.
+    v1: `reaches_positive_terminal_within_days` with
+    outcome_semantics = 'terminal_known_after_maturity_v1'.
+
+    A conversation becomes SCORE-ELIGIBLE only after it has had the
+    full `attribution_window_days` to mature (elapsed time from
+    `started_at`). Once eligible, the LATEST known terminal
+    OutcomeSnapshot is used to score positive / negative / unresolved,
+    regardless of when that snapshot's `captured_at` happens to be.
+
+    The maturity gate preserves the fair-comparison guarantee (pre
+    and post arms get equal time to develop), while decoupling
+    attribution from the outcome-resolver's ingestion cadence.
+
+    v2 will tighten this to `terminal_event_occurred_within_window`
+    once LB/SF expose authoritative business-event timestamps
+    (`booked_at`, `lost_at`, etc.) — historical v1 measurements
+    remain scored under v1 semantics via their frozen_spec_json.
 
     `baseline_window_days` defines the elapsed-time lookback used to
     build the pre-application cohort. Larger windows accumulate more
@@ -125,6 +135,7 @@ class PrimaryOutcomeDefinition:
     and can't be filtered by hash.
     """
     kind: str  # 'reaches_positive_terminal_within_days'
+    outcome_semantics: str  # 'terminal_known_after_maturity_v1'
     attribution_window_days: int
     baseline_window_days: int
     positive_terminal_events: tuple[str, ...]
@@ -162,6 +173,10 @@ class VerdictGates:
       conversations that must have clean provenance (eligible / total).
       Below this, READY is refused — silent PENDING/HASH_FAILED gaps
       would invalidate any verdict. v1: 0.60.
+    - min_outcome_resolution_coverage: minimum fraction of MATURED
+      conversations that have a known terminal outcome
+      (resolved / matured). Below this, READY is refused — slow or
+      partial outcome-resolver coverage would bias the rate. v1: 0.60.
     - max_window_days_for_inconclusive: after this many days from
       application, if verdict gates have not passed, transition to
       INCONCLUSIVE rather than continuing to accumulate forever.
@@ -170,6 +185,7 @@ class VerdictGates:
     min_effect_size_pp: float
     uncertainty_significance_alpha: float
     min_provenance_coverage: float
+    min_outcome_resolution_coverage: float
     max_window_days_for_inconclusive: int
 
 
@@ -266,6 +282,9 @@ class FrozenMeasurementSpec:
             },
             'primary_outcome': {
                 'kind': self.primary_outcome.kind,
+                'outcome_semantics': (
+                    self.primary_outcome.outcome_semantics
+                ),
                 'attribution_window_days': (
                     self.primary_outcome.attribution_window_days
                 ),
@@ -292,6 +311,9 @@ class FrozenMeasurementSpec:
                 ),
                 'min_provenance_coverage': (
                     self.verdict_gates.min_provenance_coverage
+                ),
+                'min_outcome_resolution_coverage': (
+                    self.verdict_gates.min_outcome_resolution_coverage
                 ),
                 'max_window_days_for_inconclusive': (
                     self.verdict_gates.max_window_days_for_inconclusive
@@ -330,6 +352,7 @@ HIGH_INTENT_SIGNAL_COVERAGE_V1 = MeasurementSpec(
     ),
     primary_outcome=PrimaryOutcomeDefinition(
         kind='reaches_positive_terminal_within_days',
+        outcome_semantics='terminal_known_after_maturity_v1',
         attribution_window_days=14,
         baseline_window_days=90,
         positive_terminal_events=(
@@ -356,6 +379,10 @@ HIGH_INTENT_SIGNAL_COVERAGE_V1 = MeasurementSpec(
         # below this — most target-signal conversations should have
         # OK provenance before we score anything.
         min_provenance_coverage=0.60,
+        # Refuse to promote to READY if the outcome-resolution
+        # coverage drops below this — slow / partial resolver
+        # coverage would bias the rate.
+        min_outcome_resolution_coverage=0.60,
         # Stop accumulating after 90 days without a verdict — the
         # world has probably moved on and the measurement is stale.
         max_window_days_for_inconclusive=90,

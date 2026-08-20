@@ -1733,20 +1733,40 @@ class RecommendationOutcomeMeasurement(BaseModel):
                    'from applied_at',
     )
     pre_cohort_frozen_at = models.DateTimeField(null=True, blank=True)
+    # ROM v1 attribution semantic = terminal_known_after_maturity_v1.
+    # A conversation MATURES `attribution_window_days` after
+    # `started_at`. Only matured conversations are score-eligible.
+    # Of the matured subset, "resolved" = has a known terminal;
+    # "unresolved" = matured but no terminal known.
+    pre_matured_n = models.PositiveIntegerField(
+        default=0,
+        help_text='Baseline cohort members that have finished maturing '
+                   '(started_at + attribution_window_days <= '
+                   'pre_cohort_frozen_at)',
+    )
     pre_n = models.PositiveIntegerField(
         default=0,
         help_text='Baseline arm size — resolved outcomes only '
                    '(positive + negative, unresolved excluded)',
     )
     pre_positive_n = models.PositiveIntegerField(default=0)
+    pre_negative_n = models.PositiveIntegerField(default=0)
+    pre_unresolved_n = models.PositiveIntegerField(
+        default=0,
+        help_text='Matured baseline members whose latest '
+                   'OutcomeSnapshot showed no terminal',
+    )
     pre_rate = models.FloatField(
         null=True, blank=True,
         help_text='pre_positive_n / pre_n. Null when pre_n == 0.',
     )
 
     # -- post (ACCUMULATES) --
+    post_matured_n = models.PositiveIntegerField(default=0)
     post_n = models.PositiveIntegerField(default=0)
     post_positive_n = models.PositiveIntegerField(default=0)
+    post_negative_n = models.PositiveIntegerField(default=0)
+    post_unresolved_n = models.PositiveIntegerField(default=0)
     post_rate = models.FloatField(null=True, blank=True)
 
     # -- provenance breakdown for post conversations --
@@ -1845,6 +1865,21 @@ class RecommendationOutcomeMeasurement(BaseModel):
             self.provenance_eligible_n
             / self.target_signal_conversations_n
         )
+
+    def post_outcome_resolution_coverage(self) -> float | None:
+        """Fraction of MATURED post-cohort members with a known
+        terminal. Complements provenance_coverage: even if provenance
+        is clean, slow / partial outcome-resolver coverage would bias
+        the rate. None when no matured post members yet."""
+        if self.post_matured_n == 0:
+            return None
+        return self.post_n / self.post_matured_n
+
+    def pre_outcome_resolution_coverage(self) -> float | None:
+        """Same idea for the baseline arm (frozen at creation)."""
+        if self.pre_matured_n == 0:
+            return None
+        return self.pre_n / self.pre_matured_n
 
     def is_terminal(self) -> bool:
         return self.status in self.TERMINAL_STATUSES

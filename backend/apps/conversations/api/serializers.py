@@ -262,6 +262,8 @@ class RecommendationOutcomeMeasurementSerializer(serializers.ModelSerializer):
         source='recommendation.pk', read_only=True,
     )
     provenance_coverage = serializers.SerializerMethodField()
+    pre_outcome_resolution_coverage = serializers.SerializerMethodField()
+    post_outcome_resolution_coverage = serializers.SerializerMethodField()
     is_terminal = serializers.SerializerMethodField()
 
     class Meta:
@@ -282,8 +284,12 @@ class RecommendationOutcomeMeasurementSerializer(serializers.ModelSerializer):
             'treatment_effective_config_hash',
             'treatment_managed_hash',
             'effective_config_schema_version',
-            'pre_n', 'pre_positive_n', 'pre_rate',
-            'post_n', 'post_positive_n', 'post_rate',
+            'pre_matured_n', 'pre_n', 'pre_positive_n',
+            'pre_negative_n', 'pre_unresolved_n', 'pre_rate',
+            'pre_outcome_resolution_coverage',
+            'post_matured_n', 'post_n', 'post_positive_n',
+            'post_negative_n', 'post_unresolved_n', 'post_rate',
+            'post_outcome_resolution_coverage',
             'target_signal_conversations_n',
             'provenance_eligible_n',
             'provenance_pending_n',
@@ -303,6 +309,12 @@ class RecommendationOutcomeMeasurementSerializer(serializers.ModelSerializer):
 
     def get_provenance_coverage(self, obj):
         return obj.provenance_coverage()
+
+    def get_pre_outcome_resolution_coverage(self, obj):
+        return obj.pre_outcome_resolution_coverage()
+
+    def get_post_outcome_resolution_coverage(self, obj):
+        return obj.post_outcome_resolution_coverage()
 
     def get_is_terminal(self, obj):
         return obj.is_terminal()
