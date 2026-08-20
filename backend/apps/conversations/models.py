@@ -1883,3 +1883,340 @@ class RecommendationOutcomeMeasurement(BaseModel):
 
     def is_terminal(self) -> bool:
         return self.status in self.TERMINAL_STATUSES
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1D: Observed Business Configuration Extraction
+# ---------------------------------------------------------------------------
+#
+# 1B / 1C / 1B-3 answered "what behavioral pattern did agents follow?"
+# 1D answers a different, less-causal question: "what business content
+# (prices, qualification questions, FAQ topics, service scope rules)
+# appears in real conversations, and does it match what the LB config
+# says?"
+#
+# Design constraints (from the milestone spec):
+# - Observed facts come from Conversations ONLY. Never from LB config.
+# - Configured facts come from TenantConfigSnapshot ONLY. Never inferred
+#   from observations.
+# - The diff is deterministic. LLM is used to STRUCTURE evidence into
+#   normalized facts; it never emits the diff verdict.
+# - Partial-key observations (e.g. "deep clean = $259" with no bedroom
+#   count) cannot MATCH or CONFLICT with an exact-key configured entry.
+#   They land in PARTIAL_KEY_COMPATIBLE / INSUFFICIENT_EVIDENCE.
+# - Semantic anomalies discovered by 1D (e.g. QUESTION_FAQ events that
+#   are actually payment/verification) become OntologyReviewCandidate
+#   records. These do NOT auto-modify the extractor.
+
+
+class ObservedBusinessFact(BaseModel):
+    """One normalized fact derived from conversation evidence.
+
+    Domain-neutral shape: `domain` + `fact_type` classify the row;
+    `subject_key_json` is the canonical join key against
+    ConfiguredBusinessFact; `value_json` holds the domain-specific
+    payload (distribution for pricing, presence for qualification,
+    cluster centroid for FAQ, etc.).
+
+    Aggregated across an ObservedFactExtractionRun. The aggregator
+    computes distribution stats (support_n, percentiles) and stores
+    evidence_conversation_ids / evidence_turn_ids for provenance.
+
+    A single (extraction_run, domain, fact_type, subject_key_hash)
+    row is unique — reruns produce NEW extraction_runs, not in-place
+    edits.
+    """
+
+    class Domain(models.TextChoices):
+        PRICING = 'pricing', 'Pricing / quoted amounts'
+        QUALIFICATION = 'qualification', 'Qualification questions'
+        FAQ = 'faq', 'FAQ / customer question topics'
+        SERVICE_SCOPE = 'service_scope', 'Service scope and boundaries'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='observed_business_facts',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='observed_business_facts',
+    )
+    extraction_run = models.ForeignKey(
+        'ObservedFactExtractionRun', on_delete=models.CASCADE,
+        related_name='facts',
+    )
+
+    domain = models.CharField(max_length=32, choices=Domain.choices)
+    fact_type = models.CharField(
+        max_length=64,
+        help_text='Domain-specific token, e.g. quoted_price / '
+                   'price_range / question_topic / scope_rule',
+    )
+
+    # Canonical join key against ConfiguredBusinessFact. Sorted-key
+    # JSON so comparisons are deterministic.
+    subject_key_json = models.JSONField(default=dict)
+    # Which key dimensions are actually PRESENT — the specificity
+    # gate for MATCH/CONFLICT eligibility. E.g. for pricing:
+    # ['service'] (only service known) vs
+    # ['service', 'bedrooms', 'bathrooms'] (full key).
+    subject_key_dimensions = models.JSONField(default=list)
+    # Content-hash of the canonical key for cheap indexing / dedup.
+    subject_key_hash = models.CharField(max_length=64, db_index=True)
+
+    # Domain-specific value payload — e.g. pricing distribution stats;
+    # qualification presence + frequency; FAQ cluster centroid.
+    value_json = models.JSONField(default=dict)
+
+    support_n = models.PositiveIntegerField(
+        default=0,
+        help_text='Independent conversations contributing evidence',
+    )
+    aggregate_confidence = models.FloatField(
+        default=0.0,
+        help_text='Mean or min of underlying event confidences',
+    )
+    evidence_conversation_ids = models.JSONField(
+        default=list, blank=True,
+        help_text='Up to 20 conversation UUIDs',
+    )
+    evidence_turn_ids = models.JSONField(
+        default=list, blank=True,
+        help_text='Up to 20 {conversation_id, turn_id} pairs',
+    )
+    first_seen_at = models.DateTimeField(null=True, blank=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['extraction_run', 'domain', 'fact_type',
+                        'subject_key_hash'],
+                name='observed_business_fact_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['org', 'domain']),
+            models.Index(fields=['extraction_run', 'domain']),
+            models.Index(fields=['domain', 'fact_type']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'{self.domain}/{self.fact_type} n={self.support_n}'
+
+
+class ConfiguredBusinessFact(BaseModel):
+    """One normalized fact parsed from the LB TenantConfigSnapshot.
+
+    Kept in a SEPARATE table from ObservedBusinessFact so the
+    provenance boundary is explicit — a query cannot accidentally
+    treat configured intent as observed reality. Same shape
+    otherwise so the diff can join.
+
+    Unique per (snapshot, domain, fact_type, subject_key_hash).
+    """
+
+    snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='configured_business_facts',
+    )
+    parser_run = models.ForeignKey(
+        'ConfiguredFactParserRun', on_delete=models.CASCADE,
+        related_name='facts',
+    )
+
+    domain = models.CharField(
+        max_length=32,
+        choices=ObservedBusinessFact.Domain.choices,
+    )
+    fact_type = models.CharField(max_length=64)
+
+    subject_key_json = models.JSONField(default=dict)
+    subject_key_dimensions = models.JSONField(default=list)
+    subject_key_hash = models.CharField(max_length=64, db_index=True)
+
+    value_json = models.JSONField(default=dict)
+
+    # Pointer back into the raw_config JSON for provenance.
+    source_pointer = models.JSONField(default=dict, blank=True)
+    parser_confidence = models.FloatField(default=1.0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['parser_run', 'domain', 'fact_type',
+                        'subject_key_hash'],
+                name='configured_business_fact_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['snapshot', 'domain']),
+            models.Index(fields=['parser_run', 'domain']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'{self.domain}/{self.fact_type} (configured)'
+
+
+class ObservedFactExtractionRun(BaseModel):
+    """One run of the observed-fact extractor over a corpus for a
+    specific domain. Idempotent per (org, corpus, domain,
+    extractor_version)."""
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='observed_fact_extraction_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='observed_fact_extraction_runs',
+    )
+    domain = models.CharField(
+        max_length=32,
+        choices=ObservedBusinessFact.Domain.choices,
+    )
+    extractor_version = models.CharField(max_length=64)
+    model = models.CharField(max_length=64, blank=True, default='')
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices,
+        default=Status.PENDING,
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    conversations_processed = models.PositiveIntegerField(default=0)
+    facts_emitted = models.PositiveIntegerField(default=0)
+    ontology_review_candidates_emitted = models.PositiveIntegerField(
+        default=0,
+    )
+    llm_input_tokens = models.PositiveIntegerField(default=0)
+    llm_output_tokens = models.PositiveIntegerField(default=0)
+    llm_cost_usd = models.DecimalField(
+        max_digits=10, decimal_places=4, default=0,
+    )
+    stats_json = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True, default='')
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['org', 'domain', '-created_at']),
+            models.Index(fields=['corpus', 'domain', '-created_at']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (f'ObservedFactRun({self.domain}) '
+                f'{self.extractor_version} → {self.status}')
+
+
+class ConfiguredFactParserRun(BaseModel):
+    """One run of the LB config parser over a snapshot for a specific
+    domain. Idempotent per (snapshot, domain, parser_version)."""
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='configured_fact_parser_runs',
+    )
+    domain = models.CharField(
+        max_length=32,
+        choices=ObservedBusinessFact.Domain.choices,
+    )
+    parser_version = models.CharField(max_length=64)
+    model = models.CharField(max_length=64, blank=True, default='')
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices,
+        default=Status.PENDING,
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    facts_emitted = models.PositiveIntegerField(default=0)
+    llm_input_tokens = models.PositiveIntegerField(default=0)
+    llm_output_tokens = models.PositiveIntegerField(default=0)
+    llm_cost_usd = models.DecimalField(
+        max_digits=10, decimal_places=4, default=0,
+    )
+    stats_json = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True, default='')
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['snapshot', 'domain', '-created_at']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (f'ConfiguredFactRun({self.domain}) '
+                f'{self.parser_version} → {self.status}')
+
+
+class OntologyReviewCandidate(BaseModel):
+    """Evidence for a future ontology / extractor-prompt reliability
+    pass. Emitted by 1D extractors when they encounter events whose
+    current ontology classification looks wrong (e.g. QUESTION_FAQ
+    events that are actually payment / verification / operations).
+
+    Never auto-alters the ontology or extractor. Reviewed manually.
+    """
+
+    class Kind(models.TextChoices):
+        EVENT_MIS_CLASSIFIED = (
+            'event_mis_classified',
+            'Event type appears misapplied to this evidence',
+        )
+        OTHER_CLUSTER = (
+            'other_cluster',
+            'FAQ/qualification cluster labeled OTHER; may need taxonomy expansion',
+        )
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='ontology_review_candidates',
+    )
+    extraction_run = models.ForeignKey(
+        ObservedFactExtractionRun, on_delete=models.CASCADE,
+        related_name='ontology_review_candidates',
+    )
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    original_event_type = models.CharField(
+        max_length=64, blank=True, default='',
+        help_text='For EVENT_MIS_CLASSIFIED: the event_type on the '
+                   'ConversationSemanticEvent',
+    )
+    proposed_scope = models.CharField(
+        max_length=64, blank=True, default='',
+        help_text='E.g. operational, payment_flow, marketing_scope',
+    )
+    proposed_topic = models.CharField(max_length=128, blank=True, default='')
+
+    evidence_conversation_id = models.CharField(max_length=64, blank=True)
+    evidence_turn_id = models.CharField(max_length=64, blank=True)
+    evidence_text = models.CharField(max_length=1000, blank=True)
+    confidence = models.FloatField(default=0.0)
+    reviewed = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['org', 'kind', 'reviewed']),
+            models.Index(
+                fields=['extraction_run', 'kind'],
+            ),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'OntologyReview({self.kind}) {self.original_event_type}'

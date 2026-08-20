@@ -279,6 +279,11 @@ class TenantConfigAuditView(APIView):
     LOW_CONFIDENCE buckets plus content-evidence excerpts and a
     filter of onboarding-suitable proposals. Never modifies anything.
 
+    Ship A extension: composes Pipeline 1D `structured_facts.pricing`
+    section from the latest ObservedFactExtractionRun and
+    ConfiguredFactParserRun (both domain=pricing) plus the
+    deterministic diff.
+
     Service-token authenticated. See config_diff.py for the full
     semantics + invariant enforcement.
     """
@@ -290,6 +295,9 @@ class TenantConfigAuditView(APIView):
         from apps.conversations.audit.config_diff import (
             build_audit, report_to_dict,
         )
+        from apps.conversations.audit.structured_facts_composer import (
+            build_structured_facts_section,
+        )
         tenant = (request.query_params.get('tenantId') or '').strip()
         if not tenant:
             raise ValidationError({'tenantId': 'required'})
@@ -299,7 +307,114 @@ class TenantConfigAuditView(APIView):
                 {'detail': f'no TenantConfigSnapshot for tenant {tenant}'},
                 status=http_status.HTTP_404_NOT_FOUND,
             )
-        return Response(report_to_dict(report))
+        payload = report_to_dict(report)
+        payload['structured_facts'] = build_structured_facts_section(tenant)
+        return Response(payload)
+
+
+class ObservedPricingRunView(APIView):
+    """POST /api/v1/insights/audit/observed-pricing/run?tenantId=<uuid>[&limit=N]
+
+    Triggers a Pipeline 1D pricing extractor run over the tenant's
+    latest LearningCorpus. LLM calls happen synchronously inside the
+    request (Spotless corpus ~421 conversations → ~$0.20-$0.40 at
+    gpt-4o-mini). Optional `limit` truncates to N conversations for
+    smoke tests.
+
+    Idempotent per (org, corpus, extractor_version): a new run creates
+    NEW rows; older runs preserved. Audit endpoint picks the latest.
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.models import (
+            LearningCorpus, TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.pricing.extractor import (
+            run_extraction,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        limit = request.query_params.get('limit')
+        try:
+            limit_int = int(limit) if limit else None
+        except ValueError:
+            raise ValidationError({'limit': 'must be integer'})
+
+        snap = (
+            _TCS.objects.filter(
+                source_system='leadbridge', tenant_external_id=tenant,
+            ).order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        corpus = (
+            LearningCorpus.objects
+            .filter(org=snap.org)
+            .order_by('-created_at').first()
+        )
+        if corpus is None:
+            raise NotFound(
+                {'detail': f'no LearningCorpus for tenant {tenant}'}
+            )
+        run = run_extraction(
+            org=snap.org, corpus=corpus,
+            llm_client=LearningLLMClient(), limit=limit_int,
+        )
+        return Response({
+            'run_id': str(run.id),
+            'status': run.status,
+            'conversations_processed': run.conversations_processed,
+            'facts_emitted': run.facts_emitted,
+            'ontology_review_candidates_emitted': (
+                run.ontology_review_candidates_emitted
+            ),
+            'llm_cost_usd': str(run.llm_cost_usd),
+            'stats': run.stats_json,
+        })
+
+
+class ConfiguredPricingRunView(APIView):
+    """POST /api/v1/insights/audit/configured-pricing/run?tenantId=<uuid>
+
+    Triggers a Pipeline 1D LB pricing parser run over the tenant's
+    latest TenantConfigSnapshot. Idempotent per (snapshot,
+    parser_version).
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.models import (
+            TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.pricing.config_parser import (
+            parse_snapshot,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        snap = (
+            _TCS.objects.filter(
+                source_system='leadbridge', tenant_external_id=tenant,
+            ).order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        run = parse_snapshot(
+            snapshot=snap, llm_client=LearningLLMClient(),
+        )
+        return Response({
+            'run_id': str(run.id),
+            'status': run.status,
+            'snapshot_id': str(snap.id),
+            'facts_emitted': run.facts_emitted,
+            'llm_cost_usd': str(run.llm_cost_usd),
+        })
 
 
 class RomV1BenchmarkView(APIView):
