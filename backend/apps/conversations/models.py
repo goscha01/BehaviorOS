@@ -941,3 +941,205 @@ class ConditionalActionPattern(BaseModel):
     def __str__(self) -> str:
         return (f'{self.pattern_id} {self.condition_event} → '
                 f'{self.action_event} ({self.overall_status})')
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1B-4: current-configuration benchmark
+# ---------------------------------------------------------------------------
+#
+# A TenantConfigSnapshot is the immutable capture of a source system's
+# behavior-affecting configuration at a point in time. From it we derive
+# BehavioralPolicy rows (normalized customer_signal → prescribed_action
+# rules) and PolicyAlignmentAssessment rows that compare each policy to
+# the observed ConditionalActionPattern evidence from Pipeline 1B-3.
+#
+# Immutability convention: snapshots are only inserted, never updated.
+# The DB doesn't enforce this — the fetch command checks by content-hash
+# before writing. If a fetch produces the same hash as the latest
+# snapshot, it's a no-op. Preserves audit trail (each write is a new row).
+
+
+class TenantConfigSnapshot(BaseModel):
+    """One immutable capture of a tenant's behavior-affecting config from
+    an external source system (LeadBridge today, Callio future).
+
+    Same (org, source_system, tenant_external_id, service_group,
+    raw_config_sha256) collides on re-fetch when nothing changed — the
+    fetcher detects and skips.
+    """
+
+    class SourceSystem(models.TextChoices):
+        LEADBRIDGE = 'leadbridge', 'LeadBridge'
+        CALLIO = 'callio', 'Callio'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='tenant_config_snapshots',
+    )
+    source_system = models.CharField(max_length=32, choices=SourceSystem.choices)
+    # LB uses `userId` (UUID). Callio would use its own tenant key.
+    tenant_external_id = models.CharField(max_length=128)
+    # 'house_cleaning' for now. Empty when config is service-agnostic.
+    service_group = models.CharField(max_length=64, blank=True, default='')
+    # Whatever version of the source system contract we captured.
+    contract_version = models.CharField(max_length=32)
+    # Full JSON body from the source's config endpoint.
+    raw_config = models.JSONField()
+    # Content hash of raw_config for dedup + drift detection.
+    raw_config_sha256 = models.CharField(max_length=64)
+    # Diagnostics counters populated by the fetcher.
+    fetched_from_url = models.CharField(max_length=512, blank=True, default='')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['org', 'source_system', 'tenant_external_id',
+                        'service_group', 'raw_config_sha256'],
+                name='tenant_config_snapshot_dedup_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['org', 'source_system', 'tenant_external_id',
+                                  '-created_at']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (f'{self.source_system}:{self.tenant_external_id} '
+                f'sg={self.service_group or "-"} '
+                f'sha={self.raw_config_sha256[:12]}')
+
+
+class BehavioralPolicy(BaseModel):
+    """One normalized behavioral rule derived from a TenantConfigSnapshot.
+
+    Represents a `condition → prescribed action sequence` mapping.
+    Multiple policies can share the same condition — e.g. the global AI
+    prompt says one thing and a service_profile.ai_instructions_json
+    says another. The analyzer inspects all of them.
+
+    Not every part of a config becomes a policy. Pricing tables, FAQ
+    text, qualification schema — those stay in the snapshot as
+    contextual inputs. Only rules that read as "when C happens, do A"
+    are extracted here.
+    """
+
+    class Channel(models.TextChoices):
+        TEXT = 'text', 'Text (LB SMS/chat replies)'
+        VOICE = 'voice', 'Voice (Callio)'
+        POLICY = 'policy', 'Channel-agnostic policy'
+
+    snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='policies',
+    )
+    # Ontology CUSTOMER_SIGNAL event type. Validated at write time by
+    # the normalizer against ontology.EVENT_TYPES; string here so schema
+    # doesn't need a migration when ontology bumps.
+    condition_event = models.CharField(max_length=64)
+    # Ordered list of ontology AGENT_ACTION event types. Empty list
+    # means the policy is `condition → intentionally do nothing`
+    # (rare but real — e.g. "don't respond to obvious spam").
+    prescribed_action_events = models.JSONField(default=list)
+    channel = models.CharField(max_length=16, choices=Channel.choices,
+                                default=Channel.TEXT)
+    # Verbatim text of the rule as it appears in the source config.
+    source_rule_text = models.TextField()
+    # Location of the rule inside the raw_config JSON, e.g.
+    #   {"config_path": "user.global_ai_prompt", "span": [420, 610]}
+    #   {"config_path": "service_profiles[0].ai_instructions_json"}
+    # Kept as JSON so consumers can jump straight to the source.
+    source_pointer = models.JSONField(default=dict, blank=True)
+    # 0.0–1.0. Normalizer's confidence that this rule was correctly
+    # extracted from the raw config.
+    extraction_confidence = models.FloatField(default=1.0)
+    # Ordinal within the snapshot for stable ordering.
+    ordinal = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['snapshot', 'condition_event']),
+            models.Index(fields=['snapshot', 'channel']),
+        ]
+        ordering = ['snapshot', 'ordinal']
+
+    def __str__(self) -> str:
+        actions = ' → '.join(self.prescribed_action_events) or '(no action)'
+        return f'{self.condition_event} → {actions} [{self.channel}]'
+
+
+class PolicyAlignmentAssessment(BaseModel):
+    """One deterministic classification comparing a BehavioralPolicy
+    against a ConditionalActionPattern from the linked analysis run.
+
+    Classification (per 1B-4 spec):
+    - CONFIG_SUPPORTED — at least one prescribed action has SUPPORTED
+      evidence with positive primary effect
+    - CONFIG_QUESTIONABLE — prescribed action has SUPPORTED evidence
+      with negative primary effect, AND an alternative action has
+      SUPPORTED positive evidence for the same condition
+    - EXECUTION_GAP — prescribed action rarely observed (< threshold)
+      relative to other observed actions for the same condition
+    - INSUFFICIENT_EVIDENCE — cells too small to say anything reliable
+
+    The rationale string records which thresholds fired so the
+    classification is auditable. The narrative field is optional
+    human-readable text (LLM-generated) that explains the result —
+    NEVER drives the classification itself.
+    """
+
+    class AlignmentStatus(models.TextChoices):
+        CONFIG_SUPPORTED = 'CONFIG_SUPPORTED', 'Prescribed behavior supported by evidence'
+        CONFIG_QUESTIONABLE = 'CONFIG_QUESTIONABLE', 'Prescribed weaker than alternatives'
+        EXECUTION_GAP = 'EXECUTION_GAP', 'Config prescribes X, observations do Y'
+        INSUFFICIENT_EVIDENCE = 'INSUFFICIENT_EVIDENCE', 'Cells too small to compare'
+
+    snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='alignment_assessments',
+    )
+    analysis_run = models.ForeignKey(
+        ConditionalAnalysisRun, on_delete=models.CASCADE,
+        related_name='alignment_assessments',
+    )
+    policy = models.ForeignKey(
+        BehavioralPolicy, on_delete=models.CASCADE,
+        related_name='assessments',
+    )
+    # The specific ConditionalActionPattern the policy was matched
+    # against. Nullable because "no observations of any prescribed
+    # action" is a legitimate outcome (→ INSUFFICIENT_EVIDENCE or
+    # EXECUTION_GAP depending on what WAS observed instead).
+    primary_pattern = models.ForeignKey(
+        ConditionalActionPattern, on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='+',
+    )
+    alignment_status = models.CharField(
+        max_length=32, choices=AlignmentStatus.choices,
+    )
+    # Which thresholds/rules produced this classification. Human-
+    # auditable string, e.g.:
+    #   "SUPPORTED pattern (C, PRICE_GIVEN): d_primary_effect=+0.14"
+    #   "prescribed rate=0.18 (< 0.20); max alt rate=0.54 (> 0.40)"
+    deterministic_rationale = models.TextField()
+    # Optional LLM-generated narrative. Never used for classification.
+    llm_narrative = models.TextField(blank=True, default='')
+    # Conversation IDs pulled from the primary pattern's evidence.
+    evidence_conversation_ids = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['snapshot', 'analysis_run', 'policy'],
+                name='alignment_assessment_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['snapshot', 'alignment_status']),
+            models.Index(fields=['analysis_run', 'alignment_status']),
+        ]
+        ordering = ['snapshot', 'policy']
+
+    def __str__(self) -> str:
+        return f'{self.alignment_status} [{self.policy}]'
