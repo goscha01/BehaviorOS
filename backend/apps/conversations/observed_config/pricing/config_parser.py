@@ -104,44 +104,73 @@ def parse_snapshot(
 
     raw = snapshot.raw_config or {}
     service_profiles = (raw.get('service_profiles') or [])
+    user_block = raw.get('user') or {}
+    global_ai_prompt = (user_block.get('global_ai_prompt') or '').strip()
+    global_chat_json = user_block.get('global_ai_chat_instructions_json')
 
     total_in = 0
     total_out = 0
     total_cost = Decimal('0')
     facts_emitted = 0
 
+    # v1 note: many tenants (Spotless included) keep pricing in the
+    # global_ai_prompt prose rather than in service_profile.pricing_json.
+    # We ALWAYS run one LLM call over the global prompt + chat
+    # instructions, in addition to per-service-profile passes for any
+    # structured pricing_json blobs. Every emitted fact carries a
+    # source_pointer identifying which side of the config it came from.
+    passes: list[dict] = []
+    if global_ai_prompt or global_chat_json:
+        passes.append({
+            'source_kind': 'global_prompt',
+            'payload': {
+                'global_ai_prompt': global_ai_prompt or None,
+                'global_chat_instructions_json': global_chat_json,
+            },
+            'source_pointer_default': {
+                'source': 'user.global_ai_prompt',
+            },
+        })
     for profile in service_profiles:
         pricing_json = profile.get('pricing_json')
+        if isinstance(pricing_json, dict) and not pricing_json:
+            pricing_json = None
         if not pricing_json:
             continue
-        # Skip stub / trivially-empty pricing entries.
-        if isinstance(pricing_json, dict) and not pricing_json:
-            continue
-        payload = {
-            'service_profile': {
-                'id': profile.get('id'),
-                'name': profile.get('name'),
-                'slug': profile.get('slug'),
-                'service_group': profile.get('service_group'),
+        passes.append({
+            'source_kind': 'service_profile_pricing_json',
+            'payload': {
+                'service_profile': {
+                    'id': profile.get('id'),
+                    'name': profile.get('name'),
+                    'slug': profile.get('slug'),
+                    'service_group': profile.get('service_group'),
+                },
+                'pricing_json': pricing_json,
             },
-            'pricing_json': pricing_json,
-        }
-        user = (
-            'Normalize this ServiceProfile\'s pricingJson into the '
-            'schema in the system prompt.\n\n'
-            f'{json.dumps(payload, indent=2, default=str)[:12000]}'
+            'source_pointer_default': {
+                'source': 'service_profiles[*].pricing_json',
+                'service_profile_id': profile.get('id'),
+            },
+        })
+
+    for p in passes:
+        user_msg = (
+            f'Source: {p["source_kind"]}\n\n'
+            'Extract pricing facts per the schema in the system prompt.\n\n'
+            f'{json.dumps(p["payload"], indent=2, default=str)[:12000]}'
         )
         try:
             r = llm_client.analyze(
                 system_prompt=SYSTEM_PROMPT,
-                user_prompt=user,
+                user_prompt=user_msg,
                 model=model,
                 max_tokens=2000,
             )
         except Exception as exc:
             logger.exception(
-                'pricing-parser: profile=%s failed: %s',
-                profile.get('id'), exc,
+                'pricing-parser: pass=%s failed: %s',
+                p['source_kind'], exc,
             )
             continue
         total_in += getattr(r, 'input_tokens', 0)
@@ -160,25 +189,31 @@ def parse_snapshot(
             )
             _, sha, dims = canonical_subject_key(subject_key)
             value_json = entry.get('value') or {}
-            source_pointer = entry.get('source_pointer') or {}
-            source_pointer.setdefault(
-                'service_profile_id', profile.get('id'),
-            )
-            ConfiguredBusinessFact.objects.update_or_create(
-                parser_run=run,
-                domain=ObservedBusinessFact.Domain.PRICING,
-                fact_type=fact_type,
-                subject_key_hash=sha,
-                defaults={
-                    'snapshot': snapshot,
-                    'subject_key_json': subject_key,
-                    'subject_key_dimensions': dims,
-                    'value_json': value_json,
-                    'source_pointer': source_pointer,
-                    'parser_confidence': 1.0,
-                },
-            )
-            facts_emitted += 1
+            source_pointer = dict(p['source_pointer_default'])
+            entry_pointer = entry.get('source_pointer') or {}
+            if isinstance(entry_pointer, dict):
+                source_pointer.update(entry_pointer)
+            try:
+                ConfiguredBusinessFact.objects.update_or_create(
+                    parser_run=run,
+                    domain=ObservedBusinessFact.Domain.PRICING,
+                    fact_type=fact_type,
+                    subject_key_hash=sha,
+                    defaults={
+                        'snapshot': snapshot,
+                        'subject_key_json': subject_key,
+                        'subject_key_dimensions': dims,
+                        'value_json': value_json,
+                        'source_pointer': source_pointer,
+                        'parser_confidence': 1.0,
+                    },
+                )
+                facts_emitted += 1
+            except Exception as exc:
+                logger.warning(
+                    f'pricing-parser: persist skipped '
+                    f'sha={sha[:12]} err={exc}'
+                )
 
     run.status = ConfiguredFactParserRun.Status.COMPLETED
     run.completed_at = timezone.now()
