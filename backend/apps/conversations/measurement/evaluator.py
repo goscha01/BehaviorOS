@@ -133,9 +133,14 @@ def _score_post_cohort(
     # window closes.
     window_close = now - timedelta(days=outcome.attribution_window_days)
 
+    # Post-cohort candidates: any conversation on the tenant's org
+    # (all sources) started after applied_at. Provenance
+    # classification filters non-clean rows into their own buckets
+    # so quo/callio/etc conversations without provenance stamps
+    # count toward `provenance_pending_n` (excluded) rather than
+    # being silently missed.
     candidate_qs = Conversation.objects.filter(
         org=measurement.org,
-        source='leadbridge',
         started_at__gte=applied_at,
     ).only(
         'id', 'started_at',

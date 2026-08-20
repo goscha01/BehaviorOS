@@ -219,7 +219,11 @@ def _compute_baseline_cohort(
       - Conversation.org == org (tenant scoping — v1 approximation;
         assumes org is 1:1 with an LB tenant for now; v2 should tighten
         via EntityLink → LB lead ownership check)
-      - source == 'leadbridge'
+      - source is ANY (voice via `quo`, LB SMS/webhooks via `leadbridge`,
+        etc. — all sources for the tenant's org contribute). Filtering
+        by source alone is wrong because behavior recommendations apply
+        to the tenant's WHOLE customer-conversation surface, not just
+        one ingestion channel.
       - started_at in [applied_at - baseline_window_days, applied_at)
       - has at least one ConversationSemanticEvent with
         event_type == target_signal
@@ -235,10 +239,12 @@ def _compute_baseline_cohort(
     outcome = spec.primary_outcome
     window_start = applied_at - timedelta(days=outcome.baseline_window_days)
 
-    # Candidate conversations in the baseline window.
+    # Candidate conversations in the baseline window. Source is NOT
+    # filtered — a tenant's customer-conversation surface spans every
+    # ingestion channel (voice via quo, LB webhooks, etc.) and the
+    # rec's target signal applies to the whole surface.
     candidate_qs = Conversation.objects.filter(
         org=org,
-        source='leadbridge',
         started_at__gte=window_start,
         started_at__lt=applied_at,
     ).only('id', 'started_at')
