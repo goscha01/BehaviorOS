@@ -266,6 +266,42 @@ class RecommendationProposalStatusView(_TenantScopedMixin, APIView):
         )
 
 
+class TenantConfigAuditView(APIView):
+    """POST /api/v1/insights/audit/config-vs-extracted?tenantId=<uuid>
+
+    Read-only audit that assembles the field/rule-level diff between:
+      - LB-side normalized rules (BehavioralPolicy from
+        TenantConfigSnapshot via config_normalizer)
+      - Conversation-derived observed rules (ConditionalActionPattern
+        from LearningCorpus via SemanticExtractionRun + prompt-v3)
+
+    Emits MATCH / CONFLICT / MISSING_IN_LB / MISSING_IN_EXTRACTED /
+    LOW_CONFIDENCE buckets plus content-evidence excerpts and a
+    filter of onboarding-suitable proposals. Never modifies anything.
+
+    Service-token authenticated. See config_diff.py for the full
+    semantics + invariant enforcement.
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.audit.config_diff import (
+            build_audit, report_to_dict,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        report = build_audit(tenant)
+        if report is None:
+            return Response(
+                {'detail': f'no TenantConfigSnapshot for tenant {tenant}'},
+                status=http_status.HTTP_404_NOT_FOUND,
+            )
+        return Response(report_to_dict(report))
+
+
 class RomV1BenchmarkView(APIView):
     """POST /api/v1/insights/rom/benchmark?tenantId=<uuid>
 

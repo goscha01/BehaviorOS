@@ -13,6 +13,7 @@ from apps.conversations.api.views import (
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
     RecommendationRunViewSet, RomV1BenchmarkView,
+    TenantConfigAuditView,
 )
 
 
@@ -50,5 +51,10 @@ urlpatterns = _router.urls + [
         'rom/benchmark',
         RomV1BenchmarkView.as_view(),
         name='insights-rom-benchmark',
+    ),
+    path(
+        'audit/config-vs-extracted',
+        TenantConfigAuditView.as_view(),
+        name='insights-audit-config-vs-extracted',
     ),
 ]
