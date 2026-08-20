@@ -345,17 +345,24 @@ class RomV1BenchmarkView(APIView):
                 exclusions=_SPEC.exclusions,
                 verdict_gates=_SPEC.verdict_gates,
             )
-            ids, pos, neg = _cbc(
+            ids, pos, neg, matured, unresolved = _cbc(
                 org=org, tenant_external_id=tenant,
                 target_signal=signal, applied_at=applied_at,
+                freeze_time=applied_at,
                 spec=frozen,
             )
             n = pos + neg
             per_signal[signal] = {
-                'eligible_conversation_ids': len(ids),
+                'cohort_membership_n': len(ids),
+                'matured_n': matured,
                 'resolved_n': n,
-                'positive_n': pos, 'negative_n': neg,
+                'positive_n': pos,
+                'negative_n': neg,
+                'unresolved_n': unresolved,
                 'positive_rate': (pos / n) if n > 0 else None,
+                'outcome_resolution_coverage': (
+                    (n / matured) if matured > 0 else None
+                ),
             }
 
         # Check 2: end-to-end persistence
