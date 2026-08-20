@@ -33,6 +33,11 @@ class ExtractorEvalCase:
     turns: list[EvalTurn]
     # Event types that MUST appear in the extracted set for the case to pass.
     should_emit: list[str] = field(default_factory=list)
+    # AT LEAST ONE of these must appear. Used when multiple defensible
+    # ontology types cover the same reply (e.g. AVAILABILITY_GIVEN vs
+    # TIME_SLOT_OFFERED for "tomorrow at 10 or 9 am") and the case only
+    # needs to verify we didn't pick one of the WRONG types.
+    should_emit_any_of: list[str] = field(default_factory=list)
     # Event types that MUST NOT appear.
     must_not_emit: list[str] = field(default_factory=list)
     # Optional actor-level checks: no AGENT event may reference an
@@ -104,15 +109,18 @@ AUDIT_EVAL_CASES: list[ExtractorEvalCase] = [
         must_not_emit=[],   # PRICE_GIVEN or PRICE_EXPLAINED both acceptable
     ),
     # -----------------------------------------------------------------
-    # 4. Time-slot offer misclassified as PRICE_EXPLAINED
+    # 4. Time-slot / availability offer misclassified as PRICE_EXPLAINED
     #    (audit failure: conv 347cf8dc)
     # -----------------------------------------------------------------
     ExtractorEvalCase(
-        name='time_slot_offer_is_time_slot_not_price_explained',
+        name='availability_offer_is_not_price_explained',
         description=(
             'Agent offers availability instead of engaging on price. '
-            'v2 tagged the reply as PRICE_EXPLAINED; v3 must emit '
-            'TIME_SLOT_OFFERED (or AVAILABILITY_GIVEN).'
+            'v2 tagged the reply as PRICE_EXPLAINED; v3 must NOT do '
+            'that. Either TIME_SLOT_OFFERED or AVAILABILITY_GIVEN is '
+            'a defensible label for the reply (windows vs specific '
+            'slots is fuzzy) — the case gates the ANTI-regression, '
+            'not the choice between the two.'
         ),
         turns=[
             EvalTurn('customer', 'Can you tell me the price?'),
@@ -122,7 +130,7 @@ AUDIT_EVAL_CASES: list[ExtractorEvalCase] = [
                 'want to book one of those?',
             ),
         ],
-        should_emit=['TIME_SLOT_OFFERED'],
+        should_emit_any_of=['TIME_SLOT_OFFERED', 'AVAILABILITY_GIVEN'],
         must_not_emit=['PRICE_EXPLAINED', 'PRICE_GIVEN'],
     ),
     # -----------------------------------------------------------------

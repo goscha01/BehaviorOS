@@ -100,17 +100,27 @@ def _evaluate_one(
     emitted_types = {ev['event_type'] for ev in events}
     missing = [t for t in case.should_emit if t not in emitted_types]
     forbidden_found = [t for t in case.must_not_emit if t in emitted_types]
+    # "any_of" requirement — at least one of the listed types must appear
+    any_of_missing = []
+    if case.should_emit_any_of and not any(
+        t in emitted_types for t in case.should_emit_any_of
+    ):
+        any_of_missing = list(case.should_emit_any_of)
     # Empty-turn check: no agent event may reference a turn in empty_turn_indices.
     empty_violations = []
     for ev in events:
         if ev.get('actor') == 'agent' and ev.get('turn_start') in case.empty_turn_indices:
             empty_violations.append(f"{ev['event_type']} @ turn {ev['turn_start']}")
-    passed = not missing and not forbidden_found and not empty_violations
+    passed = (
+        not missing and not forbidden_found and not empty_violations
+        and not any_of_missing
+    )
     return {
         'case': case.name,
         'passed': passed,
         'emitted_types': sorted(emitted_types),
         'missing': missing,
+        'any_of_missing': any_of_missing,
         'forbidden_found': forbidden_found,
         'empty_violations': empty_violations,
         'rejected_count': len(rejected),
@@ -160,6 +170,10 @@ class Command(BaseCommand):
                 self.stdout.write(f'    emitted: {res["emitted_types"]}')
                 if res['missing']:
                     self.stdout.write(f'    MISSING (should_emit): {res["missing"]}')
+                if res.get('any_of_missing'):
+                    self.stdout.write(
+                        f'    MISSING (should_emit_any_of): {res["any_of_missing"]}'
+                    )
                 if res['forbidden_found']:
                     self.stdout.write(f'    FORBIDDEN found (must_not_emit): {res["forbidden_found"]}')
                 if res['empty_violations']:
