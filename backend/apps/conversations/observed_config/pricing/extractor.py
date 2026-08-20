@@ -167,35 +167,69 @@ def _validate_review(entries: list) -> list[dict]:
     return out
 
 
-def run_extraction(
+def create_or_reuse_run(
     *,
     org,
     corpus: LearningCorpus,
+    model: str = 'gpt-4o-mini',
+) -> tuple[ObservedFactExtractionRun, bool]:
+    """Create a PENDING extraction run OR return an existing
+    non-terminal run for the same (org, corpus, domain,
+    extractor_version). Returns (run, created_bool).
+
+    Trigger-endpoint side of the async contract: enqueue-time
+    idempotency. If the caller retries the POST while a run is still
+    queued/running, they get the SAME run back.
+    """
+    non_terminal = ObservedFactExtractionRun.objects.filter(
+        org=org, corpus=corpus,
+        domain=ObservedBusinessFact.Domain.PRICING,
+        extractor_version=PRICING_EXTRACTOR_VERSION,
+        status__in=[
+            ObservedFactExtractionRun.Status.PENDING,
+            ObservedFactExtractionRun.Status.RUNNING,
+        ],
+    ).order_by('-created_at').first()
+    if non_terminal is not None:
+        return (non_terminal, False)
+    run = ObservedFactExtractionRun.objects.create(
+        org=org, corpus=corpus,
+        domain=ObservedBusinessFact.Domain.PRICING,
+        extractor_version=PRICING_EXTRACTOR_VERSION,
+        model=model,
+        status=ObservedFactExtractionRun.Status.PENDING,
+    )
+    return (run, True)
+
+
+def run_extraction_for_existing(
+    *,
+    run: ObservedFactExtractionRun,
     llm_client,
     model: str = 'gpt-4o-mini',
     limit: Optional[int] = None,
 ) -> ObservedFactExtractionRun:
-    """Full extraction run over a corpus. Persists an
-    ObservedFactExtractionRun + per-conversation
-    ObservedBusinessFact rows (aggregated later) + any
-    OntologyReviewCandidate rows."""
-    run = ObservedFactExtractionRun.objects.create(
-        org=org,
-        corpus=corpus,
-        domain=ObservedBusinessFact.Domain.PRICING,
-        extractor_version=PRICING_EXTRACTOR_VERSION,
-        model=model,
-        status=ObservedFactExtractionRun.Status.RUNNING,
-        started_at=timezone.now(),
-    )
+    """Execute the extraction for an already-created run row.
+    Transitions PENDING -> RUNNING -> COMPLETED (or FAILED on raise).
+    Safe against Celery retries: if the run is already terminal,
+    no-op returns the row unchanged.
+    """
+    if run.status in (
+        ObservedFactExtractionRun.Status.COMPLETED,
+        ObservedFactExtractionRun.Status.FAILED,
+    ):
+        return run
+    run.status = ObservedFactExtractionRun.Status.RUNNING
+    run.started_at = timezone.now()
+    run.save(update_fields=['status', 'started_at'])
     logger.info(
         f'pricing-extractor: run_id={run.id} started; '
-        f'corpus={corpus.id} limit={limit!r}'
+        f'corpus={run.corpus_id} limit={limit!r}'
     )
 
     member_qs = (
         LearningCorpusMember.objects
-        .filter(corpus=corpus)
+        .filter(corpus_id=run.corpus_id)
         .select_related('conversation')
     )
     if limit:
@@ -224,10 +258,9 @@ def run_extraction(
         total_out += extraction.llm_output_tokens
         total_cost += extraction.llm_cost_usd
         processed += 1
-        # Persist ontology-review candidates immediately (small enough).
         for rev in extraction.ontology_review:
             OntologyReviewCandidate.objects.create(
-                org=org,
+                org=run.org,
                 extraction_run=run,
                 kind=OntologyReviewCandidate.Kind.EVENT_MIS_CLASSIFIED,
                 original_event_type=(
@@ -242,8 +275,6 @@ def run_extraction(
             )
             reviews_persisted += 1
 
-    # Aggregate all per-conversation prices into ObservedBusinessFact
-    # rows keyed by canonical subject_key.
     from apps.conversations.observed_config.pricing.aggregator import (
         aggregate_and_persist,
     )
@@ -272,3 +303,20 @@ def run_extraction(
         f'reviews={reviews_persisted} cost=${total_cost}'
     )
     return run
+
+
+def run_extraction(
+    *,
+    org,
+    corpus: LearningCorpus,
+    llm_client,
+    model: str = 'gpt-4o-mini',
+    limit: Optional[int] = None,
+) -> ObservedFactExtractionRun:
+    """Synchronous full extraction. Kept for the management command +
+    for tests. HTTP endpoints use the async create+enqueue path via
+    create_or_reuse_run + observed_pricing_extraction_task."""
+    run, _ = create_or_reuse_run(org=org, corpus=corpus, model=model)
+    return run_extraction_for_existing(
+        run=run, llm_client=llm_client, model=model, limit=limit,
+    )

@@ -34,51 +34,75 @@ from apps.conversations.observed_config.pricing.aggregator import (
 logger = logging.getLogger(__name__)
 
 
-PRICING_CONFIG_PARSER_VERSION = 'observed-config-pricing-parser-v1'
+PRICING_CONFIG_PARSER_VERSION = 'observed-config-pricing-parser-v2'
 
 
 SYSTEM_PROMPT = '''You normalize a residential-service business's
-manually-configured pricing table into a canonical fact schema.
+manually-configured pricing content into a canonical fact schema.
 
-You receive:
-- The ServiceProfile's name / slug / serviceGroup
-- The raw pricingJson content (tenant-authored — shape varies)
+You receive one of two sources (indicated in the user message):
+- A ServiceProfile's structured pricing_json blob, OR
+- The tenant's global_ai_prompt / chat instructions (prose that may
+  reference prices).
 
 Emit one fact per distinct configured price entry. Do NOT invent
-attributes: if the raw pricingJson does not specify a dimension
-(bedrooms, bathrooms, etc.), leave it null in subject_key. Preserve
-the JSON path in source_pointer so the audit can trace back.
+attributes: if the source does not specify a dimension (bedrooms,
+bathrooms, pricing_basis, etc.), leave it null in subject_key.
+Preserve the source location in source_pointer so the audit can
+trace back.
 
 Output schema:
 
   {
     "facts": [
       {
-        "fact_type": "quoted_price" | "price_range",
+        "fact_type": "quoted_price" | "price_range" | "discount_offered",
         "subject_key": {
           "service": <string or null>,
           "bedrooms": <integer or null>,
           "bathrooms": <integer or null>,
           "square_footage_bucket": <"<1000"|"1000-2000"|"2000-3000"|">3000" or null>,
           "frequency": <"one-time"|"weekly"|"biweekly"|"monthly" or null>,
-          "addons": [<string>...] or null
+          "addons": [<string>...] or null,
+          "pricing_basis": <one of:
+              "flat_job" | "hourly_per_cleaner" | "hourly_team" |
+              "addon_flat" | "addon_hourly" |
+              "discount_price" | "original_price" | "unknown">
         },
         "value": {
           "amount": <number or null>,
           "min_amount": <number or null>,
           "max_amount": <number or null>,
-          "currency": "USD"
+          "currency": "USD",
+          "discount_pct": <number or null>,
+          "discount_amount": <number or null>
         },
         "source_pointer": {
-          "service_profile_id": "<given>",
-          "json_path": "<dotted path into the raw JSON>"
+          "json_path": "<dotted path into the raw source>",
+          "raw_value": "<the raw value, as string>"
         }
       }
     ]
   }
 
-Return only the JSON object. If pricingJson is empty or unparseable,
-return {"facts": []}.
+`pricing_basis` values:
+  * "flat_job"           — total price for the whole job, no rate structure
+  * "hourly_per_cleaner" — hourly rate per cleaner
+  * "hourly_team"        — team hourly rate (no per-person qualifier)
+  * "addon_flat"         — fixed add-on price
+  * "addon_hourly"       — hourly add-on rate
+  * "discount_price"     — a discounted price (with a reference "regular"
+                            price also present)
+  * "original_price"     — the reference "regular" price alongside a
+                            discount
+  * "unknown"            — genuinely ambiguous
+
+Do NOT emit an entry unless there is a specific dollar amount OR
+percentage discount. Prose that says "call for pricing" or "prices
+vary" produces zero facts.
+
+Return only the JSON object. If the source has no pricing, return
+{"facts": []}.
 '''
 
 

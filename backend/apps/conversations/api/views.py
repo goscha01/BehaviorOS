@@ -315,14 +315,14 @@ class TenantConfigAuditView(APIView):
 class ObservedPricingRunView(APIView):
     """POST /api/v1/insights/audit/observed-pricing/run?tenantId=<uuid>[&limit=N]
 
-    Triggers a Pipeline 1D pricing extractor run over the tenant's
-    latest LearningCorpus. LLM calls happen synchronously inside the
-    request (Spotless corpus ~421 conversations → ~$0.20-$0.40 at
-    gpt-4o-mini). Optional `limit` truncates to N conversations for
-    smoke tests.
+    Ship A.1: async execution. Creates or reuses a PENDING run row,
+    queues the Celery task on behavioros-worker, returns 202 with
+    the run_id immediately. Poll GET /audit/extraction-runs/<run_id>
+    for status.
 
-    Idempotent per (org, corpus, extractor_version): a new run creates
-    NEW rows; older runs preserved. Audit endpoint picks the latest.
+    Idempotent per (org, corpus, extractor_version): if a
+    PENDING/RUNNING run already exists, returns its id (does NOT
+    queue a duplicate task).
     """
 
     authentication_classes = [InsightsServiceTokenAuthentication]
@@ -333,7 +333,10 @@ class ObservedPricingRunView(APIView):
             LearningCorpus, TenantConfigSnapshot as _TCS,
         )
         from apps.conversations.observed_config.pricing.extractor import (
-            run_extraction,
+            create_or_reuse_run,
+        )
+        from apps.conversations.tasks import (
+            observed_pricing_extraction_task,
         )
         tenant = (request.query_params.get('tenantId') or '').strip()
         if not tenant:
@@ -360,13 +363,63 @@ class ObservedPricingRunView(APIView):
             raise NotFound(
                 {'detail': f'no LearningCorpus for tenant {tenant}'}
             )
-        run = run_extraction(
+        run, created = create_or_reuse_run(
             org=snap.org, corpus=corpus,
-            llm_client=LearningLLMClient(), limit=limit_int,
         )
+        if created:
+            observed_pricing_extraction_task.delay(
+                str(run.id), 'gpt-4o-mini', limit_int,
+            )
+        return Response(
+            {
+                'run_id': str(run.id),
+                'status': run.status,
+                'created': created,
+                'note': (
+                    'Queued on behavioros-worker. Poll '
+                    'GET /audit/extraction-runs/<run_id>.'
+                    if created else
+                    'Existing PENDING/RUNNING run reused.'
+                ),
+            },
+            status=http_status.HTTP_202_ACCEPTED,
+        )
+
+
+class ExtractionRunStatusView(APIView):
+    """GET /api/v1/insights/audit/extraction-runs/<uuid>
+
+    Read-only status endpoint for the async 1D extraction runs.
+    Returns run counters + LLM cost + terminal status. Poll from the
+    caller after POST /audit/observed-pricing/run.
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, run_id):
+        from apps.conversations.models import (
+            ObservedFactExtractionRun as _R,
+        )
+        try:
+            run = _R.objects.get(pk=run_id)
+        except _R.DoesNotExist:
+            raise NotFound({'detail': f'no run {run_id}'})
         return Response({
             'run_id': str(run.id),
+            'org_id': str(run.org_id),
+            'corpus_id': str(run.corpus_id),
+            'domain': run.domain,
+            'extractor_version': run.extractor_version,
+            'model': run.model,
             'status': run.status,
+            'started_at': (
+                run.started_at.isoformat() if run.started_at else None
+            ),
+            'completed_at': (
+                run.completed_at.isoformat()
+                if run.completed_at else None
+            ),
             'conversations_processed': run.conversations_processed,
             'facts_emitted': run.facts_emitted,
             'ontology_review_candidates_emitted': (
@@ -374,6 +427,7 @@ class ObservedPricingRunView(APIView):
             ),
             'llm_cost_usd': str(run.llm_cost_usd),
             'stats': run.stats_json,
+            'error_message': run.error_message,
         })
 
 
