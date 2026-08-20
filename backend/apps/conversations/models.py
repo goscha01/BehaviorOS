@@ -1442,3 +1442,80 @@ class BehaviorRecommendation(BaseModel):
     def __str__(self) -> str:
         return (f'{self.recommendation_id} [{self.rec_class}] '
                 f'{self.subject_state or self.subject_signals}')
+
+
+class RecommendationLifecycleState(BaseModel):
+    """Mutable lifecycle state for a BehaviorRecommendation.
+
+    Kept SEPARATE from the immutable BehaviorRecommendation itself so
+    the analytical record never mutates — recommendations are frozen
+    at synthesis time; user reactions to them are recorded here.
+
+    One row per recommendation (created lazily on first state change
+    or on first read via get_or_create). `history` is an append-only
+    log of state transitions for later feedback learning.
+    """
+
+    class State(models.TextChoices):
+        NEW = 'new', 'New — never viewed'
+        VIEWED = 'viewed', 'Viewed — surfaced to user'
+        ACCEPTED = 'accepted', 'Accepted — user endorses (does NOT apply changes in v1)'
+        DISMISSED = 'dismissed', 'Dismissed — user rejected'
+
+    recommendation = models.OneToOneField(
+        BehaviorRecommendation, on_delete=models.CASCADE,
+        related_name='lifecycle',
+    )
+    state = models.CharField(max_length=16, choices=State.choices,
+                              default=State.NEW)
+    dismissal_reason = models.CharField(
+        max_length=64, blank=True, default='',
+        help_text='Optional short tag like "not_applicable", '
+                   '"already_doing_this", "insufficient_evidence"',
+    )
+    dismissal_note = models.TextField(
+        blank=True, default='',
+        help_text='Optional free-text explanation',
+    )
+    state_changed_at = models.DateTimeField(auto_now=True)
+    # Who changed it — for LB integration this is typically the LB
+    # user's email. Free string so we don't couple to a specific
+    # auth model.
+    state_changed_by = models.CharField(max_length=255, blank=True, default='')
+    # Append-only log of state transitions:
+    #   [{"from": "new", "to": "viewed", "at": "...", "by": "..."}]
+    history = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['recommendation', 'state']),
+        ]
+        ordering = ['-state_changed_at']
+
+    def __str__(self) -> str:
+        return f'{self.recommendation.recommendation_id}: {self.state}'
+
+    def transition_to(self, new_state: str, *,
+                       actor: str = '', reason: str = '',
+                       note: str = '') -> None:
+        """Record a state transition + append to history. Call `.save()`
+        afterwards. Idempotent: transitioning to the current state is a
+        no-op except for updating the actor/timestamp."""
+        from django.utils import timezone
+        prev = self.state
+        self.state = new_state
+        if reason:
+            self.dismissal_reason = reason
+        if note:
+            self.dismissal_note = note
+        if actor:
+            self.state_changed_by = actor
+        entry = {
+            'from': prev, 'to': new_state,
+            'at': timezone.now().isoformat(),
+        }
+        if actor:
+            entry['by'] = actor
+        if reason:
+            entry['reason'] = reason
+        self.history.append(entry)

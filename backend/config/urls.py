@@ -14,6 +14,7 @@ urlpatterns = [
     path('api/training/', include('apps.training.urls')),
     path('api/learning/', include('apps.learning.urls')),
     path('api/context/', include('apps.context.urls')),
+    path('api/v1/insights/', include('apps.conversations.api.urls')),
 ]
 
 if settings.DEBUG:
