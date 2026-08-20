@@ -1143,3 +1143,118 @@ class PolicyAlignmentAssessment(BaseModel):
 
     def __str__(self) -> str:
         return f'{self.alignment_status} [{self.policy}]'
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1B-6: CustomerState v1 — inferred state primitive
+# ---------------------------------------------------------------------------
+#
+# A CustomerState is BehaviorOS's normalized abstraction of where a
+# customer is in the sales journey. Inferred deterministically from
+# semantic events; multiple event paths can enter the same state
+# (that's the whole point of the abstraction).
+#
+# InferenceRun tracks the (extraction × inference-version) key so
+# re-running with new rules under the same extraction creates a NEW
+# inference set — old rows preserved.
+
+
+class CustomerStateInferenceRun(BaseModel):
+    """One end-to-end state-inference pass over a corpus × extraction."""
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='state_inference_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='state_inference_runs',
+    )
+    extraction_run = models.ForeignKey(
+        SemanticExtractionRun, on_delete=models.CASCADE,
+        related_name='state_inference_runs',
+    )
+    inference_version = models.CharField(max_length=64)
+    status = models.CharField(max_length=16, choices=Status.choices,
+                              default=Status.PENDING)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    n_conversations_inferred = models.PositiveIntegerField(default=0)
+    n_transitions_emitted = models.PositiveIntegerField(default=0)
+    config_snapshot_hash = models.CharField(max_length=64, blank=True, default='',
+                                             help_text='Rules-config hash for '
+                                                        'audit trail')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['corpus', 'extraction_run', 'inference_version'],
+                name='state_inference_run_unique',
+            ),
+        ]
+        indexes = [models.Index(fields=['corpus', 'status'])]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (f'StateInferenceRun {self.corpus.name}@{self.corpus.version} '
+                f'{self.inference_version}')
+
+
+class InferredCustomerState(BaseModel):
+    """One state transition in a conversation's inferred state history.
+
+    Never mutated. A conversation with N state changes has N rows here,
+    ordered by `ordinal` starting at 0 (the initial move from UNKNOWN).
+    Transitions preserve the previous_state so the full history is
+    walkable without joins.
+    """
+
+    inference_run = models.ForeignKey(
+        CustomerStateInferenceRun, on_delete=models.CASCADE,
+        related_name='states',
+    )
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE,
+        related_name='inferred_states',
+    )
+    ordinal = models.PositiveIntegerField(
+        help_text='0-based position in this conversation state history',
+    )
+    state = models.CharField(max_length=32)
+    previous_state = models.CharField(max_length=32)
+    trigger_event_types = models.JSONField(
+        default=list,
+        help_text='Ontology event types that produced this transition',
+    )
+    trigger_event_ordinals = models.JSONField(
+        default=list,
+        help_text='Semantic-event ordinals (provenance to '
+                   'ConversationSemanticEvent.ordinal)',
+    )
+    effective_turn = models.PositiveIntegerField(
+        help_text='DB parent turn_start of the latest triggering event',
+    )
+    reason = models.TextField(blank=True, default='')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['inference_run', 'conversation', 'ordinal'],
+                name='inferred_state_run_conv_ordinal_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['inference_run', 'state']),
+            models.Index(fields=['conversation', 'inference_run']),
+        ]
+        ordering = ['inference_run', 'conversation', 'ordinal']
+
+    def __str__(self) -> str:
+        return (f'{self.previous_state} → {self.state} '
+                f'@turn{self.effective_turn}')
