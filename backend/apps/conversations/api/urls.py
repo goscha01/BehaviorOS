@@ -9,9 +9,11 @@ from django.urls import path
 from rest_framework.routers import SimpleRouter
 
 from apps.conversations.api.views import (
-    ConfiguredPricingRunView, ConfiguredQualificationRunView,
+    ConfiguredFaqRunView, ConfiguredPricingRunView,
+    ConfiguredQualificationRunView,
     ExtractionRunStatusView,
-    ObservedPricingRunView, ObservedQualificationRunView,
+    ObservedFaqRunView, ObservedPricingRunView,
+    ObservedQualificationRunView,
     RecommendationDetailView, RecommendationLifecycleView,
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
@@ -84,5 +86,15 @@ urlpatterns = _router.urls + [
         'audit/configured-qualification/run',
         ConfiguredQualificationRunView.as_view(),
         name='insights-audit-configured-qualification-run',
+    ),
+    path(
+        'audit/observed-faq/run',
+        ObservedFaqRunView.as_view(),
+        name='insights-audit-observed-faq-run',
+    ),
+    path(
+        'audit/configured-faq/run',
+        ConfiguredFaqRunView.as_view(),
+        name='insights-audit-configured-faq-run',
     ),
 ]
