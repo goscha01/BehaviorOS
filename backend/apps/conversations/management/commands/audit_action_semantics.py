@@ -47,6 +47,13 @@ class Command(BaseCommand):
         parser.add_argument('--include-holdout', action='store_true')
         parser.add_argument('--model', default='gpt-4o-mini',
                             help='LLM model for reply classification')
+        parser.add_argument('--taxonomy', default='generic',
+                            help='Classification taxonomy: "generic" (default '
+                                 'six categories) or a condition-specific name '
+                                 'like "price_requested" (nine categories '
+                                 'covering price + explanation + discount + '
+                                 'scope/value + qualification + '
+                                 'booking-instead-of-price)')
         parser.add_argument('--limit', type=int, default=0,
                             help='Optional cap on # observations classified '
                                  '(0 = no cap)')
@@ -126,9 +133,14 @@ class Command(BaseCommand):
         max_turn_distance = int(
             (run.config or {}).get('max_turn_distance', 20)
         )
-        classifier = build_llm_classifier(
-            LearningLLMClient(), model=options['model'],
-        )
+        try:
+            classifier = build_llm_classifier(
+                LearningLLMClient(),
+                model=options['model'],
+                taxonomy=options['taxonomy'],
+            )
+        except ValueError as exc:
+            raise CommandError(str(exc)) from exc
         result = audit(
             conversation_events=events_by_conv,
             conversation_turns=turns_by_conv,
@@ -172,9 +184,20 @@ class Command(BaseCommand):
         self.stdout.write(self.style.MIGRATE_HEADING(
             'Extracted action (rows) × LLM category (columns):'
         ))
-        cats_ordered = ['substantive_next_step', 'generic_follow_up',
-                        'acknowledgment_only', 'customer_continues_details',
-                        'true_no_response', 'mixed_or_unclear']
+        # Pull the taxonomy's own category order so the cross-tab
+        # matches the chosen taxonomy (generic vs price_requested vs
+        # future condition-specific ones).
+        from apps.conversations.analysis.action_semantics_audit import (
+            CONDITION_TAXONOMIES, SEMANTIC_CATEGORIES,
+        )
+        if options['taxonomy'] == 'generic':
+            cats_ordered = ['substantive_next_step', 'generic_follow_up',
+                            'acknowledgment_only', 'customer_continues_details',
+                            'true_no_response', 'mixed_or_unclear']
+        else:
+            cats_ordered = sorted(
+                CONDITION_TAXONOMIES[options['taxonomy']]['categories']
+            )
         # Row = extracted action, Col = LLM category
         matrix: dict[str, Counter] = defaultdict(Counter)
         for e in entries:
@@ -212,17 +235,15 @@ class Command(BaseCommand):
                 else:
                     self.stdout.write(f'      reply: (empty)')
 
-        # CA0001-style comparison: substantive vs generic_follow_up
+        # Ranked outcome-rate table for the chosen taxonomy
         self.stdout.write('')
         self.stdout.write(self.style.SUCCESS(
-            '=== Recomputed CA0001-adjacent comparison ==='
+            f'=== Positive rate by LLM category ({options["taxonomy"]}) ==='
         ))
-        for cat in ('substantive_next_step', 'generic_follow_up',
-                    'acknowledgment_only', 'customer_continues_details',
-                    'true_no_response'):
+        for cat in cats_ordered:
             if cat in rates:
                 pos, total, rate = rates[cat]
                 self.stdout.write(
-                    f'  after {condition} → {cat:30} '
+                    f'  after {condition} → {cat:36} '
                     f'n={total:3} positive_rate={rate:.2f}'
                 )

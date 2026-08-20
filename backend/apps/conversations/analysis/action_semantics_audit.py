@@ -62,6 +62,66 @@ SEMANTIC_CATEGORIES: frozenset[str] = frozenset({
     'mixed_or_unclear',
 })
 
+# Per-condition taxonomies for cases where the generic 6-way split
+# doesn't discriminate enough. Registered by name; the CLI picks one
+# via `--taxonomy <name>`. Each entry maps the taxonomy name to the
+# fixed category set + the system-prompt text that instructs the LLM
+# how to choose among them.
+CONDITION_TAXONOMIES: dict[str, dict] = {}
+
+
+def _register_taxonomy(name: str, categories: frozenset[str], system_prompt: str):
+    CONDITION_TAXONOMIES[name] = {
+        'categories': categories,
+        'system_prompt': system_prompt,
+    }
+
+
+SEMANTIC_CATEGORIES_PRICE_REQUESTED: frozenset[str] = frozenset({
+    'price_only',
+    'price_plus_explanation',
+    'price_plus_discount',
+    'scope_or_value_explained',
+    'asks_for_more_details',
+    'booking_or_availability_next_step',
+    'acknowledgment_only',
+    'true_no_response',
+    'other_unclear',
+})
+
+_register_taxonomy(
+    'price_requested',
+    SEMANTIC_CATEGORIES_PRICE_REQUESTED,
+    'You are a sales-conversation reply classifier. The customer just '
+    'asked about pricing (PRICE_REQUESTED). Given the extractor-labeled '
+    'agent action and the raw text of the agent reply, choose ONE '
+    'category from this fixed set:\n\n'
+    '- price_only: agent stated a price (or range) with no explanation '
+    'and no other content. E.g. "$150." / "Deep clean is $200-$250."\n'
+    '- price_plus_explanation: agent stated a price AND explained '
+    'what it covers or how it was computed. E.g. "$150 covers 2 hours '
+    'and includes supplies."\n'
+    '- price_plus_discount: agent stated a price AND offered a '
+    'discount / promo. E.g. "$150, and we have 10% off new customers."\n'
+    '- scope_or_value_explained: agent explained scope of service or '
+    'value proposition WITHOUT giving a price. E.g. "We include '
+    'kitchen deep-clean, baseboards, and inside oven."\n'
+    '- asks_for_more_details: agent asked a qualification question '
+    'to clarify scope before giving a price. E.g. "How many bedrooms '
+    'and bathrooms?"\n'
+    '- booking_or_availability_next_step: agent offered slots / asked '
+    'to book instead of engaging on price. E.g. "I have Tuesday at '
+    '2pm — would you like that?"\n'
+    '- acknowledgment_only: "thanks", "got it", polite ack with no '
+    'substantive content.\n'
+    '- true_no_response: the reply text is empty.\n'
+    '- other_unclear: text is present but does not fit any category '
+    'cleanly.\n\n'
+    'Return ONLY a JSON object of the form '
+    '{"category": "<one of the above>", "confidence": <0.0-1.0>, '
+    '"rationale": "<one short sentence>"}.'
+)
+
 
 # Per-observation max agent-reply text we send to the classifier. Keeps
 # LLM cost bounded and prevents a 30-turn ramble from dominating the input.
@@ -180,46 +240,79 @@ def _fallback_category(agent_reply_text: str) -> str:
     return 'mixed_or_unclear'
 
 
+_GENERIC_SYSTEM_PROMPT = (
+    f'You are a sales-conversation reply classifier. Given a '
+    f'customer signal, the sales-conversation event our extractor '
+    f'labeled the agent reply as, and the raw text of that reply, '
+    f'return a JSON object choosing ONE category from this fixed '
+    f'set: {sorted(SEMANTIC_CATEGORIES)}. Categories:\n'
+    '- substantive_next_step: agent gave price, offered availability, '
+    'requested booking, clarified scope, asked a qualification '
+    'question, or otherwise materially advanced the sale.\n'
+    '- generic_follow_up: a nudge with no substantive content '
+    '("just checking in", "any updates?", "let me know if you '
+    'need anything"). No price, no availability, no next step.\n'
+    '- acknowledgment_only: "thanks!", "got it", "perfect" — '
+    'polite acknowledgment with no forward motion.\n'
+    '- customer_continues_details: the "reply" is actually a system '
+    'artifact or the analyzer correctly waited; the customer sent '
+    'more info before the agent needed to respond.\n'
+    '- true_no_response: the reply text is empty or nonexistent.\n'
+    '- mixed_or_unclear: text is present but doesn\'t fit any '
+    'category cleanly.\n\n'
+    'Return ONLY a JSON object of the form '
+    '{"category": "<one of the above>", "confidence": <0.0-1.0>, '
+    '"rationale": "<one short sentence>"}.'
+)
+
+
+def _resolve_taxonomy(taxonomy: str) -> tuple[frozenset[str], str, str]:
+    """Return (allowed_categories, system_prompt, empty_category) for a
+    taxonomy name. `empty_category` is what we assign when the reply
+    text is empty (short-circuit before the LLM call)."""
+    if taxonomy == 'generic':
+        return SEMANTIC_CATEGORIES, _GENERIC_SYSTEM_PROMPT, 'true_no_response'
+    if taxonomy in CONDITION_TAXONOMIES:
+        entry = CONDITION_TAXONOMIES[taxonomy]
+        return entry['categories'], entry['system_prompt'], 'true_no_response'
+    raise ValueError(
+        f'unknown taxonomy {taxonomy!r}; available: '
+        f'{["generic"] + sorted(CONDITION_TAXONOMIES.keys())}'
+    )
+
+
 def build_llm_classifier(
-    llm_client, *, model: str = 'gpt-4o-mini',
+    llm_client, *, model: str = 'gpt-4o-mini', taxonomy: str = 'generic',
 ) -> ClassifyFn:
     """Wrap a LearningLLMClient into a ClassifyFn.
+
+    `taxonomy` selects the classification vocabulary + prompt:
+    - 'generic' (default): the six-category set used across most audits
+    - 'price_requested': the nine-category set specific to
+      PRICE_REQUESTED (splits price + explanation + discount +
+      scope/value + qualification + booking-instead-of-price etc.)
 
     Sends one classification per observation. Cheap: ~$0.0001 per call
     at gpt-4o-mini rates for a ~200-char reply.
     """
-    import json as _json
+    allowed, system_prompt, empty_cat = _resolve_taxonomy(taxonomy)
 
-    system_prompt = (
-        f'You are a sales-conversation reply classifier. Given a '
-        f'customer signal, the sales-conversation event our extractor '
-        f'labeled the agent reply as, and the raw text of that reply, '
-        f'return a JSON object choosing ONE category from this fixed '
-        f'set: {sorted(SEMANTIC_CATEGORIES)}. Categories:\n'
-        '- substantive_next_step: agent gave price, offered availability, '
-        'requested booking, clarified scope, asked a qualification '
-        'question, or otherwise materially advanced the sale.\n'
-        '- generic_follow_up: a nudge with no substantive content '
-        '("just checking in", "any updates?", "let me know if you '
-        'need anything"). No price, no availability, no next step.\n'
-        '- acknowledgment_only: "thanks!", "got it", "perfect" — '
-        'polite acknowledgment with no forward motion.\n'
-        '- customer_continues_details: the "reply" is actually a system '
-        'artifact or the analyzer correctly waited; the customer sent '
-        'more info before the agent needed to respond.\n'
-        '- true_no_response: the reply text is empty or nonexistent.\n'
-        '- mixed_or_unclear: text is present but doesn\'t fit any '
-        'category cleanly.\n\n'
-        'Return ONLY a JSON object of the form '
-        '{"category": "<one of the above>", "confidence": <0.0-1.0>, '
-        '"rationale": "<one short sentence>"}.'
-    )
+    def _fallback(text: str) -> str:
+        if not text.strip():
+            return empty_cat
+        # Prefer the taxonomy's own unclear/mixed bucket when it has one.
+        if 'mixed_or_unclear' in allowed:
+            return 'mixed_or_unclear'
+        if 'other_unclear' in allowed:
+            return 'other_unclear'
+        # Last-resort fallback — pick an arbitrary category so callers
+        # don't have to reason about None.
+        return next(iter(allowed))
 
     def _classify(condition_event: str, extracted_action: str,
                    agent_reply_text: str) -> tuple[str, float, str]:
-        # Fast-path: empty reply text bypasses the LLM.
         if not agent_reply_text.strip():
-            return 'true_no_response', 1.0, 'agent reply text was empty'
+            return empty_cat, 1.0, 'agent reply text was empty'
         user_prompt = (
             f'Customer signal that preceded this reply: {condition_event}\n'
             f'Extractor-labeled agent action: {extracted_action}\n'
@@ -234,13 +327,13 @@ def build_llm_classifier(
                 max_tokens=200,
             )
         except Exception as exc:
-            return _fallback_category(agent_reply_text), 0.0, f'llm error: {exc!r}'
+            return _fallback(agent_reply_text), 0.0, f'llm error: {exc!r}'
         parsed = r.parsed_json
         if not isinstance(parsed, dict):
-            return _fallback_category(agent_reply_text), 0.0, 'llm returned non-object'
+            return _fallback(agent_reply_text), 0.0, 'llm returned non-object'
         cat = parsed.get('category')
-        if cat not in SEMANTIC_CATEGORIES:
-            return _fallback_category(agent_reply_text), 0.0, (
+        if cat not in allowed:
+            return _fallback(agent_reply_text), 0.0, (
                 f'llm returned unknown category: {cat!r}'
             )
         try:

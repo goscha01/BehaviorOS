@@ -216,3 +216,73 @@ class AuditOrchestrationTests(SimpleTestCase):
                     'acknowledgment_only', 'customer_continues_details',
                     'true_no_response', 'mixed_or_unclear'):
             self.assertIn(cat, SEMANTIC_CATEGORIES)
+
+
+# ---------------------------------------------------------------------------
+# Taxonomy resolution — generic + condition-specific
+# ---------------------------------------------------------------------------
+
+
+class TaxonomyResolutionTests(SimpleTestCase):
+    def test_price_requested_taxonomy_registered(self):
+        from apps.conversations.analysis.action_semantics_audit import (
+            CONDITION_TAXONOMIES, SEMANTIC_CATEGORIES_PRICE_REQUESTED,
+        )
+        self.assertIn('price_requested', CONDITION_TAXONOMIES)
+        entry = CONDITION_TAXONOMIES['price_requested']
+        self.assertEqual(entry['categories'], SEMANTIC_CATEGORIES_PRICE_REQUESTED)
+        self.assertIn('price_only', entry['categories'])
+        self.assertIn('price_plus_explanation', entry['categories'])
+        self.assertIn('price_plus_discount', entry['categories'])
+        self.assertIn('scope_or_value_explained', entry['categories'])
+        self.assertIn('asks_for_more_details', entry['categories'])
+        self.assertIn('booking_or_availability_next_step', entry['categories'])
+        self.assertIn('true_no_response', entry['categories'])
+        self.assertIn('other_unclear', entry['categories'])
+
+    def test_unknown_taxonomy_raises(self):
+        from unittest.mock import MagicMock
+        from apps.conversations.analysis.action_semantics_audit import (
+            build_llm_classifier,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            build_llm_classifier(MagicMock(), taxonomy='does_not_exist')
+        self.assertIn('unknown taxonomy', str(ctx.exception))
+
+    def test_price_taxonomy_classifier_rejects_out_of_vocab_categories(self):
+        """When LLM returns a generic category name against the price
+        taxonomy, the classifier must fall back rather than accept a
+        non-price label."""
+        from unittest.mock import MagicMock
+        from apps.conversations.analysis.action_semantics_audit import (
+            build_llm_classifier,
+        )
+        fake_llm = MagicMock()
+        fake_llm.analyze.return_value = MagicMock(parsed_json={
+            'category': 'substantive_next_step',  # not in price taxonomy
+            'confidence': 0.9, 'rationale': 'x',
+        })
+        classify = build_llm_classifier(fake_llm, taxonomy='price_requested')
+        cat, conf, rat = classify('PRICE_REQUESTED', 'PRICE_GIVEN',
+                                   'Deep clean is $150.')
+        # Should fall back to other_unclear (the price taxonomy's unclear bucket)
+        self.assertEqual(cat, 'other_unclear')
+        self.assertIn('unknown category', rat)
+
+    def test_price_taxonomy_accepts_in_vocab_categories(self):
+        from unittest.mock import MagicMock
+        from apps.conversations.analysis.action_semantics_audit import (
+            build_llm_classifier,
+        )
+        fake_llm = MagicMock()
+        fake_llm.analyze.return_value = MagicMock(parsed_json={
+            'category': 'price_plus_discount',
+            'confidence': 0.88, 'rationale': 'gave price + promo',
+        })
+        classify = build_llm_classifier(fake_llm, taxonomy='price_requested')
+        cat, conf, rat = classify(
+            'PRICE_REQUESTED', 'PRICE_GIVEN',
+            '$150 plus 10% off first booking.',
+        )
+        self.assertEqual(cat, 'price_plus_discount')
+        self.assertAlmostEqual(conf, 0.88)
