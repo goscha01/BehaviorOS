@@ -386,6 +386,110 @@ class ObservedPricingRunView(APIView):
         )
 
 
+class ObservedQualificationRunView(APIView):
+    """POST /api/v1/insights/audit/observed-qualification/run?tenantId=<uuid>[&limit=N]
+
+    Ship B counterpart of the pricing trigger. Async — returns 202
+    with run_id; poll GET /audit/extraction-runs/<uuid>.
+    Idempotent per (org, corpus, extractor_version).
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.models import (
+            LearningCorpus, TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.qualification.extractor import (
+            create_or_reuse_run,
+        )
+        from apps.conversations.tasks import (
+            observed_qualification_extraction_task,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        limit = request.query_params.get('limit')
+        try:
+            limit_int = int(limit) if limit else None
+        except ValueError:
+            raise ValidationError({'limit': 'must be integer'})
+        snap = (
+            _TCS.objects.filter(
+                source_system='leadbridge', tenant_external_id=tenant,
+            ).order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        corpus = (
+            LearningCorpus.objects.filter(org=snap.org)
+            .order_by('-created_at').first()
+        )
+        if corpus is None:
+            raise NotFound(
+                {'detail': f'no LearningCorpus for tenant {tenant}'}
+            )
+        run, created = create_or_reuse_run(
+            org=snap.org, corpus=corpus,
+        )
+        if created:
+            observed_qualification_extraction_task.delay(
+                str(run.id), 'gpt-4o-mini', limit_int,
+            )
+        return Response(
+            {
+                'run_id': str(run.id),
+                'status': run.status,
+                'created': created,
+                'note': (
+                    'Queued on behavioros-worker. Poll '
+                    'GET /audit/extraction-runs/<run_id>.'
+                    if created else
+                    'Existing PENDING/RUNNING run reused.'
+                ),
+            },
+            status=http_status.HTTP_202_ACCEPTED,
+        )
+
+
+class ConfiguredQualificationRunView(APIView):
+    """POST /api/v1/insights/audit/configured-qualification/run?tenantId=<uuid>
+
+    Synchronous run — LB config parsing is fast (single LLM pass per
+    source, ~1-2 seconds). Idempotent per (snapshot, parser_version).
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.models import (
+            TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.qualification.config_parser import (
+            parse_snapshot,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        snap = (
+            _TCS.objects.filter(
+                source_system='leadbridge', tenant_external_id=tenant,
+            ).order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        run = parse_snapshot(
+            snapshot=snap, llm_client=LearningLLMClient(),
+        )
+        return Response({
+            'run_id': str(run.id),
+            'status': run.status,
+            'snapshot_id': str(snap.id),
+            'facts_emitted': run.facts_emitted,
+            'llm_cost_usd': str(run.llm_cost_usd),
+        })
+
+
 class ExtractionRunStatusView(APIView):
     """GET /api/v1/insights/audit/extraction-runs/<uuid>
 

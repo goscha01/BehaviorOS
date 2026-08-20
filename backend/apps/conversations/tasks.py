@@ -102,3 +102,63 @@ def observed_pricing_extraction_task(
         'facts_emitted': run.facts_emitted,
         'llm_cost_usd': str(run.llm_cost_usd),
     }
+
+
+@shared_task(
+    name='apps.conversations.tasks.observed_qualification_extraction_task',
+    bind=True,
+    autoretry_for=(),
+    acks_late=True,
+)
+def observed_qualification_extraction_task(
+    self, run_id: str, model: str = 'gpt-4o-mini',
+    limit: Optional[int] = None,
+) -> dict:
+    """Async execution of the Pipeline 1D qualification extractor
+    (Ship B). Same shape as observed_pricing_extraction_task."""
+    from apps.conversations.observed_config.qualification.extractor import (
+        run_extraction_for_existing,
+    )
+    from apps.learning.services.llm_client import LearningLLMClient
+    try:
+        run = ObservedFactExtractionRun.objects.select_related(
+            'org', 'corpus',
+        ).get(pk=run_id)
+    except ObservedFactExtractionRun.DoesNotExist:
+        logger.warning(
+            'observed_qualification_extraction_task: run %s not found',
+            run_id,
+        )
+        return {'run_id': run_id, 'skipped': 'run_not_found'}
+    if run.status in (
+        ObservedFactExtractionRun.Status.COMPLETED,
+        ObservedFactExtractionRun.Status.FAILED,
+    ):
+        return {
+            'run_id': str(run.id), 'status': run.status,
+            'skipped': 'already_terminal',
+        }
+    try:
+        run_extraction_for_existing(
+            run=run,
+            llm_client=LearningLLMClient(),
+            model=model,
+            limit=limit,
+        )
+    except Exception as exc:
+        run.status = ObservedFactExtractionRun.Status.FAILED
+        run.error_message = str(exc)[:2000]
+        run.completed_at = timezone.now()
+        run.save()
+        logger.exception(
+            'observed_qualification_extraction_task: run %s failed: %s',
+            run.id, exc,
+        )
+        raise
+    return {
+        'run_id': str(run.id),
+        'status': run.status,
+        'conversations_processed': run.conversations_processed,
+        'facts_emitted': run.facts_emitted,
+        'llm_cost_usd': str(run.llm_cost_usd),
+    }
