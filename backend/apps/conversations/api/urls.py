@@ -10,6 +10,7 @@ from rest_framework.routers import SimpleRouter
 
 from apps.conversations.api.views import (
     RecommendationDetailView, RecommendationLifecycleView,
+    RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
     RecommendationRunViewSet,
 )
@@ -39,5 +40,10 @@ urlpatterns = _router.urls + [
         'recommendations/<uuid:pk>/proposal/status',
         RecommendationProposalStatusView.as_view(),
         name='insights-recommendation-proposal-status',
+    ),
+    path(
+        'recommendations/<uuid:pk>/measurement',
+        RecommendationMeasurementView.as_view(),
+        name='insights-recommendation-measurement',
     ),
 ]

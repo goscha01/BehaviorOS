@@ -222,3 +222,94 @@ class LifecycleTransitionRequestSerializer(serializers.Serializer):
     note = serializers.CharField(
         required=False, allow_blank=True, default='',
     )
+
+
+class MeasurementCreateRequestSerializer(serializers.Serializer):
+    """LB → BehaviorOS payload for POST /recommendations/<id>/measurement.
+
+    Sent by LB immediately after a successful Apply. Idempotent per
+    lb_recommendation_application_id."""
+
+    lb_recommendation_application_id = serializers.CharField(max_length=64)
+    applied_at = serializers.DateTimeField()
+    pre_effective_config_hash = serializers.CharField(
+        required=False, allow_blank=True, default='',
+        max_length=64,
+        help_text='Config hash BEFORE the apply was written. Optional '
+                   'because the first-ever apply on a tenant has no '
+                   'pre-treatment baseline hash to compare against.',
+    )
+    treatment_effective_config_hash = serializers.CharField(
+        max_length=64,
+        help_text='Config hash AFTER the apply was written',
+    )
+    treatment_managed_hash = serializers.CharField(
+        max_length=64,
+        help_text='behavior_os_managed subtree hash after apply',
+    )
+    effective_config_schema_version = serializers.CharField(
+        max_length=32,
+        help_text='e.g. lb-effective-config-v1',
+    )
+
+
+class RecommendationOutcomeMeasurementSerializer(serializers.ModelSerializer):
+    """Read shape for a measurement. The consumer (LB UI) uses this to
+    render Measuring / Measured Result states on Applied recommendations."""
+
+    id = serializers.UUIDField(read_only=True)
+    recommendation_id = serializers.UUIDField(
+        source='recommendation.pk', read_only=True,
+    )
+    provenance_coverage = serializers.SerializerMethodField()
+    is_terminal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = None  # set below
+        fields = [
+            'id',
+            'recommendation_id',
+            'lb_recommendation_application_id',
+            'tenant_external_id',
+            'measurement_spec_key',
+            'measurement_spec_version',
+            'frozen_spec_json',
+            'applied_at',
+            'subject_state',
+            'subject_signals',
+            'target_signal',
+            'pre_effective_config_hash',
+            'treatment_effective_config_hash',
+            'treatment_managed_hash',
+            'effective_config_schema_version',
+            'pre_n', 'pre_positive_n', 'pre_rate',
+            'post_n', 'post_positive_n', 'post_rate',
+            'target_signal_conversations_n',
+            'provenance_eligible_n',
+            'provenance_pending_n',
+            'provenance_hash_failed_n',
+            'provenance_schema_mismatch_n',
+            'contaminated_n',
+            'treatment_moved_n',
+            'provenance_coverage',
+            'effect_size_pp', 'ci_low_pp', 'ci_high_pp', 'p_value',
+            'status', 'status_reason', 'evaluation_version',
+            'is_terminal',
+            'measurement_started_at', 'measurement_deadline_at',
+            'last_evaluated_at', 'finalized_at',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = fields
+
+    def get_provenance_coverage(self, obj):
+        return obj.provenance_coverage()
+
+    def get_is_terminal(self, obj):
+        return obj.is_terminal()
+
+
+# Fill the model reference here (import cycle avoidance)
+from apps.conversations.models import (  # noqa: E402
+    RecommendationOutcomeMeasurement as _ROM,
+)
+RecommendationOutcomeMeasurementSerializer.Meta.model = _ROM

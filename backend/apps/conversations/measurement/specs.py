@@ -115,9 +115,18 @@ class PrimaryOutcomeDefinition:
     within the window is scored as negative if a negative terminal was
     reached; otherwise the customer is UNRESOLVED and does not count
     toward either arm's outcome rate.
+
+    `baseline_window_days` defines the elapsed-time lookback used to
+    build the pre-application cohort. Larger windows accumulate more
+    baseline data but risk mixing eras where the tenant's config was
+    materially different. v1 defaults to 90 days — a conservative
+    compromise given that most LB tenants' historical conversations
+    predate provenance stamping (config_provenance_status=PENDING)
+    and can't be filtered by hash.
     """
     kind: str  # 'reaches_positive_terminal_within_days'
     attribution_window_days: int
+    baseline_window_days: int
     positive_terminal_events: tuple[str, ...]
     negative_terminal_events: tuple[str, ...]
 
@@ -136,9 +145,10 @@ class ExclusionRule:
 
 @dataclass(frozen=True)
 class VerdictGates:
-    """Three gates that must ALL pass to declare IMPROVED/WORSE.
+    """Gates that must ALL pass to declare IMPROVED/WORSE.
 
-    Any failure keeps status at COLLECTING or INCONCLUSIVE.
+    Any failure keeps status at COLLECTING (before READY) or leads to
+    INCONCLUSIVE (at deadline).
 
     - min_sample_per_arm: neither arm may have fewer than this many
       cohort members with a resolved outcome (positive or negative).
@@ -148,13 +158,18 @@ class VerdictGates:
     - uncertainty_significance_alpha: Fisher's exact two-sided p-value
       must be strictly less than this. NOT the only gate — see class
       docstring.
+    - min_provenance_coverage: minimum fraction of target-signal
+      conversations that must have clean provenance (eligible / total).
+      Below this, READY is refused — silent PENDING/HASH_FAILED gaps
+      would invalidate any verdict. v1: 0.60.
     - max_window_days_for_inconclusive: after this many days from
-      application, if all three gates have not passed, transition to
+      application, if verdict gates have not passed, transition to
       INCONCLUSIVE rather than continuing to accumulate forever.
     """
     min_sample_per_arm: int
     min_effect_size_pp: float
     uncertainty_significance_alpha: float
+    min_provenance_coverage: float
     max_window_days_for_inconclusive: int
 
 
@@ -254,6 +269,9 @@ class FrozenMeasurementSpec:
                 'attribution_window_days': (
                     self.primary_outcome.attribution_window_days
                 ),
+                'baseline_window_days': (
+                    self.primary_outcome.baseline_window_days
+                ),
                 'positive_terminal_events': list(
                     self.primary_outcome.positive_terminal_events
                 ),
@@ -271,6 +289,9 @@ class FrozenMeasurementSpec:
                 ),
                 'uncertainty_significance_alpha': (
                     self.verdict_gates.uncertainty_significance_alpha
+                ),
+                'min_provenance_coverage': (
+                    self.verdict_gates.min_provenance_coverage
                 ),
                 'max_window_days_for_inconclusive': (
                     self.verdict_gates.max_window_days_for_inconclusive
@@ -310,6 +331,7 @@ HIGH_INTENT_SIGNAL_COVERAGE_V1 = MeasurementSpec(
     primary_outcome=PrimaryOutcomeDefinition(
         kind='reaches_positive_terminal_within_days',
         attribution_window_days=14,
+        baseline_window_days=90,
         positive_terminal_events=(
             OutcomeTerminal.LB_BOOKED,
             OutcomeTerminal.SF_BOOKED,
@@ -330,6 +352,10 @@ HIGH_INTENT_SIGNAL_COVERAGE_V1 = MeasurementSpec(
         min_sample_per_arm=30,
         min_effect_size_pp=10.0,
         uncertainty_significance_alpha=0.05,
+        # Refuse to promote to READY if the coverage ratio drops
+        # below this — most target-signal conversations should have
+        # OK provenance before we score anything.
+        min_provenance_coverage=0.60,
         # Stop accumulating after 90 days without a verdict — the
         # world has probably moved on and the measurement is stale.
         max_window_days_for_inconclusive=90,

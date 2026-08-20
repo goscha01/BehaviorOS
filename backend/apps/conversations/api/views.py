@@ -36,14 +36,20 @@ from apps.conversations.api.proposal_synthesis import (
 )
 from apps.conversations.api.serializers import (
     LifecycleSerializer, LifecycleTransitionRequestSerializer,
+    MeasurementCreateRequestSerializer,
     ProposalStatusUpdateRequestSerializer,
+    RecommendationOutcomeMeasurementSerializer,
     RecommendationProposalSerializer,
     RecommendationRunSummarySerializer, RecommendationSerializer,
     RecommendationSummarySerializer,
 )
+from apps.conversations.measurement.creation import (
+    LbApplyContext, MeasurementCreationError, create_measurement,
+)
 from apps.conversations.models import (
     BehaviorRecommendation, RecommendationLifecycleState,
-    RecommendationProposal, RecommendationRun, TenantConfigSnapshot,
+    RecommendationOutcomeMeasurement, RecommendationProposal,
+    RecommendationRun, TenantConfigSnapshot,
 )
 from apps.learning.services.llm_client import LearningLLMClient
 
@@ -257,4 +263,89 @@ class RecommendationProposalStatusView(_TenantScopedMixin, APIView):
         return Response(
             RecommendationProposalSerializer(proposal).data,
             status=http_status.HTTP_200_OK,
+        )
+
+
+class RecommendationMeasurementView(_TenantScopedMixin, APIView):
+    """POST /recommendations/<uuid>/measurement — create the outcome
+    measurement for an applied recommendation. Idempotent per
+    lb_recommendation_application_id.
+
+    GET → return the existing measurement (single row per rec since v1
+    is 1:1). 404 when no measurement has been created yet.
+
+    LB calls POST immediately after a successful Apply, providing the
+    treatment config hashes and the LB application id. BehaviorOS
+    freezes the MeasurementSpec + baseline cohort deterministically
+    and never mutates that frozen contract afterward — only the
+    accumulated post counters + verdict update over time.
+    """
+
+    def _load_rec(self, request, pk):
+        tid = self.get_tenant_id()
+        try:
+            rec = (
+                BehaviorRecommendation.objects
+                .select_related('run', 'run__config_snapshot')
+                .get(pk=pk)
+            )
+        except BehaviorRecommendation.DoesNotExist:
+            raise NotFound()
+        if rec.run.config_snapshot.tenant_external_id != tid:
+            raise NotFound()
+        return rec
+
+    def get(self, request, pk):
+        rec = self._load_rec(request, pk)
+        row = (
+            RecommendationOutcomeMeasurement.objects
+            .filter(recommendation=rec)
+            .order_by('-created_at')
+            .first()
+        )
+        if row is None:
+            raise NotFound({'detail': 'no measurement created yet'})
+        return Response(
+            RecommendationOutcomeMeasurementSerializer(row).data,
+        )
+
+    def post(self, request, pk):
+        rec = self._load_rec(request, pk)
+        payload = MeasurementCreateRequestSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        v = payload.validated_data
+        ctx = LbApplyContext(
+            lb_recommendation_application_id=(
+                v['lb_recommendation_application_id']
+            ),
+            applied_at=v['applied_at'],
+            pre_effective_config_hash=v.get(
+                'pre_effective_config_hash', ''
+            ),
+            treatment_effective_config_hash=(
+                v['treatment_effective_config_hash']
+            ),
+            treatment_managed_hash=v['treatment_managed_hash'],
+            effective_config_schema_version=(
+                v['effective_config_schema_version']
+            ),
+        )
+        try:
+            row = create_measurement(rec, ctx)
+        except MeasurementCreationError as exc:
+            return Response(
+                {'detail': str(exc), 'reason': 'creation_failed'},
+                status=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        except Exception as exc:
+            logger.exception(
+                'measurement creation failed for rec=%s', pk,
+            )
+            return Response(
+                {'detail': f'measurement creation error: {exc!r}'},
+                status=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(
+            RecommendationOutcomeMeasurementSerializer(row).data,
+            status=http_status.HTTP_201_CREATED,
         )
