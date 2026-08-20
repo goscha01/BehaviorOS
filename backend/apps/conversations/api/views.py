@@ -429,6 +429,7 @@ class RomV1BenchmarkView(APIView):
             OutcomeSnapshot as _OS,
         )
         from django.db.models import Count, Min, Max
+        from django.db.models import Q as _Q
         conv_by_source = list(
             _Conv.objects.filter(org=org)
             .values('source')
@@ -438,6 +439,38 @@ class RomV1BenchmarkView(APIView):
                 last=Max('started_at'),
             ).order_by('-n')
         )
+        # Which OutcomeSnapshots actually carry a terminal marker?
+        # This distinguishes "snapshots exist but empty" from "snapshots
+        # are populated but attribution window is too narrow".
+        outcome_terminal_dist = {
+            'total_snapshots': _OS.objects.filter(
+                conversation__org=org,
+            ).count(),
+            'with_lb_booked_true': _OS.objects.filter(
+                conversation__org=org, lb_booked=True,
+            ).count(),
+            'with_lb_lost_true': _OS.objects.filter(
+                conversation__org=org, lb_lost=True,
+            ).count(),
+            'with_sf_booked_true': _OS.objects.filter(
+                conversation__org=org, sf_booked=True,
+            ).count(),
+            'with_sf_completed_true': _OS.objects.filter(
+                conversation__org=org, sf_completed=True,
+            ).count(),
+            'with_any_terminal': _OS.objects.filter(
+                conversation__org=org,
+            ).filter(
+                _Q(lb_booked=True) | _Q(lb_lost=True) | _Q(lb_cancelled=True)
+                | _Q(sf_booked=True) | _Q(sf_completed=True) | _Q(sf_cancelled=True),
+            ).count(),
+            'distinct_convs_with_any_terminal': _OS.objects.filter(
+                conversation__org=org,
+            ).filter(
+                _Q(lb_booked=True) | _Q(lb_lost=True) | _Q(lb_cancelled=True)
+                | _Q(sf_booked=True) | _Q(sf_completed=True) | _Q(sf_cancelled=True),
+            ).values('conversation_id').distinct().count(),
+        }
         conv_by_source_out = [
             {
                 'source': r['source'], 'n': r['n'],
@@ -476,6 +509,7 @@ class RomV1BenchmarkView(APIView):
                 'conversations_by_source': conv_by_source_out,
                 'high_intent_event_counts': hi_event_counts,
                 'outcome_snapshot_count': outcome_snapshot_count,
+                'outcome_terminal_distribution': outcome_terminal_dist,
                 'top_event_types_org_wide': [
                     {'event_type': t, 'n': n} for t, n in top_event_types
                 ],
