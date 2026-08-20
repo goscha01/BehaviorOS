@@ -1519,3 +1519,102 @@ class RecommendationLifecycleState(BaseModel):
         if reason:
             entry['reason'] = reason
         self.history.append(entry)
+
+
+class RecommendationProposal(BaseModel):
+    """Structured intent that BehaviorOS produces from an ACCEPTED
+    recommendation. The proposal describes WHAT should change (the
+    condition + prescribed behavior + evidence) without knowing HOW
+    the target system will implement it.
+
+    LeadBridge owns the config; BehaviorOS never mutates it. The
+    consumer (LB) takes this proposal, computes an actual config diff
+    against its own current state, and requires a second explicit
+    Apply authorization from the operator.
+
+    v1 supports exactly ONE change_type: `add_behavior_rule` for
+    STATE_COVERAGE_GAP / STATE_PARTIAL_COVERAGE recommendations
+    (specifically the R0002-shape "uncovered CUSTOMER_SIGNAL under a
+    validated state"). Other rec classes intentionally cannot become
+    proposals — proving one path end-to-end before generalizing.
+
+    Drift detection lives on the config_snapshot_hash: the LB
+    consumer compares this against its own current-config hash at
+    Apply time. Mismatch → STALE, do not apply.
+    """
+
+    class TargetSystem(models.TextChoices):
+        LEADBRIDGE = 'leadbridge', 'LeadBridge'
+
+    class ChangeType(models.TextChoices):
+        ADD_BEHAVIOR_RULE = 'add_behavior_rule', 'Add a behavior rule for a customer signal'
+
+    class Status(models.TextChoices):
+        PROPOSED = 'proposed', 'Proposed — ready for consumer preview/apply'
+        APPLIED = 'applied', 'Applied — consumer reported successful write'
+        STALE = 'stale', 'Stale — consumer reported config drift; regenerate'
+        FAILED = 'failed', 'Failed — consumer reported an apply error'
+
+    recommendation = models.OneToOneField(
+        BehaviorRecommendation, on_delete=models.CASCADE,
+        related_name='proposal',
+    )
+    target_system = models.CharField(
+        max_length=32, choices=TargetSystem.choices,
+        default=TargetSystem.LEADBRIDGE,
+    )
+    change_type = models.CharField(
+        max_length=32, choices=ChangeType.choices,
+    )
+    # Ontology CUSTOMER_SIGNAL that this rule addresses.
+    condition = models.CharField(max_length=64)
+    # Scope inside the tenant — e.g. 'house_cleaning' service group.
+    scope = models.CharField(max_length=64, blank=True, default='')
+
+    # LLM-drafted, one-sentence description the operator will see in
+    # the "Preview change" summary.
+    proposed_behavior_summary = models.TextField()
+    # LLM-drafted, paragraph-length rule text the consumer can use as
+    # the raw config content it writes. Consumer decides where to put
+    # it inside its own config structure.
+    proposed_behavior_detail = models.TextField()
+
+    # Provenance for drift detection + audit trail
+    config_snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='proposals',
+        help_text='Snapshot BehaviorOS analyzed when generating the proposal',
+    )
+    config_snapshot_hash = models.CharField(
+        max_length=64,
+        help_text='Copy of snapshot.raw_config_sha256 — consumer compares to '
+                   'its own current-config hash at apply time',
+    )
+
+    # Lifecycle — updated by consumer via /proposal/status endpoint
+    status = models.CharField(
+        max_length=16, choices=Status.choices,
+        default=Status.PROPOSED,
+    )
+    consumer_applied_at = models.DateTimeField(null=True, blank=True)
+    consumer_error = models.TextField(blank=True, default='')
+
+    # Synthesis metadata
+    generator_version = models.CharField(max_length=64)
+    llm_model = models.CharField(max_length=64, blank=True, default='')
+    llm_input_tokens = models.PositiveIntegerField(default=0)
+    llm_output_tokens = models.PositiveIntegerField(default=0)
+    llm_cost_usd = models.DecimalField(
+        max_digits=10, decimal_places=4, default=0,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['config_snapshot', 'status']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (f'Proposal({self.recommendation.recommendation_id} → '
+                f'{self.change_type}/{self.condition})')

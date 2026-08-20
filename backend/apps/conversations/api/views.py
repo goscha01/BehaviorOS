@@ -31,15 +31,21 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from apps.conversations.api.auth import InsightsServiceTokenAuthentication
+from apps.conversations.api.proposal_synthesis import (
+    ProposalIneligible, generate_proposal,
+)
 from apps.conversations.api.serializers import (
     LifecycleSerializer, LifecycleTransitionRequestSerializer,
+    ProposalStatusUpdateRequestSerializer,
+    RecommendationProposalSerializer,
     RecommendationRunSummarySerializer, RecommendationSerializer,
     RecommendationSummarySerializer,
 )
 from apps.conversations.models import (
     BehaviorRecommendation, RecommendationLifecycleState,
-    RecommendationRun, TenantConfigSnapshot,
+    RecommendationProposal, RecommendationRun, TenantConfigSnapshot,
 )
+from apps.learning.services.llm_client import LearningLLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -158,5 +164,97 @@ class RecommendationLifecycleView(_TenantScopedMixin, APIView):
 
         return Response(
             LifecycleSerializer(lifecycle).data,
+            status=http_status.HTTP_200_OK,
+        )
+
+
+class RecommendationProposalView(_TenantScopedMixin, APIView):
+    """POST → generate (or regenerate) a proposal from an accepted
+    recommendation. GET → retrieve the existing proposal.
+
+    v1 only supports STATE_COVERAGE_GAP / STATE_PARTIAL_COVERAGE recs
+    with lifecycle state = ACCEPTED. Anything else returns 422 with a
+    structured reason, so LB can render "not applicable" cleanly.
+    """
+
+    def _load(self, request, pk):
+        tid = self.get_tenant_id()
+        try:
+            rec = (
+                BehaviorRecommendation.objects
+                .select_related('run', 'run__config_snapshot', 'lifecycle',
+                                 'proposal', 'proposal__config_snapshot')
+                .get(pk=pk)
+            )
+        except BehaviorRecommendation.DoesNotExist:
+            raise NotFound()
+        if rec.run.config_snapshot.tenant_external_id != tid:
+            raise NotFound()
+        return rec
+
+    def get(self, request, pk):
+        rec = self._load(request, pk)
+        proposal = getattr(rec, 'proposal', None)
+        if proposal is None:
+            raise NotFound({'detail': 'no proposal generated yet'})
+        return Response(RecommendationProposalSerializer(proposal).data)
+
+    def post(self, request, pk):
+        rec = self._load(request, pk)
+        try:
+            proposal = generate_proposal(rec, llm_client=LearningLLMClient())
+        except ProposalIneligible as exc:
+            return Response(
+                {'detail': str(exc), 'reason': 'ineligible'},
+                status=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        except Exception as exc:
+            logger.exception('proposal synthesis failed for rec=%s', pk)
+            return Response(
+                {'detail': f'proposal synthesis error: {exc!r}'},
+                status=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response(
+            RecommendationProposalSerializer(proposal).data,
+            status=http_status.HTTP_200_OK,
+        )
+
+
+class RecommendationProposalStatusView(_TenantScopedMixin, APIView):
+    """POST /recommendations/<id>/proposal/status — consumer reports
+    the outcome of its Apply attempt. Status transitions:
+      applied  → LB successfully wrote config
+      stale    → LB detected drift; regenerate
+      failed   → LB's write failed; error recorded
+
+    BehaviorOS does not decide these; it only records what the
+    consumer reports."""
+
+    def post(self, request, pk):
+        tid = self.get_tenant_id()
+        try:
+            rec = (
+                BehaviorRecommendation.objects
+                .select_related('run__config_snapshot', 'proposal')
+                .get(pk=pk)
+            )
+        except BehaviorRecommendation.DoesNotExist:
+            raise NotFound()
+        if rec.run.config_snapshot.tenant_external_id != tid:
+            raise NotFound()
+        proposal = getattr(rec, 'proposal', None)
+        if proposal is None:
+            raise NotFound({'detail': 'no proposal to update'})
+        payload = ProposalStatusUpdateRequestSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        v = payload.validated_data
+        from django.utils import timezone
+        proposal.status = v['status']
+        proposal.consumer_error = v.get('error', '') or ''
+        if v['status'] == RecommendationProposal.Status.APPLIED:
+            proposal.consumer_applied_at = timezone.now()
+        proposal.save()
+        return Response(
+            RecommendationProposalSerializer(proposal).data,
             status=http_status.HTTP_200_OK,
         )

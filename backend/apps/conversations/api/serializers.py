@@ -152,6 +152,60 @@ class RecommendationRunSummarySerializer(serializers.ModelSerializer):
         ))
 
 
+class RecommendationProposalSerializer(serializers.ModelSerializer):
+    """Read shape for a proposal. The consumer (LB) uses this to
+    render a Preview screen and compute its own config diff."""
+
+    id = serializers.UUIDField(read_only=True)
+    recommendation_id = serializers.UUIDField(source='recommendation.pk', read_only=True)
+    tenant_external_id = serializers.CharField(
+        source='config_snapshot.tenant_external_id', read_only=True,
+    )
+    config_snapshot_id = serializers.UUIDField(
+        source='config_snapshot.pk', read_only=True,
+    )
+
+    class Meta:
+        model = None   # set below
+        fields = [
+            'id',
+            'recommendation_id',
+            'tenant_external_id',
+            'config_snapshot_id',
+            'config_snapshot_hash',
+            'target_system',
+            'change_type',
+            'condition',
+            'scope',
+            'proposed_behavior_summary',
+            'proposed_behavior_detail',
+            'status',
+            'consumer_applied_at',
+            'consumer_error',
+            'generator_version',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = fields
+
+
+# Fill in the model reference here (import cycle avoidance)
+from apps.conversations.models import RecommendationProposal as _RP  # noqa: E402
+RecommendationProposalSerializer.Meta.model = _RP
+
+
+class ProposalStatusUpdateRequestSerializer(serializers.Serializer):
+    """Consumer-side status update body. LB calls this after Apply
+    or when it detects stale config."""
+
+    status = serializers.ChoiceField(
+        choices=_RP.Status.choices,
+    )
+    error = serializers.CharField(
+        required=False, allow_blank=True, default='',
+    )
+
+
 class LifecycleTransitionRequestSerializer(serializers.Serializer):
     """Payload for POST /recommendations/<id>/lifecycle."""
 
