@@ -1258,3 +1258,187 @@ class InferredCustomerState(BaseModel):
     def __str__(self) -> str:
         return (f'{self.previous_state} → {self.state} '
                 f'@turn{self.effective_turn}')
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1C: evidence-grounded recommendation synthesis
+# ---------------------------------------------------------------------------
+#
+# A RecommendationRun is one synthesis pass over a (state-inference
+# × config-snapshot × conditional-analysis) tuple. Deterministic
+# eligibility rules decide which recommendations to emit and which
+# class each belongs to; the LLM only drafts prose. Every recommendation
+# preserves provenance to the exact evidence sources it stands on.
+#
+# Not a delivery mechanism — recommendations are stored + reported;
+# whether Spotless (or any tenant) acts on them is a separate decision.
+
+
+class RecommendationRun(BaseModel):
+    """One end-to-end synthesis of BehaviorRecommendations from an
+    aligned set of evidence sources."""
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='recommendation_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='recommendation_runs',
+    )
+    state_inference_run = models.ForeignKey(
+        CustomerStateInferenceRun, on_delete=models.CASCADE,
+        related_name='recommendation_runs',
+    )
+    config_snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='recommendation_runs',
+    )
+    conditional_analysis_run = models.ForeignKey(
+        ConditionalAnalysisRun, on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='recommendation_runs',
+        help_text='Optional — used for outcome-statistic provenance if present',
+    )
+    synthesizer_version = models.CharField(max_length=64)
+    llm_model = models.CharField(max_length=64, blank=True, default='')
+    status = models.CharField(max_length=16, choices=Status.choices,
+                              default=Status.PENDING)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    recommendations_generated = models.PositiveIntegerField(default=0)
+    llm_input_tokens = models.PositiveIntegerField(default=0)
+    llm_output_tokens = models.PositiveIntegerField(default=0)
+    llm_cost_usd = models.DecimalField(max_digits=10, decimal_places=4,
+                                        default=0)
+    error_summary = models.TextField(blank=True, default='')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['corpus', 'state_inference_run', 'config_snapshot',
+                        'synthesizer_version'],
+                name='recommendation_run_unique',
+            ),
+        ]
+        indexes = [models.Index(fields=['corpus', 'status'])]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (f'RecommendationRun {self.corpus.name}@{self.corpus.version} '
+                f'{self.synthesizer_version}')
+
+
+class BehaviorRecommendation(BaseModel):
+    """One deterministic-class-gated, LLM-drafted recommendation from a
+    RecommendationRun. Every field is either set by the eligibility
+    engine (deterministic) or drafted by the LLM (prose only). The
+    class + confidence + evidence chain are NEVER LLM-decided."""
+
+    class RecClass(models.TextChoices):
+        STATE_COVERAGE_GAP = 'STATE_COVERAGE_GAP', 'Validated state has uncovered contributing signals'
+        STATE_PARTIAL_COVERAGE = 'STATE_PARTIAL_COVERAGE', 'State recognized but some paths uncovered'
+        CONFIG_ALIGNMENT = 'CONFIG_ALIGNMENT', 'Configuration addresses validated state/signal'
+        OBSERVED_STATE_INSIGHT = 'OBSERVED_STATE_INSIGHT', 'Useful state/transition insight; no config change justified'
+        INSUFFICIENT_EVIDENCE = 'INSUFFICIENT_EVIDENCE', 'Interesting issue but MUST NOT become an action recommendation'
+
+    class Confidence(models.TextChoices):
+        HIGH = 'HIGH', 'High — reproduced on holdout, material lift, low ambiguity'
+        MEDIUM = 'MEDIUM', 'Medium — reproduced but small n or noisy'
+        LOW = 'LOW', 'Low — directional only'
+        INSUFFICIENT = 'INSUFFICIENT', 'Not enough evidence for confidence'
+
+    class ProposedActionScope(models.TextChoices):
+        CONFIG_ADDITION = 'config_addition', 'Add new policy/rule to LB config'
+        CONFIG_REVIEW = 'config_review', 'Human review of existing policy'
+        MONITORING_ONLY = 'monitoring_only', 'Watch this state — no config change yet'
+        NO_ACTION_RECOMMENDED = 'no_action_recommended', 'Explicitly no action'
+
+    run = models.ForeignKey(
+        RecommendationRun, on_delete=models.CASCADE,
+        related_name='recommendations',
+    )
+    recommendation_id = models.CharField(
+        max_length=32,
+        help_text='Human-readable id like R0001 within the run',
+    )
+    rec_class = models.CharField(max_length=32, choices=RecClass.choices)
+    confidence = models.CharField(max_length=16, choices=Confidence.choices)
+
+    # Deterministic — set by the eligibility engine
+    subject_state = models.CharField(
+        max_length=32, blank=True, default='',
+        help_text='CustomerState this rec is about, if any',
+    )
+    subject_signals = models.JSONField(
+        default=list, blank=True,
+        help_text='Ontology signal event_types this rec references',
+    )
+    linked_policy_ids = models.JSONField(
+        default=list, blank=True,
+        help_text='BehavioralPolicy IDs (from config snapshot) related to this rec',
+    )
+    linked_transition = models.JSONField(
+        default=dict, blank=True,
+        help_text='{"previous_state": ..., "state": ...} when this rec is about a state transition',
+    )
+
+    # Structured evidence chain — deterministic, machine-readable
+    evidence = models.JSONField(
+        default=dict, blank=True,
+        help_text=(
+            'Structured evidence chain. Example keys: state_lift, '
+            'state_holdout_status, state_n, covered_signals, '
+            'uncovered_signals, corpus_baseline_positive_rate.'
+        ),
+    )
+    supporting_conversation_ids = models.JSONField(
+        default=list, blank=True,
+        help_text='Up to 20 evidence conversation IDs',
+    )
+
+    # LLM-drafted prose (never decides class or eligibility)
+    observation = models.TextField(
+        blank=True, default='',
+        help_text='One-sentence factual observation, LLM-drafted',
+    )
+    interpretation = models.TextField(
+        blank=True, default='',
+        help_text='One-sentence interpretation of what the observation means, LLM-drafted',
+    )
+    proposed_action_scope = models.CharField(
+        max_length=32, choices=ProposedActionScope.choices,
+        default=ProposedActionScope.NO_ACTION_RECOMMENDED,
+    )
+    proposed_action = models.TextField(
+        blank=True, default='',
+        help_text='Optional proposed action, LLM-drafted; blank when '
+                   'proposed_action_scope=NO_ACTION_RECOMMENDED',
+    )
+    limitations = models.TextField(
+        blank=True, default='',
+        help_text='REQUIRED: what we do not know; caveats on the claim',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['run', 'recommendation_id'],
+                name='recommendation_id_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['run', 'rec_class']),
+            models.Index(fields=['run', 'confidence']),
+        ]
+        ordering = ['run', 'recommendation_id']
+
+    def __str__(self) -> str:
+        return (f'{self.recommendation_id} [{self.rec_class}] '
+                f'{self.subject_state or self.subject_signals}')
