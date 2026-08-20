@@ -420,6 +420,51 @@ class RomV1BenchmarkView(APIView):
             s for s, r in per_signal.items() if r['resolved_n'] >= 30
         ]
 
+        # Diagnostic counts — help distinguish "no data" from "wrong
+        # scoping" from "wrong signal names". Displayed independently
+        # of the per_signal cohort computation.
+        from apps.conversations.models import (
+            Conversation as _Conv,
+            ConversationSemanticEvent as _CSE,
+            OutcomeSnapshot as _OS,
+        )
+        from django.db.models import Count, Min, Max
+        conv_by_source = list(
+            _Conv.objects.filter(org=org)
+            .values('source')
+            .annotate(
+                n=Count('id'),
+                first=Min('started_at'),
+                last=Max('started_at'),
+            ).order_by('-n')
+        )
+        conv_by_source_out = [
+            {
+                'source': r['source'], 'n': r['n'],
+                'first': r['first'].isoformat() if r['first'] else None,
+                'last': r['last'].isoformat() if r['last'] else None,
+            } for r in conv_by_source
+        ]
+        hi_event_counts = dict(
+            _CSE.objects.filter(
+                org=org, event_type__in=list(_HI),
+            ).values('event_type').annotate(n=Count('id')).values_list(
+                'event_type', 'n',
+            )
+        )
+        outcome_snapshot_count = _OS.objects.filter(
+            conversation__org=org,
+        ).count()
+        # Existing top event types (helpful when HIGH_INTENT counts are 0
+        # — shows what event_type strings actually exist)
+        top_event_types = list(
+            _CSE.objects.filter(org=org)
+            .values('event_type')
+            .annotate(n=Count('id'))
+            .order_by('-n')[:15]
+            .values_list('event_type', 'n')
+        )
+
         return Response({
             'tenant_external_id': tenant,
             'org_id': str(org.pk),
@@ -427,6 +472,14 @@ class RomV1BenchmarkView(APIView):
             'snapshot_sha_prefix': snap.raw_config_sha256[:12],
             'applied_at_used': applied_at.isoformat(),
             'baseline_window_days_used': outcome.baseline_window_days,
+            'diagnostics': {
+                'conversations_by_source': conv_by_source_out,
+                'high_intent_event_counts': hi_event_counts,
+                'outcome_snapshot_count': outcome_snapshot_count,
+                'top_event_types_org_wide': [
+                    {'event_type': t, 'n': n} for t, n in top_event_types
+                ],
+            },
             'per_signal': per_signal,
             'end_to_end': e2e,
             'summary': {
