@@ -12,7 +12,7 @@ from apps.conversations.api.views import (
     RecommendationDetailView, RecommendationLifecycleView,
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
-    RecommendationRunViewSet,
+    RecommendationRunViewSet, RomV1BenchmarkView,
 )
 
 
@@ -45,5 +45,10 @@ urlpatterns = _router.urls + [
         'recommendations/<uuid:pk>/measurement',
         RecommendationMeasurementView.as_view(),
         name='insights-recommendation-measurement',
+    ),
+    path(
+        'rom/benchmark',
+        RomV1BenchmarkView.as_view(),
+        name='insights-rom-benchmark',
     ),
 ]

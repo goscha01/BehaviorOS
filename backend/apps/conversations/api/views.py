@@ -266,6 +266,206 @@ class RecommendationProposalStatusView(_TenantScopedMixin, APIView):
         )
 
 
+class RomV1BenchmarkView(APIView):
+    """POST /api/v1/insights/rom/benchmark?tenantId=<uuid>
+
+    Service-token-authenticated (uses the same InsightsServiceTokenAuthentication
+    the other insights endpoints use — no LB JWT needed since this is a
+    verification endpoint invoked by tooling / operator during ROM v1
+    historical acceptance testing, NOT by the LB frontend).
+
+    Runs the same three checks as the benchmark_rom_v1 management command
+    and returns the results as JSON. Safe against production: no lifecycle
+    transitions, no LB writes, no proposal generation. The only side
+    effect is a synthetic measurement row (unique id
+    'benchmark-<ts>-<rec8>' so it never collides with a real apply).
+
+    Passing ?dry_run=1 skips the measurement-row persistence.
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from dataclasses import replace as _replace
+        from django.utils import timezone as _tz
+        from apps.conversations.measurement.creation import (
+            LbApplyContext as _LbCtx,
+            MeasurementCreationError as _MCE,
+            _compute_baseline_cohort as _cbc,
+            create_measurement as _cm,
+        )
+        from apps.conversations.measurement.effective_config_contract import (
+            EFFECTIVE_CONFIG_SCHEMA_VERSION as _SCHEMA,
+        )
+        from apps.conversations.measurement.specs import (
+            HIGH_INTENT_SIGNALS as _HI,
+            HIGH_INTENT_SIGNAL_COVERAGE_V1 as _SPEC,
+            FrozenMeasurementSpec as _FMS,
+        )
+        from apps.conversations.models import (
+            BehaviorRecommendation as _BR,
+            TenantConfigSnapshot as _TCS,
+        )
+
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        dry_run = str(request.query_params.get('dry_run', '')).lower() in (
+            '1', 'true', 'yes',
+        )
+        lookback = request.query_params.get('lookback_days')
+        rec_override = request.query_params.get('rec_uuid')
+
+        snap = (
+            _TCS.objects
+            .filter(source_system='leadbridge', tenant_external_id=tenant)
+            .order_by('-created_at').first()
+        )
+        if snap is None:
+            return Response(
+                {'detail': f'no TenantConfigSnapshot for tenant {tenant}'},
+                status=http_status.HTTP_404_NOT_FOUND,
+            )
+        org = snap.org
+        applied_at = _tz.now()
+
+        outcome = _SPEC.primary_outcome
+        if lookback:
+            outcome = _replace(outcome, baseline_window_days=int(lookback))
+
+        # Check 1: per-signal baseline
+        per_signal: dict = {}
+        for signal in sorted(_HI):
+            frozen = _FMS(
+                spec_key=_SPEC.spec_key, version=_SPEC.version,
+                family=_SPEC.family, description=_SPEC.description,
+                cohort_entry=_replace(_SPEC.cohort_entry, signal=signal),
+                primary_outcome=outcome,
+                exclusions=_SPEC.exclusions,
+                verdict_gates=_SPEC.verdict_gates,
+            )
+            ids, pos, neg = _cbc(
+                org=org, tenant_external_id=tenant,
+                target_signal=signal, applied_at=applied_at,
+                spec=frozen,
+            )
+            n = pos + neg
+            per_signal[signal] = {
+                'eligible_conversation_ids': len(ids),
+                'resolved_n': n,
+                'positive_n': pos, 'negative_n': neg,
+                'positive_rate': (pos / n) if n > 0 else None,
+            }
+
+        # Check 2: end-to-end persistence
+        e2e = None
+        if not dry_run:
+            rec = self._pick_rec(tenant, rec_override, _BR, _HI)
+            if rec is not None:
+                synthetic_id = (
+                    f'benchmark-{applied_at.strftime("%Y%m%d%H%M%S")}-'
+                    f'{str(rec.pk)[:8]}'
+                )
+                ctx = _LbCtx(
+                    lb_recommendation_application_id=synthetic_id,
+                    applied_at=applied_at,
+                    pre_effective_config_hash='benchmark_pre_' + '0' * 50,
+                    treatment_effective_config_hash=(
+                        'benchmark_treatment_' + '0' * 44
+                    ),
+                    treatment_managed_hash=(
+                        'benchmark_managed_' + '0' * 46
+                    ),
+                    effective_config_schema_version=_SCHEMA,
+                )
+                try:
+                    row = _cm(rec, ctx)
+                    e2e = {
+                        'rom_id': str(row.id),
+                        'lb_recommendation_application_id': (
+                            row.lb_recommendation_application_id
+                        ),
+                        'rec_id': rec.recommendation_id,
+                        'target_signal': row.target_signal,
+                        'pre_cohort_ids_len': len(
+                            row.pre_cohort_conversation_ids
+                        ),
+                        'pre_n': row.pre_n,
+                        'pre_positive_n': row.pre_positive_n,
+                        'pre_rate': row.pre_rate,
+                        'status': row.status,
+                        'measurement_deadline_at': (
+                            row.measurement_deadline_at.isoformat()
+                        ),
+                    }
+                    ref = per_signal.get(row.target_signal)
+                    if ref is not None:
+                        e2e['cohort_agreement_with_check1'] = (
+                            row.pre_n == ref['resolved_n']
+                            and row.pre_positive_n == ref['positive_n']
+                        )
+                except _MCE as exc:
+                    e2e = {'error': str(exc), 'reason': 'creation_failed'}
+
+        any_nonzero = any(
+            r['resolved_n'] > 0 for r in per_signal.values()
+        )
+        e2e_ok = (
+            e2e is not None
+            and 'error' not in e2e
+            and e2e.get('pre_cohort_ids_len', 0) > 0
+        )
+        signals_over_floor = [
+            s for s, r in per_signal.items() if r['resolved_n'] >= 30
+        ]
+
+        return Response({
+            'tenant_external_id': tenant,
+            'org_id': str(org.pk),
+            'snapshot_id': str(snap.pk),
+            'snapshot_sha_prefix': snap.raw_config_sha256[:12],
+            'applied_at_used': applied_at.isoformat(),
+            'baseline_window_days_used': outcome.baseline_window_days,
+            'per_signal': per_signal,
+            'end_to_end': e2e,
+            'summary': {
+                'signals_with_nonzero_baseline': [
+                    s for s, r in per_signal.items() if r['resolved_n'] > 0
+                ],
+                'signals_meeting_v1_sample_floor_30': signals_over_floor,
+                'end_to_end_persistence_ok': (
+                    None if dry_run else e2e_ok
+                ),
+                'acceptance': (
+                    'READY' if (any_nonzero and (dry_run or e2e_ok))
+                    else 'NOT_READY'
+                ),
+            },
+        })
+
+    def _pick_rec(self, tenant, rec_uuid, _BR, _HI):
+        if rec_uuid:
+            try:
+                return _BR.objects.select_related(
+                    'run', 'run__config_snapshot',
+                ).get(pk=rec_uuid)
+            except _BR.DoesNotExist:
+                return None
+        candidates = _BR.objects.filter(
+            run__config_snapshot__tenant_external_id=tenant,
+            rec_class__in=[
+                'STATE_COVERAGE_GAP', 'STATE_PARTIAL_COVERAGE',
+            ],
+        ).select_related('run', 'run__config_snapshot').order_by(
+            'run__created_at', 'recommendation_id',
+        )
+        for c in candidates:
+            if c.subject_signals and c.subject_signals[0] in _HI:
+                return c
+        return None
+
+
 class RecommendationMeasurementView(_TenantScopedMixin, APIView):
     """POST /recommendations/<uuid>/measurement — create the outcome
     measurement for an applied recommendation. Idempotent per
