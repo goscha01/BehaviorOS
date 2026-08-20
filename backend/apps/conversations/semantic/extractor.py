@@ -44,9 +44,17 @@ from apps.learning.services.llm_client import LearningLLMClient, LLMProviderErro
 logger = logging.getLogger(__name__)
 
 
-EXTRACTOR_VERSION = 'extractor-v2'
+EXTRACTOR_VERSION = 'extractor-v3'
 # v1 → v2 (2026-08-19): consume string turn_ids from LLM + validator's
 # TurnIdMap; bulk-transcript speaker splitting happens in preprocessing.
+#
+# v2 → v3 (2026-08-19): deterministic empty-text hard gate. Any event
+# with actor='agent' whose source turn (turn_start) has empty/whitespace-
+# only DB text is dropped post-validation and pre-persist, with a
+# structured log line. Addresses ~15% of the v2 audit-flagged artifacts
+# where AGENT_ACTION events landed on empty turns (Sigcore bulk-transcript
+# gaps + empty webhook payloads). Also emitting the split FOLLOW_UP
+# types + ACKNOWLEDGMENT per ontology-v3 / prompt-v3.
 
 
 @dataclass
@@ -54,6 +62,8 @@ class ExtractRecordResult:
     conversation_id: str
     events_created: int = 0
     events_rejected: int = 0
+    # v3: agent-actor events dropped by the empty-text gate
+    events_dropped_empty_text: int = 0
     chunks: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -162,6 +172,33 @@ class SemanticExtractor:
             per_chunk_events.append(validated.events)
 
         merged = merge_extracted_events(per_chunk_events)
+
+        # v3: empty-text hard gate. Load DB turn text keyed by parent
+        # index. For any event with actor='agent' whose source turn has
+        # empty/whitespace-only text, drop it deterministically. The
+        # v1B-4B audits showed a meaningful fraction of AGENT_ACTION
+        # events landing on turns with empty text (Sigcore bulk-
+        # transcript segmentation artifacts + empty webhook payloads).
+        parent_text_by_idx = {
+            i: (ct.text or '').strip()
+            for i, ct in enumerate(
+                conversation.turns.order_by('occurred_at', 'source_turn_id')
+            )
+        }
+        gated: list[dict] = []
+        for ev in merged:
+            if ev.get('actor') == 'agent':
+                turn_text = parent_text_by_idx.get(ev['turn_start'], '')
+                if not turn_text:
+                    result.events_dropped_empty_text += 1
+                    logger.info(
+                        'extractor-v3: dropped agent event %s conv=%s '
+                        'turn_start=%d (empty source turn text)',
+                        ev.get('event_type'), conversation.id, ev['turn_start'],
+                    )
+                    continue
+            gated.append(ev)
+        merged = gated
 
         # Pre-resolve LB EntityLink once per conversation (used for
         # `entity_link` FK on every persisted event).

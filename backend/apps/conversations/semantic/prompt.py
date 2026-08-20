@@ -11,6 +11,25 @@ v1 → v2 changes (2026-08-19):
 - LEAD_MISMATCH clause for wrong-intent leads (v2 ontology addition).
 - Confidence calibration anchors — the LLM is instructed to reserve 1.00
   for genuinely unambiguous cases and use 0.6–0.85 for typical events.
+
+v2 → v3 changes (2026-08-19, driven by 1B-4B action-semantics audits):
+- Sharpened PRICE_GIVEN vs PRICE_EXPLAINED with an explicit criterion
+  (has-context test) and worked counterexamples from the audit.
+- QUALIFICATION_QUESTION protection — an agent question that asks for
+  bedrooms/bathrooms/square footage/frequency/property type/scope MUST
+  be QUALIFICATION_QUESTION and MUST NOT be PRICE_GIVEN even when the
+  customer's preceding turn was about pricing.
+- FOLLOW_UP_SENT replaced by FOLLOW_UP_GENERIC / FOLLOW_UP_SUBSTANTIVE.
+  A follow-up template that also offers slots / restates a price /
+  offers a discount is SUBSTANTIVE. A pure nudge ("just checking in",
+  "any updates") is GENERIC. Substantive follow-ups should ALSO emit
+  the substantive types (PRICE_GIVEN, TIME_SLOT_OFFERED, etc) — don't
+  collapse everything into FOLLOW_UP_SUBSTANTIVE.
+- ACKNOWLEDGMENT new — polite ack with no forward motion ("got it",
+  "thanks for the details", "perfect, see you Tuesday"). Previously
+  such replies got mis-fit into FOLLOW_UP_SENT or dropped.
+- Explicit "never emit an event for an empty turn" rule (validator
+  ALSO enforces this deterministically).
 """
 
 from __future__ import annotations
@@ -20,7 +39,7 @@ from apps.conversations.semantic.ontology import (
 )
 
 
-PROMPT_VERSION = 'prompt-v2'
+PROMPT_VERSION = 'prompt-v3'
 
 
 def _render_ontology_block() -> str:
@@ -112,6 +131,85 @@ for these fields.
 - Distinct from CUSTOMER_DECLINED — a declined customer was a real
   lead who chose not to buy; a mismatched contact was never a lead
   in the first place.
+
+**PRICE_GIVEN vs PRICE_EXPLAINED** (v3 sharpened):
+- PRICE_GIVEN = agent states a price / range with essentially NO
+  context. Examples:
+    "Your regular cleaning is $159"
+    "Deep clean is $200-$250"
+    "$150."
+- PRICE_EXPLAINED = agent states a price AND supplies material context:
+  duration, scope items covered, breakdown, per-hour rate context,
+  comparison, or a reason. Examples:
+    "$169 for 3.5 hours of cleaning. Any additional time is $50 per hour"
+    → PRICE_EXPLAINED (duration context)
+    "The price for today will be $349 for 3.5 hours of cleaning; that
+     should be enough time to..."
+    → PRICE_EXPLAINED (duration + reason)
+    "$150 covers 2 hours and includes supplies"
+    → PRICE_EXPLAINED (breakdown)
+  Counter-example (audit failure): "$249. Please send payment by
+  March 7" is PRICE_GIVEN not PRICE_EXPLAINED — payment terms are
+  not price rationale.
+- DISCOUNT_OFFERED is separate; emit it in ADDITION to
+  PRICE_GIVEN/EXPLAINED when the agent offers a promo:
+    "$150, and we have 10% off new customers" → PRICE_GIVEN +
+    DISCOUNT_OFFERED. Do not fold discount into SERVICE_SCOPE_CLARIFIED
+    (that was an audit failure mode).
+
+**QUALIFICATION_QUESTION vs pricing types** (v3 audit protection):
+- ANY agent question that asks the customer for bedrooms, bathrooms,
+  square footage, cleaning frequency, property type, or scope details
+  is QUALIFICATION_QUESTION. It is NOT PRICE_GIVEN, PRICE_EXPLAINED,
+  or PRICE_REQUESTED, EVEN when it is the agent's response to a
+  customer price question. Examples:
+    "What is the square footage of your house?" → QUALIFICATION_QUESTION
+    "How many bedrooms and bathrooms?" → QUALIFICATION_QUESTION
+    "So just to confirm, we are going to clean 3 bedroom and 2
+     bathroom, regular cleaning?" → QUALIFICATION_QUESTION (also
+     SERVICE_SCOPE_CLARIFIED if it confirms scope)
+- The agent needs qualifying info BEFORE they can quote. That is
+  qualification, not price.
+
+**FOLLOW_UP_GENERIC vs FOLLOW_UP_SUBSTANTIVE** (v3 replaces FOLLOW_UP_SENT):
+- FOLLOW_UP_GENERIC = the reply is primarily a nudge / check-in with
+  NO substantive sales content. Examples:
+    "Just checking in — let me know if you need anything."
+    "Any updates?"
+    "Hi, wanted to see if you had a chance to think it over."
+- FOLLOW_UP_SUBSTANTIVE = the reply is a follow-up template that ALSO
+  offers a material next step (a price, availability, discount, or
+  booking prompt). Examples:
+    "Hi , this is Kate from Spotless Homes! I wanted to follow up
+     on the cleaning service details I sent. We'd love to help;
+     Tuesday at 2pm is open" → FOLLOW_UP_SUBSTANTIVE
+    (Also emit TIME_SLOT_OFFERED for the "Tuesday at 2pm" part.)
+    "Circling back — I can honor $130 through Friday if you're
+     ready" → FOLLOW_UP_SUBSTANTIVE + DISCOUNT_OFFERED.
+- Do NOT collapse everything into one FOLLOW_UP_SUBSTANTIVE event.
+  Preserve other applicable AGENT_ACTION events (TIME_SLOT_OFFERED,
+  DISCOUNT_OFFERED, PRICE_GIVEN, etc.) that appear inside the
+  substantive follow-up.
+
+**ACKNOWLEDGMENT** (v3 new):
+- Polite acknowledgment with NO forward motion. Examples:
+    "Got it!"
+    "Thanks for the details."
+    "Perfect, see you Tuesday!"
+    "Ok"
+- Distinct from FOLLOW_UP_GENERIC — an acknowledgment is a REPLY to
+  something the customer just said; a follow-up is UNPROMPTED by a
+  recent customer turn.
+- If the acknowledgment ALSO contains a next step ("Got it — Tuesday
+  at 2pm works"), emit both ACKNOWLEDGMENT and the appropriate
+  substantive type.
+
+**Empty turns** (v3):
+- Never emit ANY event whose source turn (the turn_id you're
+  referencing) has empty or whitespace-only text. If a turn is
+  empty, no event happened at that turn from the extractor's
+  perspective. (A validator will drop any agent-actor event with
+  empty source text as a deterministic hard gate.)
 
 **CUSTOMER_STOPPED_RESPONDING**:
 - Only emit when the input clearly shows a timeline gap (large

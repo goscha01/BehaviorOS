@@ -13,11 +13,23 @@ add new event types deliberately — never silently.
 
 from __future__ import annotations
 
-ONTOLOGY_VERSION = 'ontology-v2'
+ONTOLOGY_VERSION = 'ontology-v3'
 # v1 → v2 additions (2026-08-19): CUSTOMER_DEFERRED (deferral, not decline)
 # + LEAD_MISMATCH (wrong-intent lead — e.g. customer applying for a job).
-# No other ontology changes; deliberate discipline to avoid ontology drift
-# before sequence analysis reveals which gaps actually matter.
+#
+# v2 → v3 additions (2026-08-19, driven by 1B-4B action-semantics audits):
+# - Splits FOLLOW_UP_SENT into FOLLOW_UP_GENERIC (nudge only) and
+#   FOLLOW_UP_SUBSTANTIVE (nudge + material next-step content). The v2
+#   audit showed FOLLOW_UP_SENT conflated two behavior classes with
+#   opposite outcome correlations.
+# - Adds ACKNOWLEDGMENT as a first-class AGENT_ACTION for polite
+#   acknowledgment replies ("got it", "thanks for the details") with
+#   no forward motion. Previously such replies were force-fit into
+#   FOLLOW_UP_SENT or dropped as extraction misses.
+# - Keeps FOLLOW_UP_SENT in EVENT_TYPES as a legacy type (already-
+#   persisted v2 events must remain classifiable) but v3 extractor
+#   prompt does NOT enumerate it as valid; new extractions emit
+#   FOLLOW_UP_GENERIC / FOLLOW_UP_SUBSTANTIVE instead.
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +96,14 @@ CUSTOMER_DEFERRED = 'CUSTOMER_DEFERRED'
 
 # Sales behavior
 FOLLOW_UP_SENT = 'FOLLOW_UP_SENT'
+# v3: split into FOLLOW_UP_GENERIC (nudge only) and FOLLOW_UP_SUBSTANTIVE
+# (nudge + material next step). FOLLOW_UP_SENT retained for v2 back-compat
+# (already-persisted rows) but v3 extractor never emits it.
+FOLLOW_UP_GENERIC = 'FOLLOW_UP_GENERIC'
+FOLLOW_UP_SUBSTANTIVE = 'FOLLOW_UP_SUBSTANTIVE'
+# v3: polite acknowledgment with no forward motion ("got it", "thanks
+# for the details"). Previously conflated with FOLLOW_UP_SENT or dropped.
+ACKNOWLEDGMENT = 'ACKNOWLEDGMENT'
 CUSTOMER_REENGAGED = 'CUSTOMER_REENGAGED'
 CALL_ATTEMPT = 'CALL_ATTEMPT'
 HUMAN_HANDOFF = 'HUMAN_HANDOFF'
@@ -127,7 +147,10 @@ EVENT_TYPES: frozenset[str] = frozenset({
     COMPETITOR_MENTIONED, CUSTOMER_HESITATION, CUSTOMER_DECLINED,
     CUSTOMER_DEFERRED,
     # sales behavior
-    FOLLOW_UP_SENT, CUSTOMER_REENGAGED, CALL_ATTEMPT, HUMAN_HANDOFF,
+    FOLLOW_UP_SENT,                                # v2 legacy — v3 does not emit
+    FOLLOW_UP_GENERIC, FOLLOW_UP_SUBSTANTIVE,      # v3 replacements
+    ACKNOWLEDGMENT,                                # v3 new
+    CUSTOMER_REENGAGED, CALL_ATTEMPT, HUMAN_HANDOFF,
     URGENCY_CREATED, SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
     # progression
     CUSTOMER_RESPONDED, CUSTOMER_STOPPED_RESPONDING,
@@ -177,7 +200,8 @@ PRE_OUTCOME_EVENTS: frozenset[str] = frozenset({
     PRICE_OBJECTION, TIMING_OBJECTION, TRUST_OBJECTION, SERVICE_OBJECTION,
     COMPETITOR_MENTIONED, CUSTOMER_HESITATION, CUSTOMER_DEFERRED,
     # sales behaviors
-    FOLLOW_UP_SENT, URGENCY_CREATED, SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
+    FOLLOW_UP_SENT, FOLLOW_UP_GENERIC, FOLLOW_UP_SUBSTANTIVE, ACKNOWLEDGMENT,
+    URGENCY_CREATED, SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
     CUSTOMER_RESPONDED, CONVERSATION_STALLED,
     # LEAD_MISMATCH is pre-outcome — it EXPLAINS a loss, doesn't ARE a loss.
     LEAD_MISMATCH,
@@ -281,7 +305,9 @@ AGENT_ACTION_EVENTS: frozenset[str] = frozenset({
     # availability + booking plays
     AVAILABILITY_GIVEN, TIME_SLOT_OFFERED, BOOKING_ATTEMPT,
     # outbound / cadence / persuasion
-    FOLLOW_UP_SENT, CALL_ATTEMPT, HUMAN_HANDOFF, URGENCY_CREATED,
+    FOLLOW_UP_SENT,                          # v2 legacy
+    FOLLOW_UP_GENERIC, FOLLOW_UP_SUBSTANTIVE, ACKNOWLEDGMENT,  # v3 new
+    CALL_ATTEMPT, HUMAN_HANDOFF, URGENCY_CREATED,
     SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
 })
 
@@ -384,7 +410,12 @@ def event_types_by_category() -> dict[str, list[str]]:
             CUSTOMER_HESITATION, CUSTOMER_DECLINED, CUSTOMER_DEFERRED,
         ],
         'sales_behavior': [
-            FOLLOW_UP_SENT, CUSTOMER_REENGAGED, CALL_ATTEMPT, HUMAN_HANDOFF,
+            # v3: FOLLOW_UP_SENT is intentionally excluded from the LLM-
+            # facing category listing. New extractions must use the split
+            # GENERIC / SUBSTANTIVE forms + ACKNOWLEDGMENT. FOLLOW_UP_SENT
+            # remains in EVENT_TYPES for v2 backward compatibility.
+            FOLLOW_UP_GENERIC, FOLLOW_UP_SUBSTANTIVE, ACKNOWLEDGMENT,
+            CUSTOMER_REENGAGED, CALL_ATTEMPT, HUMAN_HANDOFF,
             URGENCY_CREATED, SOCIAL_PROOF_USED, SCOPE_VALUE_EXPLAINED,
         ],
         'progression': [

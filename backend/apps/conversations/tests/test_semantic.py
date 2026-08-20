@@ -71,8 +71,16 @@ class OntologyTests(SimpleTestCase):
         self.assertTrue(is_valid_event_type('CUSTOMER_DEFERRED'))
         self.assertTrue(is_valid_event_type('LEAD_MISMATCH'))
 
-    def test_ontology_version_is_v2(self):
-        self.assertEqual(ONTOLOGY_VERSION, 'ontology-v2')
+    def test_v3_additions_present(self):
+        # v3 split of FOLLOW_UP_SENT + new ACKNOWLEDGMENT
+        self.assertTrue(is_valid_event_type('FOLLOW_UP_GENERIC'))
+        self.assertTrue(is_valid_event_type('FOLLOW_UP_SUBSTANTIVE'))
+        self.assertTrue(is_valid_event_type('ACKNOWLEDGMENT'))
+        # FOLLOW_UP_SENT kept in EVENT_TYPES for v2 back-compat
+        self.assertTrue(is_valid_event_type('FOLLOW_UP_SENT'))
+
+    def test_ontology_version_is_v3(self):
+        self.assertEqual(ONTOLOGY_VERSION, 'ontology-v3')
 
 
 # ---------------------------------------------------------------------------
