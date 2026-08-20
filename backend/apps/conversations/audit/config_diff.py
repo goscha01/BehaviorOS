@@ -600,13 +600,22 @@ def _assessment_to_row(a: PolicyAlignmentAssessment) -> dict:
         ),
     }
     if pat is not None:
+        support_ca = pat.d_ca_positive + pat.d_ca_negative
+        support_co = pat.d_co_positive + pat.d_co_negative
         row['observed_primary_pattern'] = {
             'id': str(pat.pk),
+            'pattern_id': pat.pattern_id,
             'condition_event': pat.condition_event,
             'action_event': pat.action_event,
-            'support_n': pat.support_n,
-            'primary_effect': pat.primary_effect,
-            'primary_status': pat.primary_status,
+            'support_ca': support_ca,
+            'support_co': support_co,
+            'd_ca_rate': pat.d_ca_rate,
+            'd_co_rate': pat.d_co_rate,
+            'd_primary_effect': pat.d_primary_effect,
+            'd_primary_ci': [
+                pat.d_primary_ci_low, pat.d_primary_ci_high,
+            ],
+            'h_primary_effect': pat.h_primary_effect,
             'holdout_status': pat.holdout_status,
             'overall_status': pat.overall_status,
         }
@@ -643,27 +652,31 @@ def _collect_low_confidence_patterns(
     """Patterns that are observed but weak — worth surfacing so the
     operator can see the shape of the data, but NOT strong enough to
     be onboarding proposals."""
-    weak_patterns = (
+    weak_patterns = list(
         ConditionalActionPattern.objects
         .filter(analysis_run=analysis_run)
         .exclude(overall_status='SUPPORTED')
-        .order_by('condition_event', '-support_n')
+        .order_by('condition_event', '-d_primary_effect')[:200]
     )
     out = []
-    for pat in weak_patterns[:100]:
+    for pat in weak_patterns:
         if pat.condition_event in lb_covered_conditions:
             # Already covered by an LB policy that hit MATCH; showing
             # weaker patterns for the same condition adds noise.
             continue
+        support_ca = pat.d_ca_positive + pat.d_ca_negative
         out.append({
+            'pattern_id': pat.pattern_id,
             'condition_event': pat.condition_event,
             'action_event': pat.action_event,
-            'support_n': pat.support_n,
-            'primary_effect': pat.primary_effect,
-            'primary_status': pat.primary_status,
+            'support_ca': support_ca,
+            'd_ca_rate': pat.d_ca_rate,
+            'd_primary_effect': pat.d_primary_effect,
             'holdout_status': pat.holdout_status,
             'overall_status': pat.overall_status,
         })
+        if len(out) >= 100:
+            break
     return out
 
 
@@ -791,13 +804,13 @@ def _filter_onboarding_supported(
                 (row.get('observed_primary_pattern') or {})
                 .get('action_event')
             ),
-            'observed_support_n': (
+            'observed_support_ca': (
                 (row.get('observed_primary_pattern') or {})
-                .get('support_n')
+                .get('support_ca')
             ),
-            'observed_primary_effect': (
+            'observed_d_primary_effect': (
                 (row.get('observed_primary_pattern') or {})
-                .get('primary_effect')
+                .get('d_primary_effect')
             ),
             'deterministic_rationale': row.get('deterministic_rationale'),
         })
