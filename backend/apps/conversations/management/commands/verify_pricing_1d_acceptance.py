@@ -248,33 +248,49 @@ def _describe_example(f: ReconstructedBusinessFact, cfg_by_id: dict) -> dict:
 def _pull_conversation_snippet(*, conv_id, turn_id) -> list[dict]:
     """Return the 6 turns surrounding the quote turn (3 before, quote,
     2 after) so the operator can eyeball the conversation context that
-    the extractor saw. Empty list when we can't resolve the ids."""
+    the extractor saw. Empty list when we can't resolve the ids.
+
+    Ordering: ConversationTurn is ordered by `occurred_at`. The turn
+    index used by the semantic preprocessing (and echoed as the LLM's
+    opaque turn_id "t0044") is the row's position in that order, not
+    a stored field.
+    """
     if not conv_id or not turn_id:
         return []
     try:
         conv = Conversation.objects.get(pk=conv_id)
     except Conversation.DoesNotExist:
         return []
-    turns = list(
+    turns_qs = (
         ConversationTurn.objects
-        .filter(conversation=conv).order_by('turn_index')
-        .values('turn_index', 'speaker', 'text_content')
+        .filter(conversation=conv).order_by('occurred_at', 'id')
+        .values('id', 'speaker', 'text', 'occurred_at')
     )
+    turns = list(turns_qs)
     if not turns:
         return []
-    # LLM turn_id is opaque ("t0044") — we tag by turn_index. Try
-    # both stringified and parsed forms.
+    # Number turns in load order so the display uses the same "t0044"
+    # tag the extractor's preprocessing hands the LLM.
+    for i, t in enumerate(turns):
+        t['turn_index'] = i
     q_idx = None
     for i, t in enumerate(turns):
-        tag = f't{t["turn_index"]:04d}'
-        if tag == str(turn_id):
+        if f't{i:04d}' == str(turn_id):
             q_idx = i
             break
     if q_idx is None:
-        return turns[:6]
+        return [_snippet_row(t) for t in turns[:6]]
     lo = max(0, q_idx - 3)
     hi = min(len(turns), q_idx + 3)
-    return turns[lo:hi]
+    return [_snippet_row(t) for t in turns[lo:hi]]
+
+
+def _snippet_row(t: dict) -> dict:
+    return {
+        'turn_index': t.get('turn_index', 0),
+        'speaker': t.get('speaker', ''),
+        'text_content': t.get('text', '') or '',
+    }
 
 
 def _print_example(cmd: BaseCommand, ex: dict) -> None:
