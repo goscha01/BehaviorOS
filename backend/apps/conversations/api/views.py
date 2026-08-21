@@ -386,6 +386,71 @@ class ObservedPricingRunView(APIView):
         )
 
 
+class ReconstructionRunView(APIView):
+    """POST /api/v1/insights/audit/reconstruction/run?tenantId=<uuid>
+
+    1D Hardening milestone. Synchronous — reads existing observed +
+    configured runs, applies boundary hardening (capture_rate fix,
+    lead-source heuristic, pricing_basis validation), classifies
+    each reconstructed fact with 8-value relationship_to_config +
+    3-value onboarding_class. Never re-extracts; never majority-
+    votes contradictions.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.reconstruction.service import (
+            build_reconstruction,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        run = build_reconstruction(tenant_external_id=tenant)
+        if run is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        return Response({
+            'run_id': str(run.id),
+            'status': run.status,
+            'tenant_external_id': run.tenant_external_id,
+            'snapshot_id': str(run.snapshot_id),
+            'facts_emitted': run.facts_emitted,
+            'stats': run.stats_json,
+        })
+
+
+class ReconstructionReportView(APIView):
+    """GET /api/v1/insights/audit/reconstruction/latest?tenantId=<uuid>
+
+    Returns the latest completed reconstruction for a tenant in a
+    product-style shape: sections per domain + onboarding candidate
+    set, not a raw fact dump. Designed to answer:
+      "Here is how <tenant> appears to operate, here is what LB says,
+       here are the differences, here are the areas where the
+       business itself behaves inconsistently, here is what we're
+       confident about, here is what we cannot infer safely."
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.conversations.reconstruction.report import (
+            build_report,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        report = build_report(tenant_external_id=tenant)
+        if report is None:
+            raise NotFound({
+                'detail': (
+                    f'no completed reconstruction for tenant {tenant}. '
+                    'Trigger POST /audit/reconstruction/run first.'
+                ),
+            })
+        return Response(report)
+
+
 class ObservedServiceScopeRunView(APIView):
     """POST /api/v1/insights/audit/observed-service-scope/run?tenantId=<uuid>[&limit=N]
     Ship D. Async, 202."""

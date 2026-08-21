@@ -14,6 +14,7 @@ from apps.conversations.api.views import (
     ExtractionRunStatusView,
     ObservedFaqRunView, ObservedPricingRunView,
     ObservedQualificationRunView, ObservedServiceScopeRunView,
+    ReconstructionReportView, ReconstructionRunView,
     RecommendationDetailView, RecommendationLifecycleView,
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
@@ -106,5 +107,15 @@ urlpatterns = _router.urls + [
         'audit/configured-service-scope/run',
         ConfiguredServiceScopeRunView.as_view(),
         name='insights-audit-configured-service-scope-run',
+    ),
+    path(
+        'audit/reconstruction/run',
+        ReconstructionRunView.as_view(),
+        name='insights-audit-reconstruction-run',
+    ),
+    path(
+        'audit/reconstruction/latest',
+        ReconstructionReportView.as_view(),
+        name='insights-audit-reconstruction-latest',
     ),
 ]

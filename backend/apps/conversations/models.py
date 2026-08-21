@@ -2220,3 +2220,250 @@ class OntologyReviewCandidate(BaseModel):
 
     def __str__(self) -> str:
         return f'OntologyReview({self.kind}) {self.original_event_type}'
+
+
+# ---------------------------------------------------------------------------
+# Pipeline 1D Hardening: Unified Business Reconstruction
+# ---------------------------------------------------------------------------
+#
+# The four 1D verticals each produce their own diff. Reconstruction
+# consolidates them into ONE canonical object per business fact, with
+# harmonized vocabulary (relationship_to_config with 8 values) and an
+# onboarding classification (SAFE_TO_PROPOSE / NEEDS_OWNER_CONFIRMATION /
+# DO_NOT_PROPOSE).
+#
+# CRITICAL invariants:
+# - Contradictory observed behavior (e.g. deep_cleaning + baseboards
+#   with 19 EXTRA_CHARGE + 7 INCLUDED + 1 EXCLUDED) must be preserved
+#   as CONTRADICTORY_OBSERVED_BEHAVIOR — never silently majority-voted.
+# - Hardening happens at the RECONSTRUCTION BOUNDARY. Do not
+#   re-extract to cosmetically clean old rows. Normalize / reject
+#   at reconstruction time and record the reason in quality_flags.
+# - Cross-vertical dedup: a "$50 late cancellation fee" observed
+#   by both scope and pricing extractors becomes ONE canonical
+#   ReconstructedBusinessFact with combined provenance.
+
+
+class UnifiedBusinessReconstructionRun(BaseModel):
+    """One reconstruction run for a tenant. Reads the latest completed
+    ObservedFactExtractionRun per domain + latest ConfiguredFactParserRun
+    per domain, produces ReconstructedBusinessFact rows.
+
+    Idempotent per (org, tenant_external_id, reconstruction_version).
+    Reruns create a new row so historical runs stay traceable.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='reconstruction_runs',
+    )
+    tenant_external_id = models.CharField(max_length=128)
+    snapshot = models.ForeignKey(
+        TenantConfigSnapshot, on_delete=models.CASCADE,
+        related_name='reconstruction_runs',
+    )
+    reconstruction_version = models.CharField(max_length=64)
+    input_pricing_run = models.ForeignKey(
+        'ObservedFactExtractionRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_qualification_run = models.ForeignKey(
+        'ObservedFactExtractionRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_faq_run = models.ForeignKey(
+        'ObservedFactExtractionRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_service_scope_run = models.ForeignKey(
+        'ObservedFactExtractionRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_pricing_parser = models.ForeignKey(
+        'ConfiguredFactParserRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_qualification_parser = models.ForeignKey(
+        'ConfiguredFactParserRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_faq_parser = models.ForeignKey(
+        'ConfiguredFactParserRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    input_service_scope_parser = models.ForeignKey(
+        'ConfiguredFactParserRun', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='+',
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices,
+        default=Status.PENDING,
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    facts_emitted = models.PositiveIntegerField(default=0)
+    stats_json = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True, default='')
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['org', 'tenant_external_id', '-created_at'],
+            ),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (
+            f'Reconstruction({self.tenant_external_id[:12]}) '
+            f'{self.reconstruction_version} → {self.status}'
+        )
+
+
+class ReconstructedBusinessFact(BaseModel):
+    """ONE canonical business fact assembled from observed evidence +
+    configured equivalent + quality signals.
+
+    domain     — pricing | qualification | faq | service_scope |
+                  cross_vertical
+    canonical_subject_json — normalized subject key (may combine
+                             partial info from multiple verticals)
+    observed_value_json — aggregate distribution / rate / phrasing
+                          from ObservedBusinessFact input(s)
+    configured_equivalent_json — matching ConfiguredBusinessFact
+                                  value(s) if any
+    relationship_to_config — 8-value enum (see class):
+        CONFIRMED_BY_BEHAVIOR / OBSERVED_NOT_CONFIGURED /
+        CONFIGURED_NOT_OBSERVED / CONTRADICTORY_OBSERVED_BEHAVIOR /
+        CONTEXT_DEPENDENT / LIKELY_LEAD_SOURCE_PROVIDED /
+        ONTOLOGY_OR_EXTRACTION_ISSUE / INSUFFICIENT_EVIDENCE
+    consistency — consistent | contradictory | context_dependent
+    quality_flags — [tokens] flagged at reconstruction time
+    onboarding_class — SAFE_TO_PROPOSE / NEEDS_OWNER_CONFIRMATION /
+                        DO_NOT_PROPOSE
+    """
+
+    class RelationshipToConfig(models.TextChoices):
+        CONFIRMED_BY_BEHAVIOR = (
+            'CONFIRMED_BY_BEHAVIOR',
+            'Configured rule + observed evidence supports it',
+        )
+        OBSERVED_NOT_CONFIGURED = (
+            'OBSERVED_NOT_CONFIGURED',
+            'Real observed rule with no configured entry',
+        )
+        CONFIGURED_NOT_OBSERVED = (
+            'CONFIGURED_NOT_OBSERVED',
+            'Configured rule with no supporting observation',
+        )
+        CONTRADICTORY_OBSERVED_BEHAVIOR = (
+            'CONTRADICTORY_OBSERVED_BEHAVIOR',
+            'Agents contradict each other on the same rule',
+        )
+        CONTEXT_DEPENDENT = (
+            'CONTEXT_DEPENDENT',
+            'Rule varies by service/frequency/condition/promo',
+        )
+        LIKELY_LEAD_SOURCE_PROVIDED = (
+            'LIKELY_LEAD_SOURCE_PROVIDED',
+            'Configured field likely pre-populated by Thumbtack/Yelp',
+        )
+        ONTOLOGY_OR_EXTRACTION_ISSUE = (
+            'ONTOLOGY_OR_EXTRACTION_ISSUE',
+            'Fact has a known extraction / ontology quality issue',
+        )
+        INSUFFICIENT_EVIDENCE = (
+            'INSUFFICIENT_EVIDENCE',
+            'Not enough support to classify either way',
+        )
+
+    class Consistency(models.TextChoices):
+        CONSISTENT = 'consistent', 'Consistent across support'
+        CONTRADICTORY = 'contradictory', 'Contradictory across support'
+        CONTEXT_DEPENDENT = 'context_dependent', 'Varies by context'
+        UNDETERMINED = 'undetermined', 'Not enough evidence'
+
+    class OnboardingClass(models.TextChoices):
+        SAFE_TO_PROPOSE = (
+            'SAFE_TO_PROPOSE',
+            'High support + consistent + no quality flags',
+        )
+        NEEDS_OWNER_CONFIRMATION = (
+            'NEEDS_OWNER_CONFIRMATION',
+            'Contradictory, context-dependent, or medium quality',
+        )
+        DO_NOT_PROPOSE = (
+            'DO_NOT_PROPOSE',
+            'Low support / malformed / extraction issue',
+        )
+
+    reconstruction_run = models.ForeignKey(
+        UnifiedBusinessReconstructionRun, on_delete=models.CASCADE,
+        related_name='facts',
+    )
+    domain = models.CharField(max_length=32)
+    canonical_subject_json = models.JSONField(default=dict)
+    canonical_subject_hash = models.CharField(
+        max_length=64, db_index=True,
+    )
+    observed_value_json = models.JSONField(default=dict, blank=True)
+    context_json = models.JSONField(default=dict, blank=True)
+    configured_equivalent_json = models.JSONField(
+        default=dict, blank=True,
+    )
+    support_n = models.PositiveIntegerField(default=0)
+    aggregate_confidence = models.FloatField(default=0.0)
+    consistency = models.CharField(
+        max_length=32, choices=Consistency.choices,
+        default=Consistency.UNDETERMINED,
+    )
+    relationship_to_config = models.CharField(
+        max_length=48, choices=RelationshipToConfig.choices,
+    )
+    quality_flags = models.JSONField(default=list, blank=True)
+    onboarding_class = models.CharField(
+        max_length=32, choices=OnboardingClass.choices,
+    )
+    onboarding_rationale = models.TextField(blank=True, default='')
+    evidence_conversation_ids = models.JSONField(
+        default=list, blank=True,
+    )
+    evidence_turn_ids = models.JSONField(default=list, blank=True)
+    # Provenance — which observed / configured facts contributed.
+    # Cross-vertical dedup can attach IDs from multiple verticals.
+    source_observed_fact_ids = models.JSONField(
+        default=list, blank=True,
+    )
+    source_configured_fact_ids = models.JSONField(
+        default=list, blank=True,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['reconstruction_run', 'domain'],
+            ),
+            models.Index(
+                fields=[
+                    'reconstruction_run',
+                    'relationship_to_config',
+                ],
+            ),
+            models.Index(
+                fields=['reconstruction_run', 'onboarding_class'],
+            ),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (
+            f'ReconFact({self.domain}) '
+            f'{self.relationship_to_config} / '
+            f'{self.onboarding_class}'
+        )
