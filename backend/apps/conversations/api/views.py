@@ -405,7 +405,7 @@ class TenantCandidatesView(APIView):
         snapshots = (
             TenantConfigSnapshot.objects
             .values('tenant_external_id', 'org_id')
-            .annotate(latest_snapshot_at=Max('captured_at'))
+            .annotate(latest_snapshot_at=Max('created_at'))
         )
         by_tenant = {}
         for row in snapshots:
