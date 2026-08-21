@@ -489,19 +489,45 @@ def _communication_payload(tenant_external_id: str) -> dict:
     )
     if run is None:
         return {'note': 'no communication profile run yet', 'items': []}
-    diffs = list(
-        CommunicationProfileDiff.objects
-        .filter(run=run)
-        .exclude(category=CommunicationProfileDiff.Category.SAME_AS_DEFAULT)
-        .order_by('dimension')
-    )
+    # Surface all non-SAME_AS_DEFAULT diffs. For SAME_AS_DEFAULT, only
+    # surface those where the tenant has an active TBP override on the
+    # same dimension — that's the "revert candidate" case from the
+    # carry-forward contract: the fresh run says value now matches
+    # default, but the tenant has an active approval that would
+    # override that. Owner needs a chance to keep or revert it.
     current = get_latest_profile(tenant_external_id=tenant_external_id)
-    approved_diff_ids = {
-        item.get('source_id')
+    active_tbp_dimensions = {
+        item.get('dimension')
         for item in (current.communication_overrides
                      if current else []) or []
         if item.get('source') == 'communication_diff'
+        and item.get('dimension')
     }
+    all_diffs = list(
+        CommunicationProfileDiff.objects
+        .filter(run=run)
+        .order_by('dimension')
+    )
+    diffs = [
+        d for d in all_diffs
+        if d.category != CommunicationProfileDiff.Category.SAME_AS_DEFAULT
+        or d.dimension in active_tbp_dimensions
+    ]
+    # `already_approved` reflects "the fresh diff is settled — owner
+    # does not need to touch it." Post server-side carry-forward this is
+    # per-diff review_state, not a TBP-override lookup:
+    #
+    #   review_state=accepted  → carried-forward same-value → no action
+    #   review_state=pending   → new / changed / same-as-default with
+    #                             stale approval / insufficient evidence
+    #                             → owner MUST review (even if TBP holds
+    #                             a prior approval for the dimension —
+    #                             that's exactly the case that needs to
+    #                             be resurfaced)
+    #
+    # The old source_id ≡ TBP-override lookup was broken because carry-
+    # forward mints a new diff UUID per run while the TBP override still
+    # references the original approval-time diff UUID.
     items = []
     for d in diffs:
         items.append({
@@ -516,7 +542,9 @@ def _communication_payload(tenant_external_id: str) -> dict:
             'proposed_override': d.proposed_override,
             'evidence_conversation_ids': d.evidence_conversation_ids,
             'review_state': d.review_state,
-            'already_approved': str(d.id) in approved_diff_ids,
+            'already_approved': (
+                d.review_state == CommunicationProfileDiff.ReviewState.ACCEPTED
+            ),
         })
     return {
         'communication_profile_run_id': str(run.id),
