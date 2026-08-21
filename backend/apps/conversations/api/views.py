@@ -386,6 +386,292 @@ class ObservedPricingRunView(APIView):
         )
 
 
+class BootstrapOrgView(APIView):
+    """POST /api/v1/insights/audit/setup/bootstrap-org?lbUserId=<uuid>&orgName=<str>
+
+    Idempotent: if a BehaviorOS Organization already exists whose most
+    recent TenantConfigSnapshot has this lb_user_id, reuse it. Otherwise
+    create a new Organization with the given name. Returns org_id.
+
+    Purpose: set up the BehaviorOS-side identity for a new tenant before
+    running Pipeline 1A ingestion. Does NOT touch any pipeline code.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.accounts.models import Organization
+        lb_user_id = (request.query_params.get('lbUserId') or '').strip()
+        org_name = (request.query_params.get('orgName') or '').strip()
+        if not lb_user_id:
+            raise ValidationError({'lbUserId': 'required'})
+        if not org_name:
+            raise ValidationError({'orgName': 'required'})
+        existing = (
+            TenantConfigSnapshot.objects
+            .filter(tenant_external_id=lb_user_id)
+            .order_by('-created_at').first()
+        )
+        if existing and existing.org_id:
+            org = existing.org
+            created = False
+        else:
+            # Guard against name collision — reuse an existing Org with
+            # the same name rather than duplicating.
+            org, created = Organization.objects.get_or_create(name=org_name)
+        return Response({
+            'org_id': str(org.id),
+            'org_name': org.name,
+            'lb_user_id': lb_user_id,
+            'created': created,
+        })
+
+
+class SnapshotLbConfigView(APIView):
+    """POST /api/v1/insights/audit/setup/snapshot-config?tenantId=<lb_user_id>&orgId=<uuid>[&serviceGroup=<str>]
+
+    Wraps the existing `fetch_lb_config` management-command logic (idempotent
+    via sha256). No changes to snapshot semantics.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import hashlib
+        import json as _json
+        from apps.accounts.models import Organization
+        from apps.conversations.services.lb_config_client import LbConfigClient
+
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        org_id = (request.query_params.get('orgId') or '').strip()
+        service_group = (request.query_params.get('serviceGroup') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        if not org_id:
+            raise ValidationError({'orgId': 'required'})
+        try:
+            org = Organization.objects.get(pk=org_id)
+        except Organization.DoesNotExist:
+            raise NotFound({'detail': f'org {org_id} not found'})
+
+        client = LbConfigClient()
+        try:
+            raw = client.fetch(
+                tenant_id=tenant,
+                service_group=service_group or None,
+            )
+        except RuntimeError as exc:
+            return Response(
+                {'error': str(exc)},
+                status=http_status.HTTP_502_BAD_GATEWAY,
+            )
+        canonical = _json.dumps(raw, sort_keys=True, separators=(',', ':'))
+        sha = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        existing = TenantConfigSnapshot.objects.filter(
+            org=org,
+            source_system=TenantConfigSnapshot.SourceSystem.LEADBRIDGE,
+            tenant_external_id=tenant,
+            service_group=service_group,
+            raw_config_sha256=sha,
+        ).first()
+        if existing:
+            return Response({
+                'snapshot_id': str(existing.pk),
+                'reused': True,
+                'contract_version': existing.contract_version,
+                'sha256_prefix': sha[:12],
+            })
+        snap = TenantConfigSnapshot.objects.create(
+            org=org,
+            source_system=TenantConfigSnapshot.SourceSystem.LEADBRIDGE,
+            tenant_external_id=tenant,
+            service_group=service_group,
+            contract_version=raw.get('contract_version', ''),
+            raw_config=raw,
+            raw_config_sha256=sha,
+            fetched_from_url=client.endpoint,
+        )
+        return Response({
+            'snapshot_id': str(snap.pk),
+            'reused': False,
+            'contract_version': snap.contract_version,
+            'sha256_prefix': sha[:12],
+            'saved_accounts': len(raw.get('saved_accounts', [])),
+            'service_profiles': len(raw.get('service_profiles', [])),
+        }, status=http_status.HTTP_201_CREATED)
+
+
+class IngestCorpusView(APIView):
+    """POST /api/v1/insights/audit/setup/ingest-corpus?tenantId=<lb_user_id>&orgId=<uuid>[&limit=N]
+
+    Dispatches the LB-anchored ingestion Celery task. Returns task_id
+    for polling via `GET /audit/setup/ingest-status?taskId=<id>`.
+
+    No behavioral change to ingestion — same LbAnchoredIngestionService
+    used by the `import_lb_learning_dataset` management command.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.accounts.models import Organization
+        from apps.conversations.tasks import ingest_lb_anchored_corpus_task
+
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        org_id = (request.query_params.get('orgId') or '').strip()
+        limit_raw = request.query_params.get('limit')
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        if not org_id:
+            raise ValidationError({'orgId': 'required'})
+        try:
+            org = Organization.objects.get(pk=org_id)
+        except Organization.DoesNotExist:
+            raise NotFound({'detail': f'org {org_id} not found'})
+        limit = None
+        if limit_raw:
+            try:
+                limit = int(limit_raw)
+            except ValueError:
+                raise ValidationError({'limit': 'must be int'})
+
+        async_result = ingest_lb_anchored_corpus_task.delay(
+            org_id=str(org.id), lb_user_id=tenant, limit=limit,
+        )
+        return Response({
+            'task_id': async_result.id,
+            'org_id': str(org.id),
+            'lb_user_id': tenant,
+            'limit': limit,
+            'poll_url': (
+                f'/api/v1/insights/audit/setup/ingest-status?taskId={async_result.id}'
+            ),
+        }, status=http_status.HTTP_202_ACCEPTED)
+
+
+class IngestStatusView(APIView):
+    """GET /api/v1/insights/audit/setup/ingest-status?taskId=<uuid>
+
+    Poll Celery for the ingestion task's state + meta.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from celery.result import AsyncResult
+        task_id = (request.query_params.get('taskId') or '').strip()
+        if not task_id:
+            raise ValidationError({'taskId': 'required'})
+        ar = AsyncResult(task_id)
+        payload = {'task_id': task_id, 'state': ar.state}
+        info = ar.info
+        if isinstance(info, dict):
+            payload['meta'] = info
+        elif info is not None:
+            payload['meta'] = {'repr': str(info)}
+        if ar.ready() and ar.successful():
+            payload['result'] = ar.result
+        elif ar.failed():
+            payload['error'] = str(ar.result)
+        return Response(payload)
+
+
+class FreezeCorpusView(APIView):
+    """POST /api/v1/insights/audit/setup/freeze-corpus?orgId=<uuid>&corpusName=<str>&corpusVersion=<str>[&minTurns=5&requireLbLink=1]
+
+    Wraps the `create_learning_corpus` management-command logic. Freezes
+    a versioned LearningCorpus from current Conversation rows.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from django.db import transaction
+        from django.db.models import Count
+        from apps.accounts.models import Organization
+        from apps.conversations.models import (
+            Conversation, LearningCorpus, LearningCorpusMember,
+            TargetSystem,
+        )
+
+        org_id = (request.query_params.get('orgId') or '').strip()
+        name = (request.query_params.get('corpusName') or '').strip()
+        version = (request.query_params.get('corpusVersion') or '').strip()
+        min_turns_raw = request.query_params.get('minTurns', '5')
+        require_lb_raw = request.query_params.get('requireLbLink', '1')
+        if not org_id:
+            raise ValidationError({'orgId': 'required'})
+        if not name:
+            raise ValidationError({'corpusName': 'required'})
+        if not version:
+            raise ValidationError({'corpusVersion': 'required'})
+        try:
+            min_turns = int(min_turns_raw)
+        except ValueError:
+            raise ValidationError({'minTurns': 'must be int'})
+        require_lb = require_lb_raw not in ('0', 'false', 'False', '')
+
+        try:
+            org = Organization.objects.get(pk=org_id)
+        except Organization.DoesNotExist:
+            raise NotFound({'detail': f'org {org_id} not found'})
+
+        existing = LearningCorpus.objects.filter(
+            org=org, name=name, version=version,
+        ).first()
+        if existing:
+            return Response({
+                'corpus_id': str(existing.id),
+                'reused': True,
+                'name': name, 'version': version,
+                'member_count': existing.member_count,
+            })
+
+        qs = Conversation.objects.filter(org=org).annotate(
+            turn_count=Count('turns'),
+        ).filter(turn_count__gte=min_turns)
+        if require_lb:
+            qs = qs.filter(
+                entity_links__target_system=TargetSystem.LEADBRIDGE,
+            ).distinct()
+        conversations = list(qs.prefetch_related(
+            'entity_links', 'outcome_snapshots',
+        ))
+
+        selection = {
+            'source': 'lb_anchored',
+            'min_turns': min_turns,
+            'require_lb_link': require_lb,
+        }
+        with transaction.atomic():
+            corpus = LearningCorpus.objects.create(
+                org=org, name=name, version=version,
+                selection_criteria=selection,
+                member_count=len(conversations),
+            )
+            for conv in conversations:
+                lb_link = conv.entity_links.filter(
+                    target_system=TargetSystem.LEADBRIDGE,
+                ).first()
+                latest_snap = conv.outcome_snapshots.order_by(
+                    '-captured_at',
+                ).first()
+                LearningCorpusMember.objects.create(
+                    corpus=corpus, conversation=conv,
+                    lb_lead_id=(lb_link.target_id if lb_link else ''),
+                    lb_status_at_freeze=(
+                        latest_snap.lb_status if latest_snap else ''
+                    ),
+                    turn_count_at_freeze=conv.turn_count,
+                )
+        return Response({
+            'corpus_id': str(corpus.id),
+            'reused': False,
+            'name': name, 'version': version,
+            'member_count': corpus.member_count,
+        }, status=http_status.HTTP_201_CREATED)
+
+
 class TenantCandidatesView(APIView):
     """GET /api/v1/insights/audit/tenants
 

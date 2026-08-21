@@ -9,9 +9,12 @@ from django.urls import path
 from rest_framework.routers import SimpleRouter
 
 from apps.conversations.api.views import (
+    BootstrapOrgView,
     ConfiguredFaqRunView, ConfiguredPricingRunView,
     ConfiguredQualificationRunView, ConfiguredServiceScopeRunView,
     ExtractionRunStatusView,
+    FreezeCorpusView,
+    IngestCorpusView, IngestStatusView,
     ObservedFaqRunView, ObservedPricingRunView,
     ObservedQualificationRunView, ObservedServiceScopeRunView,
     ReconstructionReportView, ReconstructionRunView,
@@ -19,6 +22,7 @@ from apps.conversations.api.views import (
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
     RecommendationRunViewSet, RomV1BenchmarkView,
+    SnapshotLbConfigView,
     TenantCandidatesView, TenantConfigAuditView,
 )
 
@@ -112,6 +116,31 @@ urlpatterns = _router.urls + [
         'audit/tenants',
         TenantCandidatesView.as_view(),
         name='insights-audit-tenants',
+    ),
+    path(
+        'audit/setup/bootstrap-org',
+        BootstrapOrgView.as_view(),
+        name='insights-audit-setup-bootstrap-org',
+    ),
+    path(
+        'audit/setup/snapshot-config',
+        SnapshotLbConfigView.as_view(),
+        name='insights-audit-setup-snapshot-config',
+    ),
+    path(
+        'audit/setup/ingest-corpus',
+        IngestCorpusView.as_view(),
+        name='insights-audit-setup-ingest-corpus',
+    ),
+    path(
+        'audit/setup/ingest-status',
+        IngestStatusView.as_view(),
+        name='insights-audit-setup-ingest-status',
+    ),
+    path(
+        'audit/setup/freeze-corpus',
+        FreezeCorpusView.as_view(),
+        name='insights-audit-setup-freeze-corpus',
     ),
     path(
         'audit/reconstruction/run',
