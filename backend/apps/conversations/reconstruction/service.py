@@ -208,6 +208,23 @@ def _reconstruct_all(*, run, inputs: dict) -> int:
 
 
 def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
+    """Deterministic pricing matcher (P4, 2026-08-21).
+
+    Replaces the old subject_key_hash join with a compatibility-based
+    candidate search per the 2026-08-21 reviewer directive. Emits the
+    four pricing-specific verdict values (MATCH, DIFFERS_FROM_CONFIG,
+    INSUFFICIENT_CONTEXT_TO_COMPARE, VARIABLE_CONTEXT_DEPENDENT) plus
+    OBSERVED_NOT_CONFIGURED / CONFIGURED_NOT_OBSERVED /
+    INSUFFICIENT_EVIDENCE / ONTOLOGY_OR_EXTRACTION_ISSUE from the
+    legacy generic set.
+
+    Matcher logic lives in pricing_matcher.py so it is unit-testable
+    without spinning up the whole reconstruction pipeline.
+    """
+    from apps.conversations.reconstruction.pricing_matcher import (
+        MatchInputs, match_all,
+    )
+
     if obs_run is None and cfg_run is None:
         return 0
     observed = list(
@@ -220,21 +237,21 @@ def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
             parser_run=cfg_run, domain='pricing',
         )
     ) if cfg_run else []
-    cfg_by_hash = {c.subject_key_hash: c for c in configured}
-    obs_by_hash = {o.subject_key_hash: o for o in observed}
+
     written = 0
 
-    for sha, obs in obs_by_hash.items():
+    # Ontology-or-extraction-issue rows short-circuit before matching:
+    # a fact with a malformed / missing pricing_basis has no valid
+    # subject to reason about, and we don't want to leak it into any
+    # candidate lookup on the matcher side.
+    matchable_observed: list[ObservedBusinessFact] = []
+    for obs in observed:
         quality_flags = _pricing_quality_flags(obs)
-        cfg_row = cfg_by_hash.get(sha)
-        support = obs.support_n
-        payload = obs.value_json or {}
-        # Extract pricing distribution stats for the payload
-        observed_value = _pricing_observed_summary(payload)
         if 'malformed_pricing_basis' in quality_flags or 'missing_pricing_basis' in quality_flags:
+            observed_value = _pricing_observed_summary(obs.value_json or {})
             _persist(
                 run=run, domain='pricing',
-                observed=obs, configured=cfg_row,
+                observed=obs, configured=None,
                 observed_value=observed_value,
                 relationship=ReconstructedBusinessFact.RelationshipToConfig.ONTOLOGY_OR_EXTRACTION_ISSUE,
                 consistency=ReconstructedBusinessFact.Consistency.UNDETERMINED,
@@ -244,73 +261,56 @@ def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
                     'pricing_basis is malformed or missing; refuse '
                     'to propose until extractor produces a valid value'
                 ),
-                support_n=support,
+                support_n=obs.support_n or 0,
             )
             written += 1
             continue
-        # Consistency: if observed amount distribution has wide IQR
-        # relative to median, mark context_dependent.
-        stats = payload.get('amount_stats') or {}
-        median = stats.get('median')
-        p25 = stats.get('p25')
-        p75 = stats.get('p75')
-        iqr_share = None
-        if median and p25 is not None and p75 is not None and median > 0:
-            iqr_share = (p75 - p25) / median
-        if iqr_share is not None and iqr_share >= 0.25 and support >= MIN_SUPPORT_INSUFFICIENT:
-            consistency = ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT
-        else:
-            consistency = (
-                ReconstructedBusinessFact.Consistency.CONSISTENT
-                if support >= MIN_SUPPORT_INSUFFICIENT
-                else ReconstructedBusinessFact.Consistency.UNDETERMINED
-            )
-        # Relationship
-        if cfg_row is None:
-            if support >= MIN_SUPPORT_SAFE:
-                relationship = ReconstructedBusinessFact.RelationshipToConfig.OBSERVED_NOT_CONFIGURED
-            else:
-                relationship = ReconstructedBusinessFact.RelationshipToConfig.INSUFFICIENT_EVIDENCE
-        else:
-            # Compare configured amount to observed distribution.
-            cfg_amount = _configured_amount(cfg_row.value_json)
-            if (
-                cfg_amount is not None and median is not None
-                and p25 is not None and p75 is not None
-                and p25 <= cfg_amount <= p75
-                and abs(median - cfg_amount) / max(cfg_amount, 1) <= 0.10
-            ):
-                relationship = ReconstructedBusinessFact.RelationshipToConfig.CONFIRMED_BY_BEHAVIOR
-            elif consistency == ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT:
-                relationship = ReconstructedBusinessFact.RelationshipToConfig.CONTEXT_DEPENDENT
-            elif support < MIN_SUPPORT_INSUFFICIENT:
-                relationship = ReconstructedBusinessFact.RelationshipToConfig.INSUFFICIENT_EVIDENCE
-            else:
-                # observed materially differs from configured — a
-                # real conflict; but reconstructed as CONTRADICTORY
-                # because we're treating observed behavior as truth.
-                relationship = ReconstructedBusinessFact.RelationshipToConfig.CONTRADICTORY_OBSERVED_BEHAVIOR
+        matchable_observed.append(obs)
+
+    outcomes, orphaned_cfg = match_all(
+        MatchInputs(observed_facts=matchable_observed,
+                    configured_facts=configured),
+    )
+
+    for obs, outcome in outcomes:
+        observed_value = _pricing_observed_summary(obs.value_json or {})
+        # Enrich observed_value with matcher provenance so the audit
+        # can render "why this verdict" without re-running the matcher.
+        observed_value['matcher'] = {
+            'verdict': outcome.verdict,
+            'rationale': outcome.rationale,
+            'candidate_configured_fact_ids': outcome.candidate_configured_fact_ids,
+            'matched_configured_fact_id': outcome.matched_configured_fact_id,
+            'missing_observed_dimensions': outcome.missing_observed_dimensions,
+            'price_comparison': outcome.price_comparison,
+        }
+        matched_cfg = None
+        if outcome.matched_configured_fact_id:
+            for c in configured:
+                if str(c.id) == outcome.matched_configured_fact_id:
+                    matched_cfg = c
+                    break
         onboarding_class, rationale = _pricing_onboarding_class(
-            relationship=relationship, consistency=consistency,
-            support=support, quality_flags=quality_flags,
+            relationship=outcome.verdict,
+            consistency=outcome.consistency,
+            support=obs.support_n or 0,
+            quality_flags=[],
         )
         _persist(
             run=run, domain='pricing',
-            observed=obs, configured=cfg_row,
+            observed=obs, configured=matched_cfg,
             observed_value=observed_value,
-            relationship=relationship,
-            consistency=consistency,
-            quality_flags=quality_flags,
+            relationship=outcome.verdict,
+            consistency=outcome.consistency,
+            quality_flags=[],
             onboarding_class=onboarding_class,
             onboarding_rationale=rationale,
-            support_n=support,
+            support_n=obs.support_n or 0,
         )
         written += 1
 
-    # Configured-only pricing facts (no observed counterpart)
-    for sha, cfg_row in cfg_by_hash.items():
-        if sha in obs_by_hash:
-            continue
+    # Configured-only pricing facts (no observed counterpart).
+    for cfg_row in orphaned_cfg:
         _persist(
             run=run, domain='pricing',
             observed=None, configured=cfg_row,
@@ -830,20 +830,41 @@ def _pricing_onboarding_class(
             ReconstructedBusinessFact.OnboardingClass.DO_NOT_PROPOSE,
             f'support {support} below floor {MIN_SUPPORT_INSUFFICIENT}',
         )
-    if relationship == ReconstructedBusinessFact.RelationshipToConfig.CONFIRMED_BY_BEHAVIOR:
+    # New pricing verdicts (P1 dual-write) + legacy generic names.
+    RTC = ReconstructedBusinessFact.RelationshipToConfig
+    if relationship in (RTC.MATCH, RTC.CONFIRMED_BY_BEHAVIOR):
         return (
             ReconstructedBusinessFact.OnboardingClass.SAFE_TO_PROPOSE,
             f'observed distribution confirms configured amount (support {support})',
+        )
+    if relationship == RTC.INSUFFICIENT_CONTEXT_TO_COMPARE:
+        return (
+            ReconstructedBusinessFact.OnboardingClass.NEEDS_OWNER_CONFIRMATION,
+            'observed conversations lack the dimensions needed to '
+            'match a specific configured pricing rule',
+        )
+    if relationship == RTC.VARIABLE_CONTEXT_DEPENDENT:
+        return (
+            ReconstructedBusinessFact.OnboardingClass.NEEDS_OWNER_CONFIRMATION,
+            'observed price distribution is materially heterogeneous; '
+            'a single configured rule cannot capture the variance',
         )
     if consistency == ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT:
         return (
             ReconstructedBusinessFact.OnboardingClass.NEEDS_OWNER_CONFIRMATION,
             'observed pricing distribution is materially context-dependent',
         )
-    if support >= MIN_SUPPORT_SAFE and relationship == ReconstructedBusinessFact.RelationshipToConfig.OBSERVED_NOT_CONFIGURED:
+    if support >= MIN_SUPPORT_SAFE and relationship == RTC.OBSERVED_NOT_CONFIGURED:
         return (
             ReconstructedBusinessFact.OnboardingClass.SAFE_TO_PROPOSE,
-            f'consistent observed rule with {support} conversations; no configured entry',
+            f'consistent observed rule with {support} conversations; '
+            'no compatible configured entry',
+        )
+    if relationship == RTC.DIFFERS_FROM_CONFIG:
+        return (
+            ReconstructedBusinessFact.OnboardingClass.NEEDS_OWNER_CONFIRMATION,
+            'observed pricing sits outside the compatible configured '
+            'rule\'s tolerance — owner should reconcile',
         )
     return (
         ReconstructedBusinessFact.OnboardingClass.NEEDS_OWNER_CONFIRMATION,
