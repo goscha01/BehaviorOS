@@ -1597,6 +1597,85 @@ class ExtractionRunStatusView(APIView):
         })
 
 
+class PricingAcceptanceReportView(APIView):
+    """GET /api/v1/insights/audit/pricing-1d-acceptance?tenantId=<uuid>[&per_category=N]
+
+    Emits the P7 acceptance report as JSON — same shape the mgmt
+    command produces. Used to verify the 1D pricing comparison
+    against a tenant WITHOUT SSH-ing to the worker.
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from collections import defaultdict
+        from apps.conversations.management.commands.verify_pricing_1d_acceptance import (
+            REQUIRED_CATEGORIES, _categorize, _describe_example,
+        )
+        from apps.conversations.models import (
+            ConfiguredBusinessFact as _CBF,
+            ReconstructedBusinessFact as _RBF,
+            UnifiedBusinessReconstructionRun as _URun,
+        )
+
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        try:
+            per_cat = int(request.query_params.get('per_category') or 3)
+        except ValueError:
+            per_cat = 3
+
+        run = (
+            _URun.objects
+            .filter(tenant_external_id=tenant, status='completed')
+            .order_by('-created_at').first()
+        )
+        if run is None:
+            raise NotFound({
+                'detail': f'no completed reconstruction run for tenant {tenant}',
+            })
+        facts = list(_RBF.objects.filter(
+            reconstruction_run=run, domain='pricing',
+        ))
+        cfg_facts = list(_CBF.objects.filter(
+            snapshot__tenant_external_id=tenant, domain='pricing',
+        ))
+        cfg_by_id = {str(c.id): c for c in cfg_facts}
+
+        by_verdict: dict[str, int] = defaultdict(int)
+        for f in facts:
+            by_verdict[f.relationship_to_config] += 1
+
+        by_cat: dict[str, list] = defaultdict(list)
+        for f in facts:
+            for cat in _categorize(f, cfg_by_id):
+                by_cat[cat].append(f)
+
+        examples: dict[str, list] = {}
+        for cat in REQUIRED_CATEGORIES:
+            examples[cat] = [
+                _describe_example(f, cfg_by_id)
+                for f in by_cat.get(cat, [])[:per_cat]
+            ]
+
+        return Response({
+            'tenant_external_id': tenant,
+            'reconstruction_run_id': str(run.id),
+            'reconstruction_run_completed_at': (
+                run.created_at.isoformat() if run.created_at else None
+            ),
+            'pricing_facts_total': len(facts),
+            'configured_pricing_facts_total': len(cfg_facts),
+            'verdict_distribution': dict(by_verdict),
+            'category_coverage': {
+                c: len(by_cat.get(c, [])) for c in REQUIRED_CATEGORIES
+            },
+            'examples': examples,
+        })
+
+
 class ConfiguredPricingRunView(APIView):
     """POST /api/v1/insights/audit/configured-pricing/run?tenantId=<uuid>
 

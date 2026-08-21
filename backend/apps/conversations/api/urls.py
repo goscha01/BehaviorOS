@@ -22,6 +22,7 @@ from apps.conversations.api.views import (
     ObservedFaqRunView, ObservedPricingRunView,
     ObservedQualificationRunView, ObservedServiceScopeRunView,
     OwnerReviewPayloadView,
+    PricingAcceptanceReportView,
     ReconstructionReportView, ReconstructionRunView,
     RecommendationDetailView, RecommendationLifecycleView,
     RecommendationMeasurementView,
@@ -128,6 +129,11 @@ urlpatterns = _router.urls + [
         'audit/tenant-evidence-summary',
         TenantEvidenceSummaryView.as_view(),
         name='insights-audit-tenant-evidence-summary',
+    ),
+    path(
+        'audit/pricing-1d-acceptance',
+        PricingAcceptanceReportView.as_view(),
+        name='insights-audit-pricing-1d-acceptance',
     ),
     path(
         'audit/setup/bootstrap-org',
