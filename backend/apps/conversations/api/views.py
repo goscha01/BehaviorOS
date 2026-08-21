@@ -386,6 +386,69 @@ class ObservedPricingRunView(APIView):
         )
 
 
+class TenantCandidatesView(APIView):
+    """GET /api/v1/insights/audit/tenants
+
+    Read-only enumeration of tenants that have BOTH a TenantConfigSnapshot
+    and a Conversation corpus in the DB, with per-tenant conversation
+    counts + snapshot presence. Purpose: selecting a tenant #2 for the
+    frozen 1D pipeline blind run. Does NOT touch the 1D pipeline.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Max
+        from apps.conversations.models import Conversation
+        # Every LB tenant is an Organization with conversations attached.
+        # tenant_external_id lives on TenantConfigSnapshot as the LB userId.
+        snapshots = (
+            TenantConfigSnapshot.objects
+            .values('tenant_external_id', 'org_id')
+            .annotate(latest_snapshot_at=Max('captured_at'))
+        )
+        by_tenant = {}
+        for row in snapshots:
+            by_tenant[row['tenant_external_id']] = {
+                'tenant_external_id': row['tenant_external_id'],
+                'org_id': str(row['org_id']) if row['org_id'] else None,
+                'has_config_snapshot': True,
+                'latest_snapshot_at': (
+                    row['latest_snapshot_at'].isoformat()
+                    if row['latest_snapshot_at'] else None
+                ),
+                'conversation_count': 0,
+            }
+        conv_counts = (
+            Conversation.objects
+            .values('org_id')
+            .annotate(n=Count('id'))
+        )
+        org_to_count = {str(r['org_id']): r['n'] for r in conv_counts}
+        for t in by_tenant.values():
+            if t['org_id']:
+                t['conversation_count'] = org_to_count.get(t['org_id'], 0)
+        # Also surface orgs that HAVE conversations but no snapshot — a red
+        # flag we want visible, not silent.
+        snapshot_org_ids = {t['org_id'] for t in by_tenant.values() if t['org_id']}
+        orphans = [
+            {
+                'org_id': oid,
+                'has_config_snapshot': False,
+                'conversation_count': n,
+            }
+            for oid, n in org_to_count.items()
+            if oid not in snapshot_org_ids and n > 0
+        ]
+        return Response({
+            'tenants_with_snapshot': sorted(
+                by_tenant.values(),
+                key=lambda x: -x['conversation_count'],
+            ),
+            'orgs_without_snapshot_but_with_conversations': orphans,
+        })
+
+
 class ReconstructionRunView(APIView):
     """POST /api/v1/insights/audit/reconstruction/run?tenantId=<uuid>
 

@@ -19,7 +19,7 @@ from apps.conversations.api.views import (
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
     RecommendationRunViewSet, RomV1BenchmarkView,
-    TenantConfigAuditView,
+    TenantCandidatesView, TenantConfigAuditView,
 )
 
 
@@ -107,6 +107,11 @@ urlpatterns = _router.urls + [
         'audit/configured-service-scope/run',
         ConfiguredServiceScopeRunView.as_view(),
         name='insights-audit-configured-service-scope-run',
+    ),
+    path(
+        'audit/tenants',
+        TenantCandidatesView.as_view(),
+        name='insights-audit-tenants',
     ),
     path(
         'audit/reconstruction/run',
