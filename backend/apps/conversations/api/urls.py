@@ -10,10 +10,10 @@ from rest_framework.routers import SimpleRouter
 
 from apps.conversations.api.views import (
     ConfiguredFaqRunView, ConfiguredPricingRunView,
-    ConfiguredQualificationRunView,
+    ConfiguredQualificationRunView, ConfiguredServiceScopeRunView,
     ExtractionRunStatusView,
     ObservedFaqRunView, ObservedPricingRunView,
-    ObservedQualificationRunView,
+    ObservedQualificationRunView, ObservedServiceScopeRunView,
     RecommendationDetailView, RecommendationLifecycleView,
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
@@ -96,5 +96,15 @@ urlpatterns = _router.urls + [
         'audit/configured-faq/run',
         ConfiguredFaqRunView.as_view(),
         name='insights-audit-configured-faq-run',
+    ),
+    path(
+        'audit/observed-service-scope/run',
+        ObservedServiceScopeRunView.as_view(),
+        name='insights-audit-observed-service-scope-run',
+    ),
+    path(
+        'audit/configured-service-scope/run',
+        ConfiguredServiceScopeRunView.as_view(),
+        name='insights-audit-configured-service-scope-run',
     ),
 ]

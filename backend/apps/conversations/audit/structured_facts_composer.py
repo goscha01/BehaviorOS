@@ -41,6 +41,7 @@ def build_structured_facts_section(tenant_external_id: str) -> dict:
         ('pricing', _build_pricing_section),
         ('qualification', _build_qualification_section),
         ('faq', _build_faq_section),
+        ('service_scope', _build_service_scope_section),
     ]:
         try:
             out[domain] = builder(snap)
@@ -265,6 +266,79 @@ def _build_faq_section(snap) -> dict:
             'raw_transactional_events': (
                 stats.get('total_transactional_events_raw')
             ),
+            'llm_cost_usd': str(extraction_run.llm_cost_usd),
+            'completed_at': (
+                extraction_run.completed_at.isoformat()
+                if extraction_run.completed_at else None
+            ),
+        },
+        'configured_run': {
+            'id': str(parser_run.id),
+            'parser_version': parser_run.parser_version,
+            'facts_emitted': parser_run.facts_emitted,
+            'llm_cost_usd': str(parser_run.llm_cost_usd),
+            'completed_at': (
+                parser_run.completed_at.isoformat()
+                if parser_run.completed_at else None
+            ),
+        },
+        'diff': diff,
+    }
+
+
+def _build_service_scope_section(snap) -> dict:
+    from apps.conversations.observed_config.service_scope.diff import (
+        build_service_scope_diff,
+    )
+    extraction_run = (
+        ObservedFactExtractionRun.objects.filter(
+            org=snap.org, domain='service_scope',
+            status='completed',
+        ).order_by('-created_at').first()
+    )
+    parser_run = (
+        ConfiguredFactParserRun.objects.filter(
+            snapshot=snap, domain='service_scope',
+            status='completed',
+        ).order_by('-created_at').first()
+    )
+    if extraction_run is None and parser_run is None:
+        return {
+            'status': 'not_run',
+            'note': (
+                'No extraction or parser runs for service_scope yet. '
+                'Trigger via POST /audit/observed-service-scope/run '
+                'and POST /audit/configured-service-scope/run.'
+            ),
+        }
+    if extraction_run is None:
+        return {
+            'status': 'observed_side_missing',
+            'configured_run_id': str(parser_run.id),
+        }
+    if parser_run is None:
+        return {
+            'status': 'configured_side_missing',
+            'observed_run_id': str(extraction_run.id),
+        }
+    diff = build_service_scope_diff(
+        extraction_run=extraction_run, parser_run=parser_run,
+    )
+    stats = extraction_run.stats_json or {}
+    return {
+        'status': 'ok',
+        'observed_run': {
+            'id': str(extraction_run.id),
+            'extractor_version': extraction_run.extractor_version,
+            'model': extraction_run.model,
+            'conversations_processed': (
+                extraction_run.conversations_processed
+            ),
+            'facts_emitted': extraction_run.facts_emitted,
+            'raw_events_by_fact_type': stats.get(
+                'raw_events_by_fact_type'
+            ),
+            'agent_policy_share': stats.get('agent_policy_share'),
             'llm_cost_usd': str(extraction_run.llm_cost_usd),
             'completed_at': (
                 extraction_run.completed_at.isoformat()

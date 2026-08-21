@@ -386,6 +386,101 @@ class ObservedPricingRunView(APIView):
         )
 
 
+class ObservedServiceScopeRunView(APIView):
+    """POST /api/v1/insights/audit/observed-service-scope/run?tenantId=<uuid>[&limit=N]
+    Ship D. Async, 202."""
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.models import (
+            LearningCorpus, TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.service_scope.extractor import (
+            create_or_reuse_run,
+        )
+        from apps.conversations.tasks import (
+            observed_service_scope_extraction_task,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        limit = request.query_params.get('limit')
+        try:
+            limit_int = int(limit) if limit else None
+        except ValueError:
+            raise ValidationError({'limit': 'must be integer'})
+        snap = (
+            _TCS.objects.filter(
+                source_system='leadbridge', tenant_external_id=tenant,
+            ).order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        corpus = (
+            LearningCorpus.objects.filter(org=snap.org)
+            .order_by('-created_at').first()
+        )
+        if corpus is None:
+            raise NotFound(
+                {'detail': f'no LearningCorpus for tenant {tenant}'}
+            )
+        run, created = create_or_reuse_run(org=snap.org, corpus=corpus)
+        if created:
+            observed_service_scope_extraction_task.delay(
+                str(run.id), 'gpt-4o-mini', limit_int,
+            )
+        return Response(
+            {
+                'run_id': str(run.id),
+                'status': run.status,
+                'created': created,
+                'note': (
+                    'Queued on behavioros-worker. Poll '
+                    'GET /audit/extraction-runs/<run_id>.'
+                    if created else
+                    'Existing PENDING/RUNNING run reused.'
+                ),
+            },
+            status=http_status.HTTP_202_ACCEPTED,
+        )
+
+
+class ConfiguredServiceScopeRunView(APIView):
+    """POST /api/v1/insights/audit/configured-service-scope/run?tenantId=<uuid>
+    Ship D. Synchronous."""
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.models import (
+            TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.service_scope.config_parser import (
+            parse_snapshot,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        snap = (
+            _TCS.objects.filter(
+                source_system='leadbridge', tenant_external_id=tenant,
+            ).order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        run = parse_snapshot(
+            snapshot=snap, llm_client=LearningLLMClient(),
+        )
+        return Response({
+            'run_id': str(run.id),
+            'status': run.status,
+            'snapshot_id': str(snap.id),
+            'facts_emitted': run.facts_emitted,
+            'llm_cost_usd': str(run.llm_cost_usd),
+        })
+
+
 class ObservedFaqRunView(APIView):
     """POST /api/v1/insights/audit/observed-faq/run?tenantId=<uuid>[&limit=N]
     Ship C. Async, 202 + run_id."""
