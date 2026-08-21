@@ -35,7 +35,7 @@ from apps.conversations.models import (
     Conversation, ObservedBusinessFact,
 )
 from apps.conversations.observed_config.base import (
-    canonical_subject_key,
+    canonical_subject_key, normalize_service,
 )
 
 
@@ -188,6 +188,13 @@ def _normalize_subject_key(key: dict) -> dict:
         elif dim == 'addons':
             if isinstance(v, list) and v:
                 out[dim] = sorted([str(x).strip().lower() for x in v])
+        elif dim == 'service':
+            # Canonicalize to match the configured-side normalizer so
+            # `cleaning` on the observed side matches `default-service`
+            # or `residential_cleaning` on the configured side.
+            normalized = normalize_service(v)
+            if normalized:
+                out[dim] = normalized
         else:
             s = str(v).strip().lower()
             if s:
@@ -230,7 +237,12 @@ def _extract_per_quote_dimensions(entry: dict) -> dict:
     for k in ('service', 'service_tier', 'frequency', 'pricing_basis'):
         v = subj.get(k)
         if v not in (None, ''):
-            out[k] = str(v).strip().lower()
+            if k == 'service':
+                normalized = normalize_service(v)
+                if normalized:
+                    out[k] = normalized
+            else:
+                out[k] = str(v).strip().lower()
     addons = subj.get('addons')
     if isinstance(addons, list) and addons:
         out['addons'] = sorted([str(a).strip().lower() for a in addons])

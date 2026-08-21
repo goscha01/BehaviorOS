@@ -50,7 +50,7 @@ from apps.conversations.models import (
     ObservedBusinessFact, TenantConfigSnapshot,
 )
 from apps.conversations.observed_config.base import (
-    canonical_subject_key,
+    canonical_subject_key, normalize_service,
 )
 
 
@@ -260,12 +260,16 @@ def parse_service_profile(
 # ─── helpers ────────────────────────────────────────────────────────
 
 def _service_slug(service_profile: dict) -> str:
-    """Prefer the LB slug; fall back to service_group; then name."""
-    return (
+    """Prefer LB slug → service_group → name, then run through the
+    canonical service normalizer so tenant-specific slugs like
+    "default-service" or "residential_cleaning" all resolve to the
+    same token the observed extractor emits ("cleaning")."""
+    raw = (
         (service_profile.get('slug') or '').strip().lower()
         or (service_profile.get('service_group') or '').strip().lower()
         or (service_profile.get('name') or 'service').strip().lower().replace(' ', '_')
     )
+    return normalize_service(raw) or raw
 
 
 def _enabled_tiers(cleaning_types: list) -> list[str]:

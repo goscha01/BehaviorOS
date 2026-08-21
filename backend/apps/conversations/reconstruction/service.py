@@ -788,13 +788,19 @@ def _pricing_quality_flags(obs: ObservedBusinessFact) -> list[str]:
 
 
 def _pricing_observed_summary(payload: dict) -> dict:
-    """Compact pricing observed_value that goes on the reconstructed row."""
+    """Compact pricing observed_value that goes on the reconstructed row.
+
+    Includes `dimension_samples` (v3) so the P7 acceptance report can
+    render per-quote raw sqft / bedrooms / bathrooms without loading
+    the underlying ObservedBusinessFact.
+    """
     stats = payload.get('amount_stats') or {}
     return {
         'currency': payload.get('currency', 'USD'),
         'amount_stats': stats,
         'observed_attributes': payload.get('observed_attributes') or {},
         'sample_quotes': (payload.get('quotes_sample') or [])[:5],
+        'dimension_samples': (payload.get('dimension_samples') or [])[:10],
     }
 
 

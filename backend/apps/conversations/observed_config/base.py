@@ -62,6 +62,53 @@ def canonical_subject_key(key: dict) -> tuple[str, str, list[str]]:
     return (canon, sha, dims)
 
 
+# ─── Canonical service normalizer (2026-08-21) ─────────────────────
+#
+# LB stores each ServiceProfile with tenant-editable `slug`, `name`,
+# and `service_group`. The observed extractor (LLM) writes canonical
+# service tokens like "cleaning" / "carpet". These must land on the
+# SAME token for the matcher's compatibility check to succeed.
+#
+# The alias table is intentionally small and residential-cleaning-
+# focused for MVP. Additional verticals extend this map rather than
+# adding parallel normalizers.
+
+_SERVICE_ALIASES: dict[str, str] = {
+    # residential cleaning family
+    'cleaning': 'cleaning',
+    'house_cleaning': 'cleaning',
+    'house-cleaning': 'cleaning',
+    'residential_cleaning': 'cleaning',
+    'residential-cleaning': 'cleaning',
+    'default_service': 'cleaning',
+    'default-service': 'cleaning',
+    'default': 'cleaning',
+    'home_cleaning': 'cleaning',
+    'home-cleaning': 'cleaning',
+    # carpet cleaning family (kept separate — MATCH shouldn't cross
+    # "cleaning" and "carpet_cleaning")
+    'carpet': 'carpet_cleaning',
+    'carpet_cleaning': 'carpet_cleaning',
+    'carpet-cleaning': 'carpet_cleaning',
+    # pressure washing
+    'pressure_washing': 'pressure_washing',
+    'pressure-washing': 'pressure_washing',
+    'power_washing': 'pressure_washing',
+}
+
+
+def normalize_service(raw: str | None) -> str | None:
+    """Map any of LB's service slugs / observed extractor tokens to a
+    single canonical service token. Unknown strings are returned as-
+    is (lowercased) so unfamiliar verticals aren't silently dropped."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    return _SERVICE_ALIASES.get(s, s)
+
+
 def dimensions_are_compatible(
     a_dims: list[str], b_dims: list[str],
 ) -> str:
