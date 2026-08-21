@@ -37,8 +37,18 @@ from apps.conversations.observed_config.pricing.prompt import (
     PRICING_EXTRACTOR_VERSION, SYSTEM_PROMPT, build_user_prompt,
 )
 from apps.conversations.semantic.preprocessing import (
-    chunk_conversation, load_and_normalize, render_turns_for_prompt,
+    ConversationChunk,
+    load_and_normalize, render_turns_for_prompt,
 )
+
+# v3: pricing extractor takes the WHOLE conversation in one call so
+# dimension mentions in any turn are visible when a price quote is
+# resolved. Cap at a soft character budget to prevent runaway costs
+# on the rare marathon conversation — beyond the cap we take the
+# head + tail. That still preserves both the initial qualification
+# (customer stating bedrooms/sqft) and the tail booking (price quote).
+PRICING_WHOLE_CONVO_CHAR_BUDGET = 30_000
+PRICING_TAIL_TURNS_ON_TRUNCATE = 80
 
 logger = logging.getLogger(__name__)
 
@@ -72,47 +82,65 @@ def extract_from_conversation(
         return PerConversationExtraction(
             conversation_id=str(conv.id),
         )
-    chunks = chunk_conversation(turns)
 
-    aggregated_prices: list[dict] = []
-    aggregated_review: list[dict] = []
-    total_in = 0
-    total_out = 0
-    total_cost = Decimal('0')
-
-    for chunk in chunks:
-        rendered = render_turns_for_prompt(chunk)
-        user = build_user_prompt(rendered, str(conv.id))
-        r = llm_client.analyze(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=user,
-            model=model,
-            max_tokens=1200,
+    # v3: single whole-conversation call so the LLM can resolve
+    # dimensions stated in early turns against price quotes in
+    # later turns. Beyond the soft cap, take head + tail so we
+    # still preserve both the qualification setup and the pricing
+    # neighborhood without paying for a marathon transcript.
+    total_chars = sum(len(t.text) for t in turns)
+    if total_chars <= PRICING_WHOLE_CONVO_CHAR_BUDGET:
+        included_turns = list(turns)
+        truncated = False
+    else:
+        tail = PRICING_TAIL_TURNS_ON_TRUNCATE
+        included_turns = list(turns[:tail]) + list(turns[-tail:])
+        truncated = True
+        logger.info(
+            'pricing extractor: conv=%s truncated to head+tail '
+            '(orig turns=%d chars=%d)',
+            conv.id, len(turns), total_chars,
         )
-        parsed = r.parsed_json or {}
-        if not isinstance(parsed, dict):
-            logger.warning(
-                'pricing extractor: non-dict response for conv=%s',
-                conv.id,
-            )
-            parsed = {}
-        prices = parsed.get('prices', []) or []
-        review = parsed.get('ontology_review', []) or []
-        if isinstance(prices, list):
-            aggregated_prices.extend(_validate_prices(prices))
-        if isinstance(review, list):
-            aggregated_review.extend(_validate_review(review))
-        total_in += getattr(r, 'input_tokens', 0)
-        total_out += getattr(r, 'output_tokens', 0)
-        total_cost += getattr(r, 'cost_usd', Decimal('0'))
+
+    chunk = ConversationChunk(
+        turns=included_turns, chunk_index=0, is_only_chunk=True,
+    )
+    rendered = render_turns_for_prompt(chunk)
+    user = build_user_prompt(rendered, str(conv.id))
+    r = llm_client.analyze(
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=user,
+        model=model,
+        # v3: bumped from 1200 → 2000 because resolved_context adds
+        # ~4 fields × ~3 keys per price entry vs v2.
+        max_tokens=2000,
+    )
+    parsed = r.parsed_json or {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            'pricing extractor: non-dict response for conv=%s',
+            conv.id,
+        )
+        parsed = {}
+    prices = parsed.get('prices', []) or []
+    review = parsed.get('ontology_review', []) or []
+    aggregated_prices = (
+        _validate_prices(prices) if isinstance(prices, list) else []
+    )
+    aggregated_review = (
+        _validate_review(review) if isinstance(review, list) else []
+    )
+    if truncated:
+        for p in aggregated_prices:
+            p.setdefault('_truncated', True)
 
     return PerConversationExtraction(
         conversation_id=str(conv.id),
         prices=aggregated_prices,
         ontology_review=aggregated_review,
-        llm_input_tokens=total_in,
-        llm_output_tokens=total_out,
-        llm_cost_usd=total_cost,
+        llm_input_tokens=getattr(r, 'input_tokens', 0),
+        llm_output_tokens=getattr(r, 'output_tokens', 0),
+        llm_cost_usd=getattr(r, 'cost_usd', Decimal('0')),
     )
 
 

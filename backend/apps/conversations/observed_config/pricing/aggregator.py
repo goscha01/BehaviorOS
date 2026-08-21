@@ -40,10 +40,16 @@ from apps.conversations.observed_config.base import (
 
 
 PRICING_KEY_DIMENSIONS = (
-    'service', 'bedrooms', 'bathrooms',
+    'service', 'service_tier', 'bedrooms', 'bathrooms',
     'square_footage_bucket', 'frequency', 'addons',
     'pricing_basis',
 )
+
+# v3: dimensions that MAY be resolved per quote but do NOT participate
+# in the subject_key hash (raw sqft is fine-grained; the matcher will
+# do interval containment against the configured sqft_min/sqft_max
+# instead of hashing on a bucket). Preserved on value_json.dimension_samples[].
+PRICING_PER_QUOTE_DIMENSIONS = ('square_footage',)
 
 # Descriptive-only fields — retained on the fact for context but NOT
 # used for the diff join. They flow into value_json.observed_attributes.
@@ -160,7 +166,15 @@ def aggregate_and_persist(*, run, per_conv_extractions) -> int:
 
 
 def _normalize_subject_key(key: dict) -> dict:
-    """Coerce values from the LLM into canonical types; drop nulls."""
+    """Coerce values from the LLM into canonical types; drop nulls.
+
+    v3: raw `square_footage` is EXCLUDED from the subject key so that
+    quotes with different sqft still aggregate into the same bucket
+    for stats. The raw sqft is captured on each quote sample so the
+    matcher can do interval containment against configured sqft
+    bounds. `square_footage_bucket` (coarse enum) remains in the
+    subject key for aggregation stability across v2 → v3.
+    """
     out: dict = {}
     for dim in PRICING_KEY_DIMENSIONS:
         v = key.get(dim)
@@ -178,6 +192,48 @@ def _normalize_subject_key(key: dict) -> dict:
             s = str(v).strip().lower()
             if s:
                 out[dim] = s
+    return out
+
+
+def _extract_per_quote_dimensions(entry: dict) -> dict:
+    """Pull the fine-grained dimensions off ONE price entry for
+    matcher use. Returns only keys that the LLM resolved from the
+    conversation. Unknown stays unknown (key omitted).
+
+    Currently pulls raw square_footage (integer) and copies the
+    bedrooms/bathrooms/frequency/addons already in the subject_key
+    for the matcher's convenience.
+    """
+    out: dict = {}
+    subj = entry.get('subject_key') or {}
+    ctx = entry.get('resolved_context') or {}
+    # Raw sqft is per-quote in v3 and NOT hashed into the subject_key.
+    sqft_raw = subj.get('square_footage')
+    if sqft_raw is None:
+        # Fall back to resolved_context if the LLM only populated it
+        # there.
+        ctx_sqft = (ctx.get('square_footage') or {})
+        if isinstance(ctx_sqft, dict):
+            sqft_raw = ctx_sqft.get('value')
+    try:
+        if sqft_raw is not None:
+            out['square_footage'] = int(sqft_raw)
+    except (TypeError, ValueError):
+        pass
+    for k in ('bedrooms', 'bathrooms'):
+        v = subj.get(k)
+        try:
+            if v is not None:
+                out[k] = int(v)
+        except (TypeError, ValueError):
+            pass
+    for k in ('service', 'service_tier', 'frequency', 'pricing_basis'):
+        v = subj.get(k)
+        if v not in (None, ''):
+            out[k] = str(v).strip().lower()
+    addons = subj.get('addons')
+    if isinstance(addons, list) and addons:
+        out['addons'] = sorted([str(a).strip().lower() for a in addons])
     return out
 
 
@@ -201,6 +257,11 @@ class _Bucket:
     _conv_amounts: dict = None
     # v2: observed_attributes (descriptive-only). Never in subject_key.
     observed_attributes: dict = None
+    # v3: per-quote fine-grained dimensions (raw sqft + resolved
+    # context) for the deterministic matcher. Not in the subject_key
+    # (aggregation stability), retained on value_json so the matcher
+    # can evaluate compatibility with configured pricing rules.
+    dimension_samples: list = None
 
     def __post_init__(self):
         self.conversation_ids = set()
@@ -213,6 +274,7 @@ class _Bucket:
         self.quote_samples = []
         self._conv_amounts = {}
         self.observed_attributes = {}
+        self.dimension_samples = []
 
     @property
     def amounts(self) -> list[float]:
@@ -292,11 +354,26 @@ class _Bucket:
                 ),
             })
 
+        # v3: per-quote fine-grained dimensions for the matcher.
+        # Every quote gets a sample, even beyond the 10-sample verbatim
+        # cap, so the matcher has full evidence for interval
+        # containment against configured sqft bounds.
+        per_quote_dims = _extract_per_quote_dimensions(entry)
+        if amount is not None or per_quote_dims:
+            per_quote_dims['amount'] = amount
+            per_quote_dims['conversation_id'] = conversation_id
+            per_quote_dims['turn_id'] = ev.get('quote_turn_id', '')
+            self.dimension_samples.append(per_quote_dims)
+
     def compute_value_json(self) -> dict:
         payload: dict = {
             'fact_type': self.fact_type,
             'currency': 'USD',
             'quotes_sample': self.quote_samples,
+            # v3: matcher input — every quote's raw dimensions.
+            # `square_footage` is the load-bearing signal that
+            # decouples observed from LB's band boundaries.
+            'dimension_samples': self.dimension_samples,
         }
         amounts = self.amounts
         if amounts:
