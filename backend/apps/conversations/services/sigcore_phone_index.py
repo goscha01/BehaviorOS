@@ -3,8 +3,8 @@
 Sigcore's `/conversations` endpoint doesn't support server-side phone
 filtering (verified via probes 2026-08-19: `search=` 500s and other
 attempted params are ignored). Rather than add a new Sigcore endpoint
-just for BehaviorOS, we paginate `/conversations?provider=openphone`
-ONCE per import run and build an in-memory index:
+just for BehaviorOS, we paginate `/conversations` ONCE per import run
+and build an in-memory index:
 
     normalized_e164 -> [sigcore_conv_summary, sigcore_conv_summary, ...]
 
@@ -50,7 +50,7 @@ def build_sigcore_phone_index(
     *,
     sigcore_url: Optional[str] = None,
     sigcore_api_key: Optional[str] = None,
-    provider: str = 'openphone',
+    provider: Optional[str] = None,
     max_pages: int = 1000,
     page_size: int = 100,
 ) -> SigcorePhoneIndex:
@@ -77,7 +77,9 @@ def build_sigcore_phone_index(
     index = SigcorePhoneIndex()
     page = 1
     while page <= max_pages:
-        params = {'page': page, 'limit': page_size, 'provider': provider}
+        params = {'page': page, 'limit': page_size}
+        if provider:
+            params['provider'] = provider
         try:
             resp = session.get(f'{base}/conversations', headers=headers,
                                params=params, timeout=30)
