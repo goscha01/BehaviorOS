@@ -30,6 +30,7 @@ from apps.conversations.api.views import (
     SnapshotLbConfigView,
     TenantBehaviorProfileEffectiveView,
     TenantCandidatesView, TenantConfigAuditView,
+    TenantEvidenceSummaryView,
 )
 
 
@@ -122,6 +123,11 @@ urlpatterns = _router.urls + [
         'audit/tenants',
         TenantCandidatesView.as_view(),
         name='insights-audit-tenants',
+    ),
+    path(
+        'audit/tenant-evidence-summary',
+        TenantEvidenceSummaryView.as_view(),
+        name='insights-audit-tenant-evidence-summary',
     ),
     path(
         'audit/setup/bootstrap-org',

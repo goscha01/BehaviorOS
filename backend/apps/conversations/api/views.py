@@ -386,6 +386,142 @@ class ObservedPricingRunView(APIView):
         )
 
 
+class TenantEvidenceSummaryView(APIView):
+    """GET /api/v1/insights/audit/tenant-evidence-summary?tenantId=<lb_user_id>
+
+    Read-only per-tenant evidence-provenance summary used by LB's
+    Business Learning Setup screen. Reports REAL counts from
+    BehaviorOS's Conversation + LearningCorpus tables — never derived
+    from an unrelated proxy like max(support_n).
+
+    Response shape:
+      {
+        "tenant_external_id": "...",
+        "resolved_for_org_id": "..."|null,
+        "ingested_conversations": {
+          "total": N,
+          "by_source": [ {"source": "openphone", "count": ...},
+                         {"source": "twilio",    "count": ...} ],
+          "earliest_at": iso|null,
+          "latest_at":   iso|null
+        },
+        "latest_corpus": {
+          "id": "...", "name": "...", "version": "...",
+          "member_count": N,          # analyzed_in_corpus
+          "created_at": iso
+        } | null,
+        "latest_reconstruction_run": {
+          "id": "...", "completed_at": iso, "facts_emitted": N
+        } | null,
+        "latest_communication_profile_run": {
+          "id": "...", "completed_at": iso,
+          "corpus_conversations": N,
+          "agent_turns_scanned": N
+        } | null
+      }
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Min, Max
+        from apps.conversations.models import (
+            CommunicationProfileRun, Conversation, LearningCorpus,
+            UnifiedBusinessReconstructionRun,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        snap = (
+            TenantConfigSnapshot.objects
+            .filter(tenant_external_id=tenant)
+            .order_by('-created_at').first()
+        )
+        if snap is None:
+            # Return honest empty response — the LB frontend renders
+            # "not yet ingested" rather than 404.
+            return Response({
+                'tenant_external_id': tenant,
+                'resolved_for_org_id': None,
+                'ingested_conversations': {
+                    'total': 0,
+                    'by_source': [],
+                    'earliest_at': None,
+                    'latest_at': None,
+                },
+                'latest_corpus': None,
+                'latest_reconstruction_run': None,
+                'latest_communication_profile_run': None,
+            })
+        org = snap.org
+        # Per-source ingest counts — from the real Conversation table.
+        by_source = list(
+            Conversation.objects
+            .filter(org=org)
+            .values('source')
+            .annotate(count=Count('id'))
+            .order_by('-count')
+        )
+        agg = Conversation.objects.filter(org=org).aggregate(
+            total=Count('id'),
+            earliest=Min('started_at'),
+            latest=Max('started_at'),
+        )
+        corpus = (
+            LearningCorpus.objects
+            .filter(org=org)
+            .order_by('-created_at').first()
+        )
+        recon = (
+            UnifiedBusinessReconstructionRun.objects
+            .filter(tenant_external_id=tenant, status='completed')
+            .order_by('-created_at').first()
+        )
+        commprofile = (
+            CommunicationProfileRun.objects
+            .filter(
+                tenant_external_id=tenant,
+                status=CommunicationProfileRun.Status.COMPLETED,
+            )
+            .order_by('-created_at').first()
+        )
+        return Response({
+            'tenant_external_id': tenant,
+            'resolved_for_org_id': str(org.id),
+            'ingested_conversations': {
+                'total': agg['total'] or 0,
+                'by_source': [
+                    {'source': r['source'], 'count': r['count']}
+                    for r in by_source
+                ],
+                'earliest_at': (agg['earliest'].isoformat()
+                                if agg['earliest'] else None),
+                'latest_at':   (agg['latest'].isoformat()
+                                if agg['latest'] else None),
+            },
+            'latest_corpus': None if corpus is None else {
+                'id': str(corpus.id),
+                'name': corpus.name,
+                'version': corpus.version,
+                'member_count': corpus.member_count,
+                'created_at': corpus.created_at.isoformat(),
+            },
+            'latest_reconstruction_run': None if recon is None else {
+                'id': str(recon.id),
+                'completed_at': (recon.completed_at.isoformat()
+                                 if recon.completed_at else None),
+                'facts_emitted': recon.facts_emitted,
+            },
+            'latest_communication_profile_run': (None if commprofile is None else {
+                'id': str(commprofile.id),
+                'completed_at': (commprofile.completed_at.isoformat()
+                                 if commprofile.completed_at else None),
+                'corpus_conversations': commprofile.corpus_conversations,
+                'agent_turns_scanned': commprofile.agent_turns_scanned,
+            }),
+        })
+
+
 class BootstrapOrgView(APIView):
     """POST /api/v1/insights/audit/setup/bootstrap-org?lbUserId=<uuid>&orgName=<str>
 
