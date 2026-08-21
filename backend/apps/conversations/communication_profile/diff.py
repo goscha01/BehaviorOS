@@ -40,8 +40,42 @@ logger = logging.getLogger(__name__)
 
 def build_diffs(*, run: CommunicationProfileRun) -> list[CommunicationProfileDiff]:
     """Compute diffs for every registered dimension against the default
-    profile. Idempotent per (run, dimension) via update_or_create."""
+    profile. Idempotent per (run, dimension) via update_or_create.
+
+    Server-side approval carry-forward (2026-08-21):
+      When a dimension already has an active approved override on the
+      current TenantBehaviorProfile AND the fresh diff's observed value
+      is semantically identical to the previously-approved value, the
+      new diff is created with `review_state='accepted'` and the prior
+      approval payload is carried forward as `owner_edited_payload`.
+      A re-analysis that produces the same conclusion MUST NOT make
+      the owner's decision appear undone.
+
+    Rules (from the 2026-08-21 reviewer directive):
+      1. new observed value == active approved value → carry as ACCEPTED
+      2. new observed value differs from approved     → PENDING (no carry)
+      3. new category is SAME_AS_DEFAULT and dimension has active
+         approval → PENDING with a "revert candidate" narrative flag
+      4. new category is INSUFFICIENT_EVIDENCE and dimension has active
+         approval → PENDING with an "evidence weakened" narrative flag
+      5. no active approval → PENDING (normal case)
+    """
+    from apps.conversations.tenant_behavior_profile.service import (
+        get_latest_profile,
+    )
     profile = run.profile_json or {}
+
+    # Load active TBP approvals keyed by dimension (dimension → override).
+    active_by_dim: dict[str, dict] = {}
+    tbp = get_latest_profile(tenant_external_id=run.tenant_external_id)
+    if tbp is not None:
+        for override in (tbp.communication_overrides or []):
+            dim = override.get('dimension')
+            if dim:
+                # Latest approval wins if there are duplicates (shouldn't
+                # be, since approvals dedupe by dimension server-side).
+                active_by_dim[dim] = override
+
     out: list[CommunicationProfileDiff] = []
     for spec in DIMENSIONS:
         path = spec['path']
@@ -51,22 +85,124 @@ def build_diffs(*, run: CommunicationProfileRun) -> list[CommunicationProfileDif
         default = get_default_dimension_value(path)
         diff = _diff_one(observed=observed, default=default,
                          path=path, label=label, section=section)
+
+        # Carry-forward decision.
+        carry = _carry_forward_decision(
+            path=path, diff=diff,
+            active_override=active_by_dim.get(path),
+        )
+
+        defaults = {
+            'category': diff['category'],
+            'default_value': diff['default_value'],
+            'observed_value': diff['observed_value'],
+            'support_n': diff['support_n'],
+            'confidence': diff['confidence'],
+            'narrative': carry.get('narrative_override') or diff['narrative'],
+            'proposed_override': diff['proposed_override'],
+            'evidence_conversation_ids': diff['evidence'],
+            'review_state': carry['review_state'],
+            'reviewed_at': carry.get('reviewed_at'),
+            'owner_edited_payload': carry.get('owner_edited_payload'),
+        }
         obj, _ = CommunicationProfileDiff.objects.update_or_create(
-            run=run,
-            dimension=path,
-            defaults={
-                'category': diff['category'],
-                'default_value': diff['default_value'],
-                'observed_value': diff['observed_value'],
-                'support_n': diff['support_n'],
-                'confidence': diff['confidence'],
-                'narrative': diff['narrative'],
-                'proposed_override': diff['proposed_override'],
-                'evidence_conversation_ids': diff['evidence'],
-            },
+            run=run, dimension=path,
+            defaults=defaults,
         )
         out.append(obj)
     return out
+
+
+def _carry_forward_decision(
+    *, path: str, diff: dict, active_override: dict | None,
+) -> dict:
+    """Decide the fresh diff's review_state relative to any active TBP
+    approval for this dimension. Returns a dict with keys:
+      review_state          — one of ReviewState values
+      owner_edited_payload  — populated when carrying an approval forward
+      reviewed_at           — copied from the prior approval when carrying
+      narrative_override    — surfaces "previously approved" context
+
+    Contract:
+      - Approval source of truth is the active TenantBehaviorProfile,
+        not the previous CommunicationProfileDiff row.
+      - Carry ONLY when observed value is semantically equal to the
+        previously-approved observed value. Otherwise pending.
+      - When the new run says SAME_AS_DEFAULT or INSUFFICIENT_EVIDENCE
+        but the dimension has an active override, DO NOT remove the
+        approval; leave TBP alone and flag the fresh diff for review.
+    """
+    Pending = CommunicationProfileDiff.ReviewState.PENDING
+    Accepted = CommunicationProfileDiff.ReviewState.ACCEPTED
+    if active_override is None:
+        return {'review_state': Pending}
+
+    prior_observed_value = (active_override.get('observed_value') or {}).get('value')
+    prior_payload = active_override.get('payload') or {}
+    prior_approved_at = active_override.get('approved_at')
+    prior_approved_by = active_override.get('approved_by', 'owner')
+    prior_support_n = active_override.get('support_n')
+
+    new_observed_value = (diff.get('observed_value') or {}).get('value')
+    new_category = diff.get('category')
+    new_support_n = diff.get('support_n', 0)
+
+    # Case 3: new run says SAME_AS_DEFAULT but dimension is approved.
+    if new_category == CommunicationProfileDiff.Category.SAME_AS_DEFAULT:
+        return {
+            'review_state': Pending,
+            'narrative_override': (
+                f'Previously approved as {_short(prior_observed_value)} '
+                f'(n={prior_support_n}). New analysis matches the default — '
+                f'you may want to revert this override.'
+            ),
+        }
+
+    # Case 4: new run has insufficient evidence but dimension is approved.
+    if new_category == CommunicationProfileDiff.Category.INSUFFICIENT_EVIDENCE:
+        return {
+            'review_state': Pending,
+            'narrative_override': (
+                f'Previously approved as {_short(prior_observed_value)} '
+                f'(n={prior_support_n}). Fresh analysis does not have '
+                f'enough evidence to confirm the pattern this time — '
+                f'the approval is still active but you may want to review.'
+            ),
+        }
+
+    # Cases 1 + 2: compare canonical proposed values.
+    if _values_equal(new_observed_value, prior_observed_value):
+        # Same conclusion, evidence re-confirmed. Carry the approval forward.
+        return {
+            'review_state': Accepted,
+            'owner_edited_payload': prior_payload,
+            'reviewed_at': _parse_iso(prior_approved_at),
+            'narrative_override': (
+                f'Previously approved · Confirmed again from '
+                f'{new_support_n} agent turns / conversations.'
+            ),
+        }
+
+    # Case 2: value changed materially. Fresh pending decision — never
+    # silently carry the approval to a different recommendation.
+    return {
+        'review_state': Pending,
+        'narrative_override': (
+            f'Previously approved as {_short(prior_observed_value)} '
+            f'(n={prior_support_n}). New analysis suggests '
+            f'{_short(new_observed_value)} (n={new_support_n}) — review.'
+        ),
+    }
+
+
+def _parse_iso(s):
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _observed_at(profile: dict, path: str) -> dict:
