@@ -30,11 +30,14 @@ from apps.conversations.observed_config.base import (
 from apps.conversations.observed_config.pricing.aggregator import (
     _normalize_subject_key,
 )
+from apps.conversations.observed_config.pricing import (
+    config_parser_deterministic,
+)
 
 logger = logging.getLogger(__name__)
 
 
-PRICING_CONFIG_PARSER_VERSION = 'observed-config-pricing-parser-v2'
+PRICING_CONFIG_PARSER_VERSION = 'observed-config-pricing-parser-v3'
 
 
 SYSTEM_PROMPT = '''You normalize a residential-service business's
@@ -137,12 +140,25 @@ def parse_snapshot(
     total_cost = Decimal('0')
     facts_emitted = 0
 
-    # v1 note: many tenants (Spotless included) keep pricing in the
-    # global_ai_prompt prose rather than in service_profile.pricing_json.
-    # We ALWAYS run one LLM call over the global prompt + chat
-    # instructions, in addition to per-service-profile passes for any
-    # structured pricing_json blobs. Every emitted fact carries a
-    # source_pointer identifying which side of the config it came from.
+    # Phase 1: deterministic pass over recognized ServiceProfile
+    # pricing_json shapes (priceTable / cleaningTypes / extras /
+    # hourlyRate). Fine-grained facts per grid cell × service tier ×
+    # frequency, per LB engine semantics. No LLM.
+    det_written, det_handled_profile_ids = (
+        config_parser_deterministic.parse_all_profiles(
+            run=run, snapshot=snapshot,
+            service_profiles=service_profiles,
+        )
+    )
+    facts_emitted += det_written
+    logger.info(
+        'pricing-parser: deterministic pass emitted=%d profiles=%d',
+        det_written, len(det_handled_profile_ids),
+    )
+
+    # Phase 2 (LLM): handle prose sources + any unrecognized
+    # pricing_json shapes. Deterministic-handled profiles are
+    # skipped to avoid double-writing the same subject_key.
     passes: list[dict] = []
     if global_ai_prompt or global_chat_json:
         passes.append({
@@ -160,6 +176,11 @@ def parse_snapshot(
         if isinstance(pricing_json, dict) and not pricing_json:
             pricing_json = None
         if not pricing_json:
+            continue
+        # Deterministic parser already owned this profile — LLM pass
+        # skips it. Prevents subject_key collisions between the two
+        # emitters and avoids paying for an LLM call we don't need.
+        if str(profile.get('id') or '') in det_handled_profile_ids:
             continue
         passes.append({
             'source_kind': 'service_profile_pricing_json',

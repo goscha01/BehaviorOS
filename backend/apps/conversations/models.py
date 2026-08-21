@@ -2350,6 +2350,12 @@ class ReconstructedBusinessFact(BaseModel):
     """
 
     class RelationshipToConfig(models.TextChoices):
+        # Legacy generic values — still emitted by non-pricing verticals
+        # (qualification, faq, service_scope). Kept unchanged so those
+        # pipelines do not require a schema migration or ontology
+        # coordination. Pricing has moved to the four new *_PRICING
+        # values below; other verticals may migrate later on their own
+        # timeline.
         CONFIRMED_BY_BEHAVIOR = (
             'CONFIRMED_BY_BEHAVIOR',
             'Configured rule + observed evidence supports it',
@@ -2381,6 +2387,39 @@ class ReconstructedBusinessFact(BaseModel):
         INSUFFICIENT_EVIDENCE = (
             'INSUFFICIENT_EVIDENCE',
             'Not enough support to classify either way',
+        )
+        # ── Pricing-specific verdicts (2026-08-21). Emitted by the
+        # deterministic pricing matcher only. Semantics per the
+        # 2026-08-21 reviewer directive:
+        #
+        #   MATCH — observed quote falls inside the compatible
+        #     configured rule's tolerance band.
+        #   DIFFERS_FROM_CONFIG — observed quote is comparable to a
+        #     compatible configured rule but sits outside tolerance.
+        #   INSUFFICIENT_CONTEXT_TO_COMPARE — at least one plausible
+        #     configured candidate exists, but the observed context
+        #     lacks the dimension(s) needed to pick among them.
+        #   VARIABLE_CONTEXT_DEPENDENT — observed price distribution
+        #     itself is too heterogeneous to compare.
+        #
+        # OBSERVED_NOT_CONFIGURED (above) is reused for pricing when
+        # NO compatible configured rule exists — not merely when the
+        # service name doesn't match.
+        MATCH = (
+            'MATCH',
+            'Observed quote matches the compatible configured rule',
+        )
+        DIFFERS_FROM_CONFIG = (
+            'DIFFERS_FROM_CONFIG',
+            'Observed quote is outside the compatible configured rule\'s tolerance',
+        )
+        INSUFFICIENT_CONTEXT_TO_COMPARE = (
+            'INSUFFICIENT_CONTEXT_TO_COMPARE',
+            'Configured candidates exist but observed context lacks the dimensions to choose',
+        )
+        VARIABLE_CONTEXT_DEPENDENT = (
+            'VARIABLE_CONTEXT_DEPENDENT',
+            'Observed price distribution is too heterogeneous to compare',
         )
 
     class Consistency(models.TextChoices):
