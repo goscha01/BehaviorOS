@@ -58,6 +58,49 @@ def _new_context_request_id() -> str:
     return 'ctx_' + uuid.uuid4().hex[:24]
 
 
+def _lookup_communication_profile(org):
+    """Advisory communication-profile slot for Callio. Returns None when
+    no approved TenantBehaviorProfile exists for this org. NEVER
+    contains authoritative business decisions — pricing/service/
+    availability/booking state stay with LB. The Callio prompt renderer
+    treats this dict as advisory descriptors of HOW to speak.
+    """
+    if org is None:
+        return None
+    try:
+        from apps.conversations.models import (
+            TenantBehaviorProfile, TenantConfigSnapshot,
+        )
+        snap = (
+            TenantConfigSnapshot.objects
+            .filter(org=org)
+            .order_by('-created_at').first()
+        )
+        if snap is None:
+            return None
+        tbp = (
+            TenantBehaviorProfile.objects
+            .filter(tenant_external_id=snap.tenant_external_id)
+            .order_by('-profile_version').first()
+        )
+        if tbp is None or not tbp.communication_overrides:
+            return None
+        return {
+            'profileVersion': tbp.profile_version,
+            'baseTemplateVersion': tbp.base_template_version,
+            'approvedOverridesCount': len(tbp.communication_overrides),
+            'overrides': tbp.communication_overrides,
+            'advisoryNote': (
+                'Advisory communication style only. Authoritative '
+                'business decisions (pricing, service scope, availability, '
+                'booking state) remain with LeadBridge.'
+            ),
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception('_lookup_communication_profile failed')
+        return None
+
+
 def _resolve_org(tenant_id: str):
     """Map a runtime's tenantId to an Organization.
 
@@ -171,17 +214,43 @@ class ContextView(APIView):
             context_request_id,
         )
 
+        # Attach the approved TenantBehaviorProfile v1 communication
+        # profile as an additive slot on the wire context. It's advisory:
+        # Callio uses it to shape HOW to speak. It NEVER contains
+        # authoritative business decisions (pricing/service/availability/
+        # booking-state) — those remain LB's.
+        comm_slot = _lookup_communication_profile(ctx_request.org)
+
         if not enabled or result.status == 'no_context':
+            # Still allow the communication profile through in this
+            # branch — comm profile is orthogonal to context evidence
+            # and Callio may want it even when there's no customer
+            # history/hints. When BOTH are empty we still return
+            # no_context to preserve the Phase-1 contract.
+            if comm_slot and enabled:
+                return Response(
+                    {
+                        'status': 'context',
+                        'confidence': 0.0,
+                        'context': {'communicationProfile': comm_slot},
+                        'contextRequestId': context_request_id,
+                        'contextVersion': result.context_version or '2.0',
+                    },
+                    status=http_status.HTTP_200_OK,
+                )
             return Response(
                 {'status': 'no_context', 'contextRequestId': context_request_id},
                 status=http_status.HTTP_200_OK,
             )
 
+        wire = dict(result.wire_context) if result.wire_context else {}
+        if comm_slot:
+            wire['communicationProfile'] = comm_slot
         return Response(
             {
                 'status': 'context',
                 'confidence': result.confidence,
-                'context': result.wire_context,
+                'context': wire,
                 'contextRequestId': context_request_id,
                 'contextVersion': result.context_version,
             },

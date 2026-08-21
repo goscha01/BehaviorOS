@@ -2467,3 +2467,219 @@ class ReconstructedBusinessFact(BaseModel):
             f'{self.relationship_to_config} / '
             f'{self.onboarding_class}'
         )
+
+
+# ---------------------------------------------------------------------------
+# CommunicationProfile v1 + TenantBehaviorProfile v1  (MVP)
+# ---------------------------------------------------------------------------
+#
+# BehaviorOS learns HOW a business communicates (comm profile) and WHAT rules
+# it operates by (business reconstruction, above). Owner approves the
+# differences vs LB defaults. Approved output is a single versioned
+# TenantBehaviorProfile — the runtime contract for LB (business overrides)
+# and Callio (communication profile).
+
+
+class CommunicationProfileRun(BaseModel):
+    """One extraction of CommunicationProfileV1 from a LearningCorpus.
+
+    Deterministic aggregation + light LLM classification. Every extracted
+    dimension carries support_n and evidence turn ids so the owner review
+    can trace back to conversations.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='communication_profile_runs',
+    )
+    corpus = models.ForeignKey(
+        LearningCorpus, on_delete=models.CASCADE,
+        related_name='communication_profile_runs',
+    )
+    tenant_external_id = models.CharField(max_length=128, blank=True, default='')
+    profile_version = models.CharField(max_length=64)
+    model = models.CharField(max_length=64, blank=True, default='')
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.PENDING,
+    )
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    corpus_conversations = models.PositiveIntegerField(default=0)
+    agent_turns_scanned = models.PositiveIntegerField(default=0)
+    llm_calls = models.PositiveIntegerField(default=0)
+    llm_cost_usd = models.DecimalField(
+        max_digits=10, decimal_places=4, default=0,
+    )
+    # profile_json shape (see communication_profile/extractor.py):
+    #   {
+    #     "response_style": {"typical_agent_sentences": {value, support_n, ...}, ...},
+    #     "pricing_communication": {"directness": {...}, "examples": [...]},
+    #     "qualification_style": {"questions_per_turn_mode": {...}, ...},
+    #     "booking_style": {...},
+    #     "objection_style": {"patterns": [...]},
+    #     "tone": {"formality": {...}, "characteristic_phrases": [...]}
+    #   }
+    profile_json = models.JSONField(default=dict, blank=True)
+    error_message = models.TextField(blank=True, default='')
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['corpus', 'status']),
+            models.Index(
+                fields=['tenant_external_id', '-created_at'],
+            ),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return (
+            f'CommProfile {self.corpus.name}@{self.corpus.version} '
+            f'{self.profile_version} ({self.status})'
+        )
+
+
+class TenantBehaviorProfile(BaseModel):
+    """One versioned tenant behavior profile: approved overrides on top of
+    LB's default template. This is the RUNTIME contract:
+
+        effective_tenant_behavior
+            = default_template
+            + approved business_rule_overrides
+            + approved custom_business_rules
+            + approved communication_overrides
+
+    Versions are additive-only. Approving a new override creates a NEW
+    profile row with an incremented `profile_version` — never a mutation.
+    LB and Callio consume the latest completed profile for a tenant.
+    """
+
+    org = models.ForeignKey(
+        'accounts.Organization', on_delete=models.CASCADE,
+        related_name='tenant_behavior_profiles',
+    )
+    tenant_external_id = models.CharField(max_length=128)
+    # e.g. "leadbridge-playbook-v1" — the default template we diff against.
+    base_template_version = models.CharField(max_length=64)
+    # Monotonically incremented per (tenant_external_id) as new approvals
+    # accumulate. First profile = 1.
+    profile_version = models.PositiveIntegerField()
+    # Source of truth for what was approved. Each entry has
+    # {source: 'reconstruction_fact'|'communication_diff'|'custom_rule',
+    #  source_id: <fact_id or diff_key or ''>,
+    #  payload: {...},  # verbatim override content
+    #  approved_at: iso,
+    #  approved_by: 'owner' | 'system',
+    #  provenance: {...}}
+    business_rule_overrides = models.JSONField(default=list, blank=True)
+    custom_business_rules = models.JSONField(default=list, blank=True)
+    communication_overrides = models.JSONField(default=list, blank=True)
+    # Correlation IDs so consumers know exactly which BehaviorOS runs the
+    # approvals derive from.
+    reconstruction_run_id = models.UUIDField(null=True, blank=True)
+    communication_profile_run_id = models.UUIDField(null=True, blank=True)
+    generated_at = models.DateTimeField()
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tenant_external_id', 'profile_version'],
+                name='tenant_behavior_profile_version_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['tenant_external_id', '-profile_version'],
+            ),
+        ]
+        ordering = ['-profile_version']
+
+    def __str__(self) -> str:
+        return (
+            f'TenantBehaviorProfile {self.tenant_external_id}'
+            f'@v{self.profile_version}'
+        )
+
+
+class CommunicationProfileDiff(BaseModel):
+    """One computed diff entry between observed CommunicationProfileV1 and
+    the DefaultCommunicationProfileV1. Feeds the owner-review UI.
+
+    Category vocabulary (fixed):
+      SAME_AS_DEFAULT              — no owner action needed
+      DIFFERENT_FROM_DEFAULT       — owner should confirm the override
+      BUSINESS_SPECIFIC            — no default coverage; owner opts in
+      CONFLICTING_OR_UNCLEAR       — mixed signal; owner clarifies
+      INSUFFICIENT_EVIDENCE        — not enough support to propose
+    """
+
+    class Category(models.TextChoices):
+        SAME_AS_DEFAULT = 'SAME_AS_DEFAULT', 'Same as default'
+        DIFFERENT_FROM_DEFAULT = 'DIFFERENT_FROM_DEFAULT', 'Different from default'
+        BUSINESS_SPECIFIC = 'BUSINESS_SPECIFIC', 'Business-specific (no default)'
+        CONFLICTING_OR_UNCLEAR = 'CONFLICTING_OR_UNCLEAR', 'Conflicting or unclear'
+        INSUFFICIENT_EVIDENCE = 'INSUFFICIENT_EVIDENCE', 'Insufficient evidence'
+
+    class ReviewState(models.TextChoices):
+        PENDING = 'pending', 'Pending review'
+        ACCEPTED = 'accepted', 'Accepted by owner'
+        EDITED = 'edited', 'Accepted with owner edit'
+        DISMISSED = 'dismissed', 'Kept as default'
+
+    run = models.ForeignKey(
+        CommunicationProfileRun, on_delete=models.CASCADE,
+        related_name='diffs',
+    )
+    dimension = models.CharField(
+        max_length=64,
+        help_text=(
+            'Dot-path like "response_style.typical_agent_sentences" or '
+            '"pricing_communication.directness".'
+        ),
+    )
+    category = models.CharField(max_length=32, choices=Category.choices)
+    default_value = models.JSONField(default=dict, blank=True)
+    observed_value = models.JSONField(default=dict, blank=True)
+    support_n = models.PositiveIntegerField(default=0)
+    confidence = models.CharField(
+        max_length=16, blank=True, default='',
+        help_text='LOW | MEDIUM | HIGH',
+    )
+    # Human-readable narrative for the review card ("Spotless agents usually
+    # answer pricing questions in 1-2 sentences then ask the next
+    # qualification question").
+    narrative = models.TextField(blank=True, default='')
+    # Proposed override content (what would be persisted on approval).
+    proposed_override = models.JSONField(default=dict, blank=True)
+    evidence_conversation_ids = models.JSONField(default=list, blank=True)
+    review_state = models.CharField(
+        max_length=16, choices=ReviewState.choices,
+        default=ReviewState.PENDING,
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    owner_edited_payload = models.JSONField(
+        null=True, blank=True,
+        help_text='Populated when review_state=EDITED — owner-modified override',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['run', 'dimension'],
+                name='comm_profile_diff_dimension_unique',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['run', 'category']),
+            models.Index(fields=['run', 'review_state']),
+        ]
+        ordering = ['dimension']
+
+    def __str__(self) -> str:
+        return f'CommDiff({self.dimension}) {self.category}'

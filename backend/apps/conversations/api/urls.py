@@ -9,20 +9,26 @@ from django.urls import path
 from rest_framework.routers import SimpleRouter
 
 from apps.conversations.api.views import (
+    AddCustomBusinessRuleView,
+    ApproveCommunicationDiffView, ApproveReconstructedFactView,
     BootstrapOrgView,
+    CommunicationProfileLatestView, CommunicationProfileRunView,
     ConfiguredFaqRunView, ConfiguredPricingRunView,
     ConfiguredQualificationRunView, ConfiguredServiceScopeRunView,
+    DismissCommunicationDiffView,
     ExtractionRunStatusView,
     FreezeCorpusView,
     IngestCorpusView, IngestStatusView,
     ObservedFaqRunView, ObservedPricingRunView,
     ObservedQualificationRunView, ObservedServiceScopeRunView,
+    OwnerReviewPayloadView,
     ReconstructionReportView, ReconstructionRunView,
     RecommendationDetailView, RecommendationLifecycleView,
     RecommendationMeasurementView,
     RecommendationProposalStatusView, RecommendationProposalView,
     RecommendationRunViewSet, RomV1BenchmarkView,
     SnapshotLbConfigView,
+    TenantBehaviorProfileEffectiveView,
     TenantCandidatesView, TenantConfigAuditView,
 )
 
@@ -151,5 +157,46 @@ urlpatterns = _router.urls + [
         'audit/reconstruction/latest',
         ReconstructionReportView.as_view(),
         name='insights-audit-reconstruction-latest',
+    ),
+    # ---- MVP: CommunicationProfile v1 + TenantBehaviorProfile v1 ---------
+    path(
+        'audit/communication-profile/run',
+        CommunicationProfileRunView.as_view(),
+        name='insights-audit-communication-profile-run',
+    ),
+    path(
+        'audit/communication-profile/latest',
+        CommunicationProfileLatestView.as_view(),
+        name='insights-audit-communication-profile-latest',
+    ),
+    path(
+        'audit/owner-review/latest',
+        OwnerReviewPayloadView.as_view(),
+        name='insights-audit-owner-review-latest',
+    ),
+    path(
+        'audit/owner-review/comm-diff/approve',
+        ApproveCommunicationDiffView.as_view(),
+        name='insights-audit-owner-review-comm-diff-approve',
+    ),
+    path(
+        'audit/owner-review/comm-diff/dismiss',
+        DismissCommunicationDiffView.as_view(),
+        name='insights-audit-owner-review-comm-diff-dismiss',
+    ),
+    path(
+        'audit/owner-review/business-rule/approve',
+        ApproveReconstructedFactView.as_view(),
+        name='insights-audit-owner-review-business-rule-approve',
+    ),
+    path(
+        'audit/owner-review/custom-rule',
+        AddCustomBusinessRuleView.as_view(),
+        name='insights-audit-owner-review-custom-rule',
+    ),
+    path(
+        'tenant-behavior-profile/effective',
+        TenantBehaviorProfileEffectiveView.as_view(),
+        name='insights-tenant-behavior-profile-effective',
     ),
 ]

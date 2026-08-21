@@ -800,6 +800,326 @@ class ReconstructionReportView(APIView):
         return Response(report)
 
 
+class CommunicationProfileRunView(APIView):
+    """POST /api/v1/insights/audit/communication-profile/run?tenantId=<lb_user_id>
+
+    Extract CommunicationProfileV1 from the tenant's most recent
+    LearningCorpus. Synchronous — deterministic aggregation is fast,
+    plus one small LLM classification call. Also builds the diff rows
+    against DefaultCommunicationProfileV1 in the same call, so the
+    owner-review payload is immediately available.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.communication_profile.diff import (
+            build_diffs,
+        )
+        from apps.conversations.communication_profile.extractor import (
+            create_run, run_extraction,
+        )
+        from apps.conversations.models import LearningCorpus
+
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        snap = (
+            TenantConfigSnapshot.objects
+            .filter(tenant_external_id=tenant)
+            .order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        corpus = (
+            LearningCorpus.objects
+            .filter(org=snap.org)
+            .order_by('-created_at').first()
+        )
+        if corpus is None:
+            raise NotFound(
+                {'detail': f'no LearningCorpus for tenant {tenant}'}
+            )
+        run = create_run(
+            org=snap.org, corpus=corpus,
+            tenant_external_id=tenant,
+        )
+        run = run_extraction(run=run, llm_client=LearningLLMClient())
+        diffs = build_diffs(run=run)
+        return Response({
+            'run_id': str(run.id),
+            'status': run.status,
+            'profile_version': run.profile_version,
+            'corpus_id': str(run.corpus_id),
+            'corpus_conversations': run.corpus_conversations,
+            'agent_turns_scanned': run.agent_turns_scanned,
+            'llm_calls': run.llm_calls,
+            'llm_cost_usd': str(run.llm_cost_usd),
+            'diffs_emitted': len(diffs),
+            'diff_categories': _count_by(
+                (d.category for d in diffs)
+            ),
+        })
+
+
+class CommunicationProfileLatestView(APIView):
+    """GET /api/v1/insights/audit/communication-profile/latest?tenantId=<lb_user_id>
+
+    Returns the latest completed communication profile + its diff rows.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.conversations.models import (
+            CommunicationProfileDiff, CommunicationProfileRun,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        run = (
+            CommunicationProfileRun.objects
+            .filter(
+                tenant_external_id=tenant,
+                status=CommunicationProfileRun.Status.COMPLETED,
+            )
+            .order_by('-created_at').first()
+        )
+        if run is None:
+            raise NotFound({
+                'detail': (
+                    f'no completed communication profile for tenant {tenant}. '
+                    'Trigger POST /audit/communication-profile/run first.'
+                ),
+            })
+        diffs = list(
+            CommunicationProfileDiff.objects.filter(run=run)
+            .order_by('dimension')
+        )
+        return Response({
+            'run_id': str(run.id),
+            'tenant_external_id': run.tenant_external_id,
+            'profile_version': run.profile_version,
+            'corpus_conversations': run.corpus_conversations,
+            'agent_turns_scanned': run.agent_turns_scanned,
+            'profile': run.profile_json,
+            'diffs': [
+                {
+                    'diff_id': str(d.id),
+                    'dimension': d.dimension,
+                    'category': d.category,
+                    'default': d.default_value,
+                    'observed': d.observed_value,
+                    'support_n': d.support_n,
+                    'confidence': d.confidence,
+                    'narrative': d.narrative,
+                    'proposed_override': d.proposed_override,
+                    'evidence_conversation_ids': d.evidence_conversation_ids,
+                    'review_state': d.review_state,
+                }
+                for d in diffs
+            ],
+        })
+
+
+class OwnerReviewPayloadView(APIView):
+    """GET /api/v1/insights/audit/owner-review/latest?tenantId=<lb_user_id>
+
+    Composed payload the LB AI Insights UI renders: business-rule
+    candidates (from reconstruction) + communication diffs.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.conversations.tenant_behavior_profile.service import (
+            build_owner_review_payload,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        return Response(build_owner_review_payload(tenant_external_id=tenant))
+
+
+class TenantBehaviorProfileEffectiveView(APIView):
+    """GET /api/v1/insights/tenant-behavior-profile/effective?tenantId=<lb_user_id>
+
+    Runtime contract for LB + Callio. Returns the LATEST approved
+    TenantBehaviorProfile in a shape both consumers can walk. Empty
+    override lists when no approvals exist yet — never 404.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.conversations.tenant_behavior_profile.service import (
+            render_effective_profile,
+        )
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        return Response(render_effective_profile(
+            tenant_external_id=tenant,
+        ))
+
+
+class ApproveCommunicationDiffView(APIView):
+    """POST /api/v1/insights/audit/owner-review/comm-diff/approve
+
+    Body:
+      { "tenantId": "...", "diffId": "...", "approvedBy": "owner",
+        "editedPayload": {...} | null }
+
+    Persists the owner's approval as a new TenantBehaviorProfile
+    version. Idempotency: approving the same dimension twice replaces
+    the prior override, not stacks it.
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.tenant_behavior_profile.service import (
+            approve_communication_diff,
+        )
+        body = request.data or {}
+        tenant = (body.get('tenantId') or '').strip()
+        diff_id = (body.get('diffId') or '').strip()
+        approved_by = (body.get('approvedBy') or 'owner').strip()
+        edited = body.get('editedPayload')
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        if not diff_id:
+            raise ValidationError({'diffId': 'required'})
+        try:
+            tbp = approve_communication_diff(
+                tenant_external_id=tenant, diff_id=diff_id,
+                approved_by=approved_by, edited_payload=edited,
+            )
+        except ValueError as exc:
+            raise ValidationError({'detail': str(exc)})
+        return Response({
+            'tenant_behavior_profile_id': str(tbp.id),
+            'profile_version': tbp.profile_version,
+            'communication_overrides_count': len(
+                tbp.communication_overrides or [],
+            ),
+        }, status=http_status.HTTP_201_CREATED)
+
+
+class DismissCommunicationDiffView(APIView):
+    """POST /api/v1/insights/audit/owner-review/comm-diff/dismiss
+
+    Body: { "diffId": "..." }
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.tenant_behavior_profile.service import (
+            dismiss_communication_diff,
+        )
+        body = request.data or {}
+        diff_id = (body.get('diffId') or '').strip()
+        if not diff_id:
+            raise ValidationError({'diffId': 'required'})
+        d = dismiss_communication_diff(diff_id=diff_id)
+        return Response({
+            'diff_id': str(d.id),
+            'review_state': d.review_state,
+        })
+
+
+class ApproveReconstructedFactView(APIView):
+    """POST /api/v1/insights/audit/owner-review/business-rule/approve
+
+    Body:
+      { "tenantId": "...", "factId": "...",
+        "approvedBy": "owner",
+        "editedPayload": {...} | null }
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.tenant_behavior_profile.service import (
+            approve_reconstructed_fact,
+        )
+        body = request.data or {}
+        tenant = (body.get('tenantId') or '').strip()
+        fact_id = (body.get('factId') or '').strip()
+        approved_by = (body.get('approvedBy') or 'owner').strip()
+        edited = body.get('editedPayload')
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        if not fact_id:
+            raise ValidationError({'factId': 'required'})
+        try:
+            tbp = approve_reconstructed_fact(
+                tenant_external_id=tenant, fact_id=fact_id,
+                approved_by=approved_by, edited_payload=edited,
+            )
+        except ValueError as exc:
+            raise ValidationError({'detail': str(exc)})
+        return Response({
+            'tenant_behavior_profile_id': str(tbp.id),
+            'profile_version': tbp.profile_version,
+            'business_rule_overrides_count': len(
+                tbp.business_rule_overrides or [],
+            ),
+        }, status=http_status.HTTP_201_CREATED)
+
+
+class AddCustomBusinessRuleView(APIView):
+    """POST /api/v1/insights/audit/owner-review/custom-rule
+
+    Body:
+      { "tenantId": "...", "section": "pricing_guidance",
+        "ruleText": "..." }
+    """
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.conversations.tenant_behavior_profile.service import (
+            add_custom_business_rule,
+        )
+        body = request.data or {}
+        tenant = (body.get('tenantId') or '').strip()
+        section = (body.get('section') or '').strip()
+        rule_text = (body.get('ruleText') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        if not section:
+            raise ValidationError({'section': 'required'})
+        if not rule_text:
+            raise ValidationError({'ruleText': 'required'})
+        snap = (
+            TenantConfigSnapshot.objects
+            .filter(tenant_external_id=tenant)
+            .order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        tbp = add_custom_business_rule(
+            org=snap.org, tenant_external_id=tenant,
+            section=section, rule_text=rule_text,
+        )
+        return Response({
+            'tenant_behavior_profile_id': str(tbp.id),
+            'profile_version': tbp.profile_version,
+            'custom_business_rules_count': len(
+                tbp.custom_business_rules or [],
+            ),
+        }, status=http_status.HTTP_201_CREATED)
+
+
+def _count_by(iterable) -> dict:
+    out: dict = {}
+    for k in iterable:
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
 class ObservedServiceScopeRunView(APIView):
     """POST /api/v1/insights/audit/observed-service-scope/run?tenantId=<uuid>[&limit=N]
     Ship D. Async, 202."""
