@@ -36,8 +36,14 @@ from apps.conversations.observed_config.base import (
 from apps.conversations.observed_config.pricing.prompt import (
     PRICING_EXTRACTOR_VERSION, SYSTEM_PROMPT, build_user_prompt,
 )
-from apps.conversations.observed_config.pricing.lead_metadata import (
-    extract_dimensions_from_lead,
+from apps.conversations.context import (
+    Attr,
+    Authority,
+    Observation,
+    resolve_conversation_context,
+)
+from apps.conversations.context.lb_client import (
+    LeadBridgeContextClient,
 )
 from apps.conversations.semantic.preprocessing import (
     ConversationChunk,
@@ -137,28 +143,35 @@ def extract_from_conversation(
         for p in aggregated_prices:
             p.setdefault('_truncated', True)
 
-    # 2026-08-22 enrichment: for every extracted quote, backfill
-    # missing bed/bath/sqft from the LB lead payload attached to
-    # this conversation (Thumbtack/Yelp/Callio lead metadata lives
-    # on OutcomeSnapshot.source_payload['lb_lead']). Rationale: the
-    # customer/team never restates the dimensions in the SMS
-    # thread — LB already knows them from the lead. Extractor
-    # respects "unknown stays unknown" on the CONVERSATION side but
-    # can trust the LB LEAD metadata as authoritative request
-    # context.
-    lead_dims = extract_dimensions_from_lead(conv)
-    if lead_dims:
+    # 2026-08-22 v5: enrichment goes through the canonical context
+    # resolver (apps.conversations.context). The resolver:
+    #   1. Fetches semantic attributes from LB via the canonical
+    #      /api/v1/learning/leads/context endpoint (LB is
+    #      authoritative for Thumbtack/Yelp payload parsing —
+    #      BehaviorOS never re-parses provider payloads).
+    #   2. Accepts our per-price P3 resolved_context as
+    #      conversation observations so both sources feed the
+    #      precedence engine.
+    #   3. Applies source/time/authority-aware precedence,
+    #      preserves conflicts, and produces one canonical
+    #      attribute set per conversation.
+    #
+    # We then backfill each price's subject_key from the canonical
+    # attributes for any dimension the LLM did not resolve —
+    # preserves the "existing LLM-resolved value wins over
+    # canonical" behavior when a price is quote-specific
+    # ("for 4BR that would be…" different from lead's 3BR default).
+    canonical_ctx = _resolve_canonical_context(conv, aggregated_prices)
+    if canonical_ctx is not None:
         for p in aggregated_prices:
             subj = p.setdefault('subject_key', {})
-            if subj.get('bedrooms') in (None, '') and 'bedrooms' in lead_dims:
-                subj['bedrooms'] = lead_dims['bedrooms']
-            if subj.get('bathrooms') in (None, '') and 'bathrooms' in lead_dims:
-                subj['bathrooms'] = lead_dims['bathrooms']
-            if subj.get('square_footage') in (None, '') and 'square_footage' in lead_dims:
-                subj['square_footage'] = lead_dims['square_footage']
-            # Record provenance so a debug view can distinguish
-            # lead-derived from conversation-derived dimensions.
-            p.setdefault('_lead_metadata_used', True)
+            for attr_name, canon_key in _PRICE_TO_CANONICAL:
+                if subj.get(canon_key) in (None, ''):
+                    val = canonical_ctx.get(attr_name)
+                    if val is not None:
+                        subj[canon_key] = val
+            # Provenance flag for debug views.
+            p.setdefault('_canonical_context_used', True)
 
     return PerConversationExtraction(
         conversation_id=str(conv.id),
@@ -168,6 +181,113 @@ def extract_from_conversation(
         llm_output_tokens=getattr(r, 'output_tokens', 0),
         llm_cost_usd=getattr(r, 'cost_usd', Decimal('0')),
     )
+
+
+# Ordered pairs of (canonical Attr name, subject_key field name).
+# Kept as a constant so both the resolver call-site and any future
+# consumer share the exact same enrichment surface.
+_PRICE_TO_CANONICAL: tuple[tuple[str, str], ...] = (
+    (Attr.BEDROOMS, 'bedrooms'),
+    (Attr.BATHROOMS, 'bathrooms'),
+    (Attr.SQUARE_FOOTAGE, 'square_footage'),
+    (Attr.FREQUENCY, 'frequency'),
+    (Attr.SERVICE, 'service'),
+    (Attr.SERVICE_TIER, 'service_tier'),
+)
+
+
+def _resolve_canonical_context(conv, aggregated_prices: list[dict]):
+    """Build the CanonicalConversationContext for this conversation.
+
+    Feeds two source families into the resolver:
+      * LB canonical lead context (via HTTP).
+      * Conversation observations derived from each price's P3
+        resolved_context (turn_id + source_text).
+
+    Returns None on any unrecoverable failure so the extractor can
+    still ship prices with LLM-only dimensions.
+    """
+    from apps.conversations.models import (
+        TenantConfigSnapshot as _TCS,
+    )
+    try:
+        snap = (
+            _TCS.objects
+            .filter(org=conv.org, source_system='leadbridge')
+            .order_by('-created_at').first()
+        )
+        lb_user_id = snap.tenant_external_id if snap else None
+    except Exception:  # noqa: BLE001
+        lb_user_id = None
+
+    lb_client = LeadBridgeContextClient(lb_user_id=lb_user_id) if lb_user_id else None
+    if lb_client is not None and not lb_client.configured:
+        lb_client = None
+
+    conv_observations = _observations_from_prices(conv, aggregated_prices)
+
+    try:
+        return resolve_conversation_context(
+            conv,
+            conversation_observations=conv_observations,
+            lb_context_client=lb_client,
+            lb_user_id=lb_user_id,
+            use_cache=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            'canonical context resolution failed for conv=%s: %s '
+            '— continuing with LLM-only dimensions',
+            conv.id, exc,
+        )
+        return None
+
+
+def _observations_from_prices(conv, prices: list[dict]) -> list[Observation]:
+    """Convert each price's P3 resolved_context sidecar into
+    CONVERSATION_LLM observations for the precedence engine.
+
+    P3 shape (per prompt.py):
+        resolved_context: {
+          "bedrooms": {"value": 3, "source_turn_id": "t...", "source_text": "..."},
+          "bathrooms": {"value": 2, ...},
+          "square_footage": {"value": 1800, ...},
+          "frequency": {"value": "monthly", ...},
+          "service": {"value": "cleaning", ...},
+          "service_tier": {"value": "regular", ...},
+          "addons": {"value": [...], "source_turn_ids": [...], ...}
+        }
+
+    A null / missing key means "unknown" — no observation emitted for
+    that attribute.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    conv_started = getattr(conv, 'started_at', None) or _dt.now(_tz.utc)
+    obs: list[Observation] = []
+    for price in prices:
+        rc = price.get('resolved_context') or {}
+        if not isinstance(rc, dict):
+            continue
+        for attr_name, canon_key in _PRICE_TO_CANONICAL:
+            entry = rc.get(canon_key)
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get('value')
+            if value is None or value == '':
+                continue
+            turn_id = entry.get('source_turn_id') or 'unknown'
+            source_text = entry.get('source_text')
+            obs.append(Observation(
+                attribute=attr_name,
+                value=value,
+                source='conversation',
+                source_field=f'price_resolved_context:{turn_id}',
+                observed_at=conv_started,
+                authority=Authority.CONVERSATION_LLM,
+                text=(str(source_text)[:400] if source_text else None),
+                source_version=f'pricing-extractor:{PRICING_EXTRACTOR_VERSION}',
+            ))
+    return obs
 
 
 def _validate_prices(entries: list) -> list[dict]:

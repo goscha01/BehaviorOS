@@ -2722,3 +2722,79 @@ class CommunicationProfileDiff(BaseModel):
 
     def __str__(self) -> str:
         return f'CommDiff({self.dimension}) {self.category}'
+
+
+# ---------------------------------------------------------------------------
+# Canonical Conversation Context (Phase 3 — one-to-one persistence cache)
+# ---------------------------------------------------------------------------
+
+
+class ConversationContext(BaseModel):
+    """Canonical semantic context resolved for one conversation.
+
+    Owned by `apps.conversations.context`. Persists the winning
+    canonical attributes AND all raw observations (losers included)
+    so downstream analyzers can render conflict flags rather than
+    silently trusting a resolver decision.
+
+    Cache invariant: the row is valid iff `source_versions_json`
+    matches what the resolver would compute now. Any source moving
+    (LB lead updated_at, extractor version bump, new conversation
+    turn) invalidates the row and forces a rebuild. See
+    `apps.conversations.context.service` for the get-or-build flow.
+
+    Design notes:
+      * One-to-one with Conversation (unique row per conversation).
+      * JSON columns instead of a normalized attributes table —
+        attribute set is small (~7) and the payload is read together;
+        an extra join per pricing verdict is not worth the schema
+        complexity.
+      * Never authoritative — always rebuildable from sources.
+    """
+
+    conversation = models.OneToOneField(
+        Conversation,
+        on_delete=models.CASCADE,
+        related_name='canonical_context',
+    )
+    resolved_at = models.DateTimeField()
+
+    # Cache-invalidation fingerprint. Shape:
+    #   {
+    #     'lb_lead:<uuid>': {'lead_id', 'platform', 'updated_at', 'mapping_version'},
+    #     'conversation_observations': {'conversation_id', 'count'},
+    #     'outcome_snapshot': {'captured_at'},
+    #   }
+    source_versions_json = models.JSONField(default=dict, blank=True)
+
+    # Winning value per attribute. Shape:
+    #   {'bedrooms': {'value': 3, 'winning_observation_index': 0, 'reason': '...'}, ...}
+    attributes_json = models.JSONField(default=dict, blank=True)
+
+    # All observations per attribute (winners + losers, deterministically ordered).
+    # Shape:
+    #   {'bedrooms': [{'attribute': 'bedrooms', 'value': 3, 'source': 'leadbridge',
+    #                  'source_field': '...', 'observed_at': '...',
+    #                  'authority': 'source_structured', ...}, ...], ...}
+    observations_json = models.JSONField(default=dict, blank=True)
+
+    # Conflict reports per attribute (only present where observations disagreed).
+    # Shape:
+    #   {'bedrooms': {'attribute': 'bedrooms', 'winning_value': 3,
+    #                 'losing_values': [4], 'severity': 'warning', 'explanation': '...'}}
+    conflicts_json = models.JSONField(default=dict, blank=True)
+
+    # Per-attribute coverage summary for diagnostics.
+    # Shape:
+    #   {'bedrooms': {'known': True, 'source': 'leadbridge',
+    #                 'authority': 'source_structured', 'source_field': '...'}, ...}
+    coverage_json = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['-resolved_at']),
+        ]
+        ordering = ['-resolved_at']
+
+    def __str__(self) -> str:
+        return f'ConversationContext({self.conversation_id})@{self.resolved_at.isoformat()}'
