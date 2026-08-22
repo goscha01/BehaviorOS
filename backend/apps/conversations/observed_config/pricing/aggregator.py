@@ -35,7 +35,7 @@ from apps.conversations.models import (
     Conversation, ObservedBusinessFact,
 )
 from apps.conversations.observed_config.base import (
-    canonical_subject_key, normalize_service,
+    canonical_subject_key, normalize_frequency, normalize_service,
 )
 
 
@@ -195,6 +195,12 @@ def _normalize_subject_key(key: dict) -> dict:
             normalized = normalize_service(v)
             if normalized:
                 out[dim] = normalized
+        elif dim == 'frequency':
+            # Fold `one-time`/`once`, `every-two-weeks`/`biweekly`,
+            # etc. so string compat matches LB frequencyDiscounts keys.
+            normalized = normalize_frequency(v)
+            if normalized:
+                out[dim] = normalized
         else:
             s = str(v).strip().lower()
             if s:
@@ -239,6 +245,10 @@ def _extract_per_quote_dimensions(entry: dict) -> dict:
         if v not in (None, ''):
             if k == 'service':
                 normalized = normalize_service(v)
+                if normalized:
+                    out[k] = normalized
+            elif k == 'frequency':
+                normalized = normalize_frequency(v)
                 if normalized:
                     out[k] = normalized
             else:

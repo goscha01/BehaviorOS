@@ -109,6 +109,48 @@ def normalize_service(raw: str | None) -> str | None:
     return _SERVICE_ALIASES.get(s, s)
 
 
+# Frequency aliases: LB frequencyDiscounts uses the keys `once`,
+# `weekly`, `biweekly`, `monthly`. The observed pricing extractor
+# prompt v3 emits `one-time`, `weekly`, `biweekly`, `monthly`. Full-
+# corpus Spotless verification (2026-08-22) showed 11 observed
+# conversations for `regular cleaning · one-time · flat_job` at
+# median $209 landing as OBSERVED_NOT_CONFIGURED purely because
+# `one-time` ≠ `once` in the string compat check — real signal
+# lost to a naming mismatch. Both sides funnel through
+# normalize_frequency so `once` and `one-time` collapse to the
+# same canonical value.
+_FREQUENCY_ALIASES: dict[str, str] = {
+    'once': 'once',
+    'one-time': 'once',
+    'one_time': 'once',
+    'onetime': 'once',
+    'single': 'once',
+    'weekly': 'weekly',
+    'every_week': 'weekly',
+    'every-week': 'weekly',
+    'biweekly': 'biweekly',
+    'bi-weekly': 'biweekly',
+    'bi_weekly': 'biweekly',
+    'every_two_weeks': 'biweekly',
+    'every-two-weeks': 'biweekly',
+    'every_other_week': 'biweekly',
+    'monthly': 'monthly',
+    'every_month': 'monthly',
+    'every-month': 'monthly',
+}
+
+
+def normalize_frequency(raw: str | None) -> str | None:
+    """Fold LB and observed-extractor frequency labels onto a single
+    canonical string. Unknown strings pass through lowercased."""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    return _FREQUENCY_ALIASES.get(s, s)
+
+
 def dimensions_are_compatible(
     a_dims: list[str], b_dims: list[str],
 ) -> str:
