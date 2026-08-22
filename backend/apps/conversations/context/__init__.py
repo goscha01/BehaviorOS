@@ -50,6 +50,9 @@ from apps.conversations.context.resolver import (
     resolve_conversation_context,
 )
 from apps.conversations.context.types import (
+    ALL_ATTRIBUTES,
+    STABLE_ATTRIBUTES,
+    Attr,
     Authority,
     CanonicalAttribute,
     CanonicalConversationContext,
@@ -58,6 +61,9 @@ from apps.conversations.context.types import (
 )
 
 __all__ = [
+    'ALL_ATTRIBUTES',
+    'STABLE_ATTRIBUTES',
+    'Attr',
     'Authority',
     'CanonicalAttribute',
     'CanonicalConversationContext',
