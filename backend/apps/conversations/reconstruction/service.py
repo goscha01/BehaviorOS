@@ -313,11 +313,11 @@ def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
                 'median': v.price_comparison['observed_median'],
                 'support_n': v.price_comparison['sample_n'],
             }
-        onboarding_class, rationale = _pricing_onboarding_class(
-            relationship=v.verdict,
+        onboarding_class, rationale = _pricing_cell_onboarding_class(
+            verdict=v.verdict,
             consistency=v.consistency,
-            support=len(v.unique_samples),
-            quality_flags=[],
+            unique_samples=len(v.unique_samples),
+            partial_samples=len(v.partial_samples),
         )
         # Cell verdicts pass through _persist with the cell as the
         # `configured` side. `observed=None` intentionally — the
@@ -861,6 +861,65 @@ def _configured_amount(value_json: dict) -> Optional[float]:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _pricing_cell_onboarding_class(
+    *, verdict: str, consistency: str,
+    unique_samples: int, partial_samples: int,
+) -> tuple:
+    """Onboarding class for a config-anchored pricing cell verdict.
+
+    Cell rows are ALWAYS shown to the owner — they represent LB's own
+    configured pricing table, which the owner presumably wants to
+    review. DO_NOT_PROPOSE is never returned here (the payload
+    filter would hide the cell). The verdict itself drives the
+    display state; the onboarding class just controls whether the
+    row lands in the "safe" bucket or "needs a look" bucket on the
+    LB frontend.
+
+    MATCH                              → SAFE_TO_PROPOSE (confirm)
+    DIFFERS_FROM_CONFIG                → NEEDS_OWNER_CONFIRMATION (fix)
+    INSUFFICIENT_CONTEXT_TO_COMPARE    → NEEDS_OWNER_CONFIRMATION (informational)
+    VARIABLE_CONTEXT_DEPENDENT         → NEEDS_OWNER_CONFIRMATION
+    CONFIGURED_NOT_OBSERVED            → NEEDS_OWNER_CONFIRMATION (remove or keep)
+    """
+    RTC = ReconstructedBusinessFact.RelationshipToConfig
+    OC = ReconstructedBusinessFact.OnboardingClass
+    if verdict == RTC.MATCH:
+        return (
+            OC.SAFE_TO_PROPOSE,
+            f'observed evidence ({unique_samples} unique quotes) '
+            f'confirms this configured cell',
+        )
+    if verdict == RTC.DIFFERS_FROM_CONFIG:
+        return (
+            OC.NEEDS_OWNER_CONFIRMATION,
+            f'observed quotes ({unique_samples} unique) fall outside '
+            f'this cell\'s configured amount tolerance',
+        )
+    if verdict == RTC.INSUFFICIENT_CONTEXT_TO_COMPARE:
+        return (
+            OC.NEEDS_OWNER_CONFIRMATION,
+            f'{unique_samples} uniquely-attributed + {partial_samples} '
+            f'partial-evidence observed quotes; not enough to compare '
+            'confidently',
+        )
+    if verdict == RTC.VARIABLE_CONTEXT_DEPENDENT:
+        return (
+            OC.NEEDS_OWNER_CONFIRMATION,
+            'observed quote distribution too heterogeneous to compare '
+            'with a single configured amount',
+        )
+    if verdict == RTC.CONFIGURED_NOT_OBSERVED:
+        return (
+            OC.NEEDS_OWNER_CONFIRMATION,
+            'this configured cell has not been observed in any '
+            'conversation yet',
+        )
+    return (
+        OC.NEEDS_OWNER_CONFIRMATION,
+        f'verdict={verdict}',
+    )
 
 
 def _pricing_onboarding_class(
