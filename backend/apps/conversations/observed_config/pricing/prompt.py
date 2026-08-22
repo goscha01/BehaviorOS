@@ -1,6 +1,21 @@
 """Pricing extractor prompt v3 — whole-conversation dimension
 resolution.
 
+v4 -> v5 changes (2026-08-22, driven by Canonical Context
+Resolution Layer):
+  - Extractor now feeds each price's `resolved_context` into
+    `apps.conversations.context` as CONVERSATION_LLM observations.
+    The canonical resolver merges them with LB SOURCE_STRUCTURED
+    context from `/api/v1/learning/leads/context` and applies
+    source/time/authority-aware precedence.
+  - Backfill of missing subject_key dimensions now sources from
+    the canonical attributes (not `lead_metadata.py` — which is
+    deleted). LLM-resolved dims on the price still win over
+    canonical (quote-specific > lead-default).
+  - Prompt itself unchanged from v4 — the version bump is purely
+    to invalidate old-code v4 facts so a fresh reconstruction
+    doesn't mix pre-refactor + post-refactor rows in one corpus.
+
 v2 -> v3 changes (2026-08-21, driven by Spotless 1D pricing
 comparison acceptance):
   - Whole-conversation input. v2 chunked the conversation and each
@@ -34,7 +49,7 @@ Retains v2 semantics:
 from __future__ import annotations
 
 
-PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v4'
+PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v5'
 
 
 SYSTEM_PROMPT = '''You extract pricing facts from residential-service
