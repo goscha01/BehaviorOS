@@ -21,6 +21,7 @@ from apps.conversations.api.views import (
     IngestCorpusView, IngestStatusView,
     ObservedFaqRunView, ObservedPricingRunView,
     ObservedQualificationRunView, ObservedServiceScopeRunView,
+    LeadMetadataCoverageView,
     OwnerReviewPayloadView,
     PricingAcceptanceReportView,
     ReconstructionReportView, ReconstructionRunView,
@@ -134,6 +135,11 @@ urlpatterns = _router.urls + [
         'audit/pricing-1d-acceptance',
         PricingAcceptanceReportView.as_view(),
         name='insights-audit-pricing-1d-acceptance',
+    ),
+    path(
+        'audit/lead-metadata-coverage',
+        LeadMetadataCoverageView.as_view(),
+        name='insights-audit-lead-metadata-coverage',
     ),
     path(
         'audit/setup/bootstrap-org',

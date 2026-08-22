@@ -1597,6 +1597,129 @@ class ExtractionRunStatusView(APIView):
         })
 
 
+class LeadMetadataCoverageView(APIView):
+    """GET /api/v1/insights/audit/lead-metadata-coverage?tenantId=<uuid>
+
+    Diagnostic: for the tenant's ingested conversations, report how
+    many have an OutcomeSnapshot carrying `source_payload['lb_lead']`,
+    and how many of those payloads actually contain
+    bedrooms / bathrooms / sqft. Answers "does my pricing extractor's
+    v4 lead-metadata enrichment have anything to enrich?" without
+    guessing.
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.conversations.models import (
+            Conversation as _Conv,
+            OutcomeSnapshot as _OS,
+            TenantConfigSnapshot as _TCS,
+        )
+        from apps.conversations.observed_config.pricing.lead_metadata import (
+            extract_dimensions_from_lead,
+        )
+
+        tenant = (request.query_params.get('tenantId') or '').strip()
+        if not tenant:
+            raise ValidationError({'tenantId': 'required'})
+        snap = (
+            _TCS.objects
+            .filter(tenant_external_id=tenant)
+            .order_by('-created_at').first()
+        )
+        if snap is None:
+            raise NotFound({'detail': f'no snapshot for tenant {tenant}'})
+        org_id = snap.org_id
+
+        convs = _Conv.objects.filter(org_id=org_id)
+        total_convs = convs.count()
+        by_source: dict = {}
+        for c in convs.values('source').distinct():
+            by_source[c['source']] = convs.filter(source=c['source']).count()
+
+        # How many conversations have at least one OutcomeSnapshot?
+        conv_ids_with_os = set(
+            _OS.objects.filter(conversation__org_id=org_id)
+            .values_list('conversation_id', flat=True).distinct()
+        )
+        with_os = len(conv_ids_with_os)
+
+        # How many have OutcomeSnapshot with non-empty source_payload?
+        with_payload_conv_ids = set(
+            _OS.objects.filter(conversation__org_id=org_id)
+            .exclude(source_payload={})
+            .values_list('conversation_id', flat=True).distinct()
+        )
+        with_payload = len(with_payload_conv_ids)
+
+        # For a small sample, check what dimensions the enricher
+        # actually returns.
+        sample_size = 30
+        sample_convs = list(
+            convs.filter(id__in=with_payload_conv_ids)[:sample_size]
+        )
+        sample_stats = {
+            'sample_size': len(sample_convs),
+            'with_bedrooms': 0,
+            'with_bathrooms': 0,
+            'with_square_footage': 0,
+            'with_service_hint': 0,
+            'with_any_dim': 0,
+            'examples': [],
+        }
+        for c in sample_convs:
+            dims = extract_dimensions_from_lead(c)
+            if 'bedrooms' in dims:
+                sample_stats['with_bedrooms'] += 1
+            if 'bathrooms' in dims:
+                sample_stats['with_bathrooms'] += 1
+            if 'square_footage' in dims:
+                sample_stats['with_square_footage'] += 1
+            if 'service_hint' in dims:
+                sample_stats['with_service_hint'] += 1
+            if any(k in dims for k in ('bedrooms', 'bathrooms', 'square_footage')):
+                sample_stats['with_any_dim'] += 1
+            if len(sample_stats['examples']) < 5:
+                sample_stats['examples'].append({
+                    'conversation_id': str(c.id),
+                    'source': c.source,
+                    'resolved_dimensions': dims,
+                })
+
+        # Peek at the raw lb_lead top-level keys on the first sampled
+        # conversation so the operator can eyeball what fields ARE
+        # in the payload (helps us map new field-name aliases if
+        # extract_dimensions_from_lead misses common Quo/Sigcore keys).
+        raw_lb_lead_keys_sample = None
+        if sample_convs:
+            first_os = (
+                _OS.objects.filter(conversation=sample_convs[0])
+                .exclude(source_payload={}).order_by('-captured_at').first()
+            )
+            if first_os is not None:
+                lb_lead = (first_os.source_payload or {}).get('lb_lead')
+                if isinstance(lb_lead, dict):
+                    raw_lb_lead_keys_sample = sorted(lb_lead.keys())
+
+        return Response({
+            'tenant_external_id': tenant,
+            'org_id': str(org_id),
+            'ingest': {
+                'total_conversations': total_convs,
+                'by_source': by_source,
+                'with_outcome_snapshot': with_os,
+                'with_source_payload': with_payload,
+                'coverage_pct': (
+                    round(100.0 * with_payload / max(total_convs, 1), 1)
+                ),
+            },
+            'lead_metadata_enrichment_sample': sample_stats,
+            'raw_lb_lead_top_level_keys_sample': raw_lb_lead_keys_sample,
+        })
+
+
 class PricingAcceptanceReportView(APIView):
     """GET /api/v1/insights/audit/pricing-1d-acceptance?tenantId=<uuid>[&per_category=N]
 
