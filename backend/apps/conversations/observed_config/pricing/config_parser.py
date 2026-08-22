@@ -37,7 +37,7 @@ from apps.conversations.observed_config.pricing import (
 logger = logging.getLogger(__name__)
 
 
-PRICING_CONFIG_PARSER_VERSION = 'observed-config-pricing-parser-v3'
+PRICING_CONFIG_PARSER_VERSION = 'observed-config-pricing-parser-v4'
 
 
 SYSTEM_PROMPT = '''You normalize a residential-service business's

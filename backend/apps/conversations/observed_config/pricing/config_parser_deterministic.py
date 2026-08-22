@@ -56,7 +56,7 @@ from apps.conversations.observed_config.base import (
 
 logger = logging.getLogger(__name__)
 
-DETERMINISTIC_PARSER_VERSION = 'observed-config-pricing-parser-deterministic-v1'
+DETERMINISTIC_PARSER_VERSION = 'observed-config-pricing-parser-deterministic-v2'
 
 # LB frequency keys → BehaviorOS canonical frequency labels.
 # BehaviorOS keeps LB's exact key strings so subject-key matching is
@@ -117,18 +117,18 @@ def parse_service_profile(
     # cleaningTypes: infer tiers from row keys.
     if not enabled_tiers and price_table:
         enabled_tiers = _infer_tiers_from_rows(price_table)
-    freq_by_key = {
-        (fd.get('key') or '').lower(): fd
-        for fd in frequency_discounts
-        if isinstance(fd, dict)
-    }
-    # Always emit a `once` variant even if LB doesn't declare it.
-    if 'once' not in freq_by_key:
-        freq_by_key['once'] = {'key': 'once', 'label': 'One Time', 'discount': 0}
 
     written = 0
 
-    # Grid rows × tiers × frequencies.
+    # Grid rows × tiers. LB's actual pricing table is ONE ROW per
+    # (bed, bath, sqft) with COLUMNS per service_tier. Frequency is
+    # a GLOBAL discount % (frequencyDiscounts[]) applied at runtime,
+    # NOT a separate row. We emit ONE base cell per (row × tier) and
+    # emit frequency discounts as their own separate facts below.
+    #
+    # Previous version multiplied cells by frequency, producing 4×
+    # phantom rows like "1BR/1BA · Regular · Weekly" that don't
+    # exist in the LB pricing_table. Fixed 2026-08-22.
     for row_index, row in enumerate(price_table):
         if not isinstance(row, dict):
             continue
@@ -142,59 +142,81 @@ def parse_service_profile(
             base_amount = _as_float(row.get(tier_key))
             if base_amount is None or base_amount <= 0:
                 continue
-            for freq_key, fd in freq_by_key.items():
-                discount_pct = _as_float(fd.get('discount')) or 0.0
-                amount = _apply_frequency_discount(
-                    base_amount, discount_pct,
-                )
-                subject = {
-                    'service': service_slug,
-                    'service_tier': tier_key,
-                    'bedrooms': bed,
-                    'bathrooms': bath,
-                    'frequency': freq_key,
-                    'pricing_basis': 'flat_job',
-                }
-                # Preserve raw sqft interval — matcher does
-                # `observed_sqft ∈ [sqft_min, sqft_max]`. When LB
-                # rows omit sqft bounds, the fact still emits but
-                # the matcher can only match on bed/bath (which is
-                # correct — the config itself is coarser).
-                if sqft_min is not None:
-                    subject['sqft_min'] = sqft_min
-                if sqft_max is not None:
-                    subject['sqft_max'] = sqft_max
-                value = {
-                    'currency': 'USD',
-                    'amount': amount,
-                    'base_amount': base_amount,
-                    'frequency_discount_pct': discount_pct,
-                    'sqft_scale_up': {
-                        'enabled': sqft_scale_enabled,
-                        'formula': (
-                            'when sqft > sqft_max: '
-                            'price = round5(sqft * base / midpoint(sqft_min, sqft_max)); '
-                            'floor = base'
-                        ),
-                    },
-                    'source_row_ref': {
-                        'row_index': row_index,
-                        'service_tier': tier_key,
-                    },
-                }
-                source_pointer = {
-                    'source': 'service_profiles[*].pricing_json.priceTable[]',
-                    'service_profile_id': service_profile_id,
+            subject = {
+                'service': service_slug,
+                'service_tier': tier_key,
+                'bedrooms': bed,
+                'bathrooms': bath,
+                'pricing_basis': 'flat_job',
+            }
+            # Preserve raw sqft interval — matcher does
+            # `observed_sqft ∈ [sqft_min, sqft_max]`.
+            if sqft_min is not None:
+                subject['sqft_min'] = sqft_min
+            if sqft_max is not None:
+                subject['sqft_max'] = sqft_max
+            value = {
+                'currency': 'USD',
+                'amount': base_amount,
+                'base_amount': base_amount,
+                'sqft_scale_up': {
+                    'enabled': sqft_scale_enabled,
+                    'formula': (
+                        'when sqft > sqft_max: '
+                        'price = round5(sqft * base / midpoint(sqft_min, sqft_max)); '
+                        'floor = base'
+                    ),
+                },
+                'source_row_ref': {
                     'row_index': row_index,
-                    'field': tier_key,
-                    'frequency_key': freq_key,
-                }
-                written += _upsert_fact(
-                    run=run, snapshot=snapshot,
-                    fact_type='quoted_price',
-                    subject=subject, value=value,
-                    source_pointer=source_pointer,
-                )
+                    'service_tier': tier_key,
+                },
+            }
+            source_pointer = {
+                'source': 'service_profiles[*].pricing_json.priceTable[]',
+                'service_profile_id': service_profile_id,
+                'row_index': row_index,
+                'field': tier_key,
+            }
+            written += _upsert_fact(
+                run=run, snapshot=snapshot,
+                fact_type='quoted_price',
+                subject=subject, value=value,
+                source_pointer=source_pointer,
+            )
+
+    # Frequency discounts — one fact per recurring frequency LB
+    # configured. These are % discounts applied on top of the base
+    # cell price at runtime; they don't create new cells.
+    for fd in frequency_discounts:
+        if not isinstance(fd, dict):
+            continue
+        freq_key = (fd.get('key') or '').strip().lower()
+        discount_pct = _as_float(fd.get('discount')) or 0.0
+        if not freq_key or freq_key == 'once' or discount_pct <= 0:
+            continue
+        subject = {
+            'service': service_slug,
+            'frequency': freq_key,
+            'pricing_basis': 'frequency_discount',
+        }
+        value = {
+            'currency': 'USD',
+            'amount': discount_pct,  # % off (matcher treats specially)
+            'discount_pct': discount_pct,
+            'frequency_label': fd.get('label'),
+        }
+        source_pointer = {
+            'source': 'service_profiles[*].pricing_json.frequencyDiscounts[]',
+            'service_profile_id': service_profile_id,
+            'frequency_key': freq_key,
+        }
+        written += _upsert_fact(
+            run=run, snapshot=snapshot,
+            fact_type='quoted_price',
+            subject=subject, value=value,
+            source_pointer=source_pointer,
+        )
 
     # Extras (addons) — one fact per priced addon.
     for extra in extras:

@@ -445,14 +445,25 @@ def _sample_compatible_with_cell(
         sv = _norm_scalar(sample_val)
         if cell_val is not None and sv is not None and cell_val != sv:
             return False
-    # frequency: alias-aware so `once` (LB) and `one-time` (older
-    # observed rows pre-aggregator-fix) collapse. Guards existing
-    # ObservedBusinessFact rows aggregated before the aggregator
-    # normalizer landed — no re-extraction required.
-    cell_freq = normalize_frequency(csubj.get('frequency'))
-    obs_freq = normalize_frequency(s.frequency)
-    if cell_freq is not None and obs_freq is not None and cell_freq != obs_freq:
-        return False
+    # frequency compat depends on the cell's pricing_basis:
+    #   flat_job cells (the grid) — no `frequency` in the subject;
+    #     any observed frequency is compatible (the frequency discount
+    #     is applied as a separate factor at runtime, not a separate
+    #     cell)
+    #   frequency_discount cells — MUST equal the observed frequency
+    #     (that's the whole point of the fact)
+    cell_basis = _norm_scalar(csubj.get('pricing_basis'))
+    if cell_basis == 'frequency_discount':
+        cell_freq = normalize_frequency(csubj.get('frequency'))
+        obs_freq = normalize_frequency(s.frequency)
+        if cell_freq is not None and obs_freq is not None and cell_freq != obs_freq:
+            return False
+    # else: grid cells (flat_job) don't carry frequency; the base
+    # cell matches any-frequency observed quote for its bed/bath/
+    # sqft/tier. Observed samples for recurring frequencies still
+    # go through the same compat — the matcher currently doesn't
+    # try to unwind the frequency discount, but at least the row
+    # itself becomes reachable.
     for dim, sample_val in (
         ('bedrooms', s.bedrooms),
         ('bathrooms', s.bathrooms),
