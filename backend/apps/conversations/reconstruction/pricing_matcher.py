@@ -60,6 +60,9 @@ from apps.conversations.models import (
     ConfiguredBusinessFact, ObservedBusinessFact,
     ReconstructedBusinessFact,
 )
+from apps.conversations.observed_config.base import (
+    normalize_frequency, normalize_service,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -367,20 +370,33 @@ def _sample_compatible_with_cell(
       may include additional addons alongside).
     """
     csubj = cell.subject_key_json or {}
-    if _norm_scalar(s.service) is None:
+    # Service must always be declared and canonically match. Both
+    # sides funnel through normalize_service so LB slugs like
+    # `default-service` and observed tokens like `cleaning` collapse.
+    obs_service = normalize_service(s.service)
+    if obs_service is None:
         return False
-    cell_service = _norm_scalar(csubj.get('service'))
-    if cell_service is not None and cell_service != _norm_scalar(s.service):
+    cell_service = normalize_service(csubj.get('service'))
+    if cell_service is not None and cell_service != obs_service:
         return False
+    # service_tier / pricing_basis: plain lowercased-string equality
+    # when both sides declare them.
     for dim, sample_val in (
         ('service_tier', s.service_tier),
-        ('frequency', s.frequency),
         ('pricing_basis', s.pricing_basis),
     ):
         cell_val = _norm_scalar(csubj.get(dim))
         sv = _norm_scalar(sample_val)
         if cell_val is not None and sv is not None and cell_val != sv:
             return False
+    # frequency: alias-aware so `once` (LB) and `one-time` (older
+    # observed rows pre-aggregator-fix) collapse. Guards existing
+    # ObservedBusinessFact rows aggregated before the aggregator
+    # normalizer landed — no re-extraction required.
+    cell_freq = normalize_frequency(csubj.get('frequency'))
+    obs_freq = normalize_frequency(s.frequency)
+    if cell_freq is not None and obs_freq is not None and cell_freq != obs_freq:
+        return False
     for dim, sample_val in (
         ('bedrooms', s.bedrooms),
         ('bathrooms', s.bathrooms),
