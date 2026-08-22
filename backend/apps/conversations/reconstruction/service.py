@@ -283,6 +283,7 @@ def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
             'matched_configured_fact_id': outcome.matched_configured_fact_id,
             'missing_observed_dimensions': outcome.missing_observed_dimensions,
             'price_comparison': outcome.price_comparison,
+            'candidate_summary': outcome.candidate_summary,
         }
         matched_cfg = None
         if outcome.matched_configured_fact_id:
@@ -913,15 +914,32 @@ def _persist(
     ev_turn_ids: list = []
     if observed is not None:
         ev_turn_ids = list(observed.evidence_turn_ids or [])[:20]
+    # When there's no single matched configured rule but the pricing
+    # matcher DID find plausible candidates, surface the candidate
+    # summary through configured_equivalent_json so the frontend can
+    # show "3 rules configured, $149–$329" instead of "Not configured
+    # yet". Only applies to pricing INSUFFICIENT_CONTEXT_TO_COMPARE.
+    if configured is not None:
+        cfg_equiv = configured.value_json
+    else:
+        cfg_equiv = {}
+        matcher = (observed_value or {}).get('matcher') or {}
+        cand_summary = matcher.get('candidate_summary')
+        if cand_summary and cand_summary.get('count'):
+            cfg_equiv = {
+                'kind': 'candidate_range',
+                'candidate_count': cand_summary['count'],
+                'amount_min': cand_summary.get('amount_min'),
+                'amount_max': cand_summary.get('amount_max'),
+                'currency': 'USD',
+            }
     ReconstructedBusinessFact.objects.create(
         reconstruction_run=run,
         domain=domain,
         canonical_subject_json=subject_key,
         canonical_subject_hash=subject_hash,
         observed_value_json=observed_value or {},
-        configured_equivalent_json=(
-            configured.value_json if configured else {}
-        ),
+        configured_equivalent_json=cfg_equiv,
         support_n=support_n,
         aggregate_confidence=(
             observed.aggregate_confidence if observed else 0.0

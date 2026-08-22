@@ -84,6 +84,13 @@ class MatchOutcome:
     matched_configured_fact_id: str | None
     missing_observed_dimensions: list[str]
     price_comparison: dict | None  # {'observed_median':..,'configured':..,'delta_pct':..}
+    # Aggregate view of the configured candidates the observed fact is
+    # compatible with. Populated on INSUFFICIENT_CONTEXT_TO_COMPARE so
+    # the UI can honestly render "N rules configured, $X–$Y" instead
+    # of the misleading "Not configured yet". Empty on MATCH /
+    # DIFFERS_FROM_CONFIG (single rule matched) and on
+    # OBSERVED_NOT_CONFIGURED (no candidates).
+    candidate_summary: dict | None = None
 
 
 @dataclass
@@ -238,8 +245,12 @@ def match_one(
 
     # More than one plausible configured candidate — observed
     # context lacks the discriminators to choose. Report which
-    # dimensions vary across the candidates.
+    # dimensions vary across the candidates AND include a compact
+    # summary of the candidate amounts so the UI can render
+    # "N configured rules span $min–$max" instead of "Not
+    # configured yet".
     missing = _dimensions_varying_across_candidates(narrowed, obs_subj)
+    candidate_summary = _summarize_candidates(narrowed)
     return MatchOutcome(
         verdict=ReconstructedBusinessFact.RelationshipToConfig.INSUFFICIENT_CONTEXT_TO_COMPARE,
         rationale=(
@@ -253,7 +264,31 @@ def match_one(
         matched_configured_fact_id=None,
         missing_observed_dimensions=missing,
         price_comparison=None,
+        candidate_summary=candidate_summary,
     )
+
+
+def _summarize_candidates(candidates: list[ConfiguredBusinessFact]) -> dict:
+    """Compact per-verdict summary of the configured candidates a
+    matcher call ended up with. Fed straight to the UI so the
+    'Currently in LeadBridge' column can say
+    "3 rules · $149–$329" instead of showing empty."""
+    amounts = []
+    for c in candidates:
+        a = _configured_amount(c.value_json or {})
+        if a is not None:
+            amounts.append(float(a))
+    if not amounts:
+        return {
+            'count': len(candidates),
+            'amount_min': None,
+            'amount_max': None,
+        }
+    return {
+        'count': len(candidates),
+        'amount_min': min(amounts),
+        'amount_max': max(amounts),
+    }
 
 
 # ─── Compatibility ─────────────────────────────────────────────────
