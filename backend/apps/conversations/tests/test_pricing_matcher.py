@@ -190,6 +190,69 @@ class PricingCellMatcherAcceptanceTests(TestCase):
         self.assertEqual(v.verdict, RTC.DIFFERS_FROM_CONFIG)
         self.assertFalse(v.price_comparison['within_tolerance'])
 
+    # ─── MATCH tentative (asymmetric threshold) ────────────────
+
+    def test_cell_matches_tentative_when_single_unique_quote_aligns(self):
+        """Asymmetric threshold (2026-08-22): 1 unique quote at the
+        cell's exact configured amount → MATCH (tentative), not
+        INSUFFICIENT. Rationale mentions 'tentative (n<3)'."""
+        cell = self._cell(
+            subject={
+                'service': 'cleaning', 'service_tier': 'deep',
+                'bedrooms': 3, 'bathrooms': 2,
+                'sqft_min': 1300, 'sqft_max': 1600,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            amount=219,
+        )
+        obs = self._observed(
+            subject={
+                'service': 'cleaning', 'service_tier': 'deep',
+                'bedrooms': 3, 'bathrooms': 2,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            samples=[
+                {'amount': 219, 'square_footage': 1500, 'bedrooms': 3, 'bathrooms': 2},
+            ],
+        )
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=[cell],
+        ))
+        v = verdicts[0]
+        self.assertEqual(v.verdict, RTC.MATCH)
+        self.assertIn('tentative', v.rationale)
+
+    def test_cell_insufficient_when_single_unique_quote_disagrees(self):
+        """Asymmetric threshold: a single OFF-tolerance quote is
+        NOT enough to emit DIFFERS_FROM_CONFIG. Fall through to
+        INSUFFICIENT_CONTEXT_TO_COMPARE — one outlier isn't a
+        real conflict."""
+        cell = self._cell(
+            subject={
+                'service': 'cleaning', 'service_tier': 'deep',
+                'bedrooms': 3, 'bathrooms': 2,
+                'sqft_min': 1300, 'sqft_max': 1600,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            amount=219,
+        )
+        obs = self._observed(
+            subject={
+                'service': 'cleaning', 'service_tier': 'deep',
+                'bedrooms': 3, 'bathrooms': 2,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            samples=[
+                {'amount': 349, 'square_footage': 1500, 'bedrooms': 3, 'bathrooms': 2},
+            ],
+        )
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=[cell],
+        ))
+        v = verdicts[0]
+        self.assertEqual(v.verdict, RTC.INSUFFICIENT_CONTEXT_TO_COMPARE)
+        self.assertIn('need >= 3', v.rationale)
+
     # ─── INSUFFICIENT_CONTEXT_TO_COMPARE (partial only) ────────
 
     def test_cell_insufficient_when_only_partial_evidence(self):

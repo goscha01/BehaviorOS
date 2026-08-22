@@ -251,8 +251,36 @@ def _verdict_for_cell(
             contributing_observed_fact_ids=[],
         )
 
-    # Not enough UNIQUE evidence for a hard verdict.
-    if len(unique_amounts) < MIN_UNIQUE_SAMPLES_FOR_VERDICT:
+    # Asymmetric threshold (2026-08-22 reviewer correction after
+    # Spotless full-corpus verification):
+    #   MATCH   requires >=1 unique observation AND every unique quote
+    #           agrees with the cell's amount within tolerance. A
+    #           single quote CONSISTENT with the cell is meaningful —
+    #           it's a real customer conversation where the team
+    #           quoted exactly the configured price.
+    #   DIFFERS requires >=MIN_UNIQUE unique observations AND their
+    #           median falls outside tolerance. A single quote
+    #           inconsistent with the cell is NOT enough — could be
+    #           an outlier.
+    # This asymmetry reflects the different evidentiary bars:
+    # "confirmed by real conversation" (thin evidence sufficient) vs
+    # "team overrides config" (thin evidence not sufficient).
+    if unique_amounts and cell_amount is not None:
+        all_unique_within = all(
+            abs(a - cell_amount) <= max(
+                cell_amount * PRICE_TOLERANCE_PCT, PRICE_TOLERANCE_FLOOR,
+            )
+            for a in unique_amounts
+        )
+    else:
+        all_unique_within = False
+
+    # Not enough UNIQUE evidence AND the evidence we do have doesn't
+    # confirm the cell → INSUFFICIENT_CONTEXT_TO_COMPARE.
+    if (
+        len(unique_amounts) < MIN_UNIQUE_SAMPLES_FOR_VERDICT
+        and not all_unique_within
+    ):
         partial_desc = ''
         if partial_amounts:
             partial_med = _median(partial_amounts)
@@ -268,7 +296,9 @@ def _verdict_for_cell(
             rationale=(
                 f'{len(unique_amounts)} uniquely-attributed observed '
                 f'quote{"s" if len(unique_amounts) != 1 else ""} '
-                f'(need >= {MIN_UNIQUE_SAMPLES_FOR_VERDICT}){partial_desc}'
+                f'(need >= {MIN_UNIQUE_SAMPLES_FOR_VERDICT} for a '
+                f'hard verdict when they disagree with the cell)'
+                f'{partial_desc}'
             ),
             unique_samples=unique, partial_samples=partial,
             price_comparison=(
@@ -314,16 +344,42 @@ def _verdict_for_cell(
 
     comparison = _price_comparison(unique_amounts, cell_amount)
     if comparison['within_tolerance']:
+        tentative = len(unique_amounts) < MIN_UNIQUE_SAMPLES_FOR_VERDICT
         return CellVerdict(
             cell=cell,
             verdict=RTC.MATCH,
             consistency=consistency,
             rationale=(
-                f'{len(unique_amounts)} unique observed quotes with '
+                f'{len(unique_amounts)} unique observed quote'
+                f'{"s" if len(unique_amounts) != 1 else ""} with '
                 f'median ${comparison["observed_median"]:.2f} vs '
                 f'configured ${comparison["configured"]:.2f} '
                 f'(delta {comparison["delta_pct"]:+.1%}, within '
                 f'±{PRICE_TOLERANCE_PCT:.0%})'
+                + (' — tentative (n<3)' if tentative else '')
+            ),
+            unique_samples=unique, partial_samples=partial,
+            price_comparison=comparison,
+            contributing_observed_fact_ids=contributing,
+        )
+    # DIFFERS requires >= MIN_UNIQUE unique quotes — a single
+    # off-tolerance quote is more likely an outlier than a real
+    # override. Below the threshold, we fall through to
+    # INSUFFICIENT_CONTEXT_TO_COMPARE so the operator isn't shown
+    # a fake conflict.
+    if len(unique_amounts) < MIN_UNIQUE_SAMPLES_FOR_VERDICT:
+        return CellVerdict(
+            cell=cell,
+            verdict=RTC.INSUFFICIENT_CONTEXT_TO_COMPARE,
+            consistency=Con.UNDETERMINED,
+            rationale=(
+                f'{len(unique_amounts)} unique observed quote'
+                f'{"s" if len(unique_amounts) != 1 else ""} at '
+                f'median ${comparison["observed_median"]:.2f} vs '
+                f'configured ${comparison["configured"]:.2f} '
+                f'(delta {comparison["delta_pct"]:+.1%}); '
+                f'need >= {MIN_UNIQUE_SAMPLES_FOR_VERDICT} for a '
+                'DIFFERS verdict'
             ),
             unique_samples=unique, partial_samples=partial,
             price_comparison=comparison,
