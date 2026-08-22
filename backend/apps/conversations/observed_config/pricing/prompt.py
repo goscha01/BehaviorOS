@@ -34,7 +34,7 @@ Retains v2 semantics:
 from __future__ import annotations
 
 
-PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v3'
+PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v4'
 
 
 SYSTEM_PROMPT = '''You extract pricing facts from residential-service

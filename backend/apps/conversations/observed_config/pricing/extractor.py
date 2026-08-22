@@ -36,6 +36,9 @@ from apps.conversations.observed_config.base import (
 from apps.conversations.observed_config.pricing.prompt import (
     PRICING_EXTRACTOR_VERSION, SYSTEM_PROMPT, build_user_prompt,
 )
+from apps.conversations.observed_config.pricing.lead_metadata import (
+    extract_dimensions_from_lead,
+)
 from apps.conversations.semantic.preprocessing import (
     ConversationChunk,
     load_and_normalize, render_turns_for_prompt,
@@ -133,6 +136,29 @@ def extract_from_conversation(
     if truncated:
         for p in aggregated_prices:
             p.setdefault('_truncated', True)
+
+    # 2026-08-22 enrichment: for every extracted quote, backfill
+    # missing bed/bath/sqft from the LB lead payload attached to
+    # this conversation (Thumbtack/Yelp/Callio lead metadata lives
+    # on OutcomeSnapshot.source_payload['lb_lead']). Rationale: the
+    # customer/team never restates the dimensions in the SMS
+    # thread — LB already knows them from the lead. Extractor
+    # respects "unknown stays unknown" on the CONVERSATION side but
+    # can trust the LB LEAD metadata as authoritative request
+    # context.
+    lead_dims = extract_dimensions_from_lead(conv)
+    if lead_dims:
+        for p in aggregated_prices:
+            subj = p.setdefault('subject_key', {})
+            if subj.get('bedrooms') in (None, '') and 'bedrooms' in lead_dims:
+                subj['bedrooms'] = lead_dims['bedrooms']
+            if subj.get('bathrooms') in (None, '') and 'bathrooms' in lead_dims:
+                subj['bathrooms'] = lead_dims['bathrooms']
+            if subj.get('square_footage') in (None, '') and 'square_footage' in lead_dims:
+                subj['square_footage'] = lead_dims['square_footage']
+            # Record provenance so a debug view can distinguish
+            # lead-derived from conversation-derived dimensions.
+            p.setdefault('_lead_metadata_used', True)
 
     return PerConversationExtraction(
         conversation_id=str(conv.id),

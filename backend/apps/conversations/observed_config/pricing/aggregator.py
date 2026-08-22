@@ -77,15 +77,35 @@ def aggregate_and_persist(*, run, per_conv_extractions) -> int:
     conv_meta: dict[str, dict] = {}
     seen_dedup_keys: set[tuple[str, str, str, str]] = set()
 
+    dropped_no_dims = 0
     for extraction in per_conv_extractions:
         for entry in extraction.prices:
             fact_type = entry.get('fact_type')
             if fact_type not in ('quoted_price', 'price_range',
                                   'discount_offered'):
                 continue
-            subject_key = _normalize_subject_key(
-                entry.get('subject_key') or {}
-            )
+            raw_subj = entry.get('subject_key') or {}
+            # Drop-filter (2026-08-22 operator directive): every real
+            # quote HAS request context (in the LB lead payload, the
+            # Thumbtack/Yelp request, or the initial voice call).
+            # After the extractor's lead-metadata enrichment, if
+            # NONE of bed/bath/sqft resolved for this quote, we
+            # treat it as extraction-quality noise rather than
+            # partial evidence. Addon-basis quotes are exempt (they
+            # target an addon, not a size-band cell).
+            basis = (raw_subj.get('pricing_basis') or '').lower()
+            if not basis.startswith('addon_') and basis not in (
+                'hourly_per_cleaner', 'hourly_team', 'discount_price',
+                'original_price',
+            ):
+                has_dim = any(
+                    raw_subj.get(k) not in (None, '')
+                    for k in ('bedrooms', 'bathrooms', 'square_footage')
+                )
+                if not has_dim:
+                    dropped_no_dims += 1
+                    continue
+            subject_key = _normalize_subject_key(raw_subj)
             canon, sha, dims = canonical_subject_key(subject_key)
             quote_turn_id = (
                 (entry.get('evidence') or {}).get('quote_turn_id', '')
