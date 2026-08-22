@@ -208,21 +208,24 @@ def _reconstruct_all(*, run, inputs: dict) -> int:
 
 
 def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
-    """Deterministic pricing matcher (P4, 2026-08-21).
+    """Config-anchored pricing reconstruction (2026-08-21 v2).
 
-    Replaces the old subject_key_hash join with a compatibility-based
-    candidate search per the 2026-08-21 reviewer directive. Emits the
-    four pricing-specific verdict values (MATCH, DIFFERS_FROM_CONFIG,
-    INSUFFICIENT_CONTEXT_TO_COMPARE, VARIABLE_CONTEXT_DEPENDENT) plus
-    OBSERVED_NOT_CONFIGURED / CONFIGURED_NOT_OBSERVED /
-    INSUFFICIENT_EVIDENCE / ONTOLOGY_OR_EXTRACTION_ISSUE from the
-    legacy generic set.
+    The LB pricing table is the ontology. This function iterates
+    configured cells and asks per cell "which observed quotes belong
+    here, and do they agree with this cell's price?" — instead of
+    the earlier observed-primary shape.
 
-    Matcher logic lives in pricing_matcher.py so it is unit-testable
-    without spinning up the whole reconstruction pipeline.
+    Emits ONE ReconstructedBusinessFact per configured cell, plus
+    additional rows for any observed subject whose quotes couldn't
+    be attributed to any cell (the "doesn't fit your setup" bucket
+    the reviewer asked to surface separately).
+
+    Matcher logic lives in pricing_matcher.match_by_cell so it is
+    unit-testable without spinning up the whole reconstruction
+    pipeline.
     """
     from apps.conversations.reconstruction.pricing_matcher import (
-        MatchInputs, match_all,
+        MatchInputs, match_by_cell,
     )
 
     if obs_run is None and cfg_run is None:
@@ -267,64 +270,101 @@ def _reconstruct_pricing(*, run, obs_run, cfg_run) -> int:
             continue
         matchable_observed.append(obs)
 
-    outcomes, orphaned_cfg = match_all(
-        MatchInputs(observed_facts=matchable_observed,
-                    configured_facts=configured),
-    )
+    cell_verdicts, orphans = match_by_cell(MatchInputs(
+        observed_facts=matchable_observed,
+        configured_facts=configured,
+    ))
 
-    for obs, outcome in outcomes:
-        observed_value = _pricing_observed_summary(obs.value_json or {})
-        # Enrich observed_value with matcher provenance so the audit
-        # can render "why this verdict" without re-running the matcher.
-        observed_value['matcher'] = {
-            'verdict': outcome.verdict,
-            'rationale': outcome.rationale,
-            'candidate_configured_fact_ids': outcome.candidate_configured_fact_ids,
-            'matched_configured_fact_id': outcome.matched_configured_fact_id,
-            'missing_observed_dimensions': outcome.missing_observed_dimensions,
-            'price_comparison': outcome.price_comparison,
-            'candidate_summary': outcome.candidate_summary,
+    # PRIMARY: one row per configured cell with its verdict.
+    for v in cell_verdicts:
+        cell = v.cell
+        # observed_value carries the per-cell evidence + matcher
+        # provenance for the UI + audit.
+        observed_value = {
+            'currency': 'USD',
+            'matcher': {
+                'verdict': v.verdict,
+                'rationale': v.rationale,
+                'anchor': 'configured_cell',
+                'unique_sample_count': len(v.unique_samples),
+                'partial_sample_count': len(v.partial_samples),
+                'price_comparison': v.price_comparison,
+            },
+            'unique_sample_amounts': [
+                s.amount for s in v.unique_samples if s.amount is not None
+            ][:10],
+            'partial_sample_amounts': [
+                s.amount for s in v.partial_samples if s.amount is not None
+            ][:10],
+            'unique_sample_quotes': [
+                {
+                    'amount': s.amount,
+                    'square_footage': s.square_footage,
+                    'bedrooms': s.bedrooms,
+                    'bathrooms': s.bathrooms,
+                    'conversation_id': s.conversation_id,
+                    'turn_id': s.turn_id,
+                }
+                for s in v.unique_samples[:5]
+            ],
         }
-        matched_cfg = None
-        if outcome.matched_configured_fact_id:
-            for c in configured:
-                if str(c.id) == outcome.matched_configured_fact_id:
-                    matched_cfg = c
-                    break
+        if v.price_comparison:
+            observed_value['amount_stats'] = {
+                'median': v.price_comparison['observed_median'],
+                'support_n': v.price_comparison['sample_n'],
+            }
         onboarding_class, rationale = _pricing_onboarding_class(
-            relationship=outcome.verdict,
-            consistency=outcome.consistency,
+            relationship=v.verdict,
+            consistency=v.consistency,
+            support=len(v.unique_samples),
+            quality_flags=[],
+        )
+        # Cell verdicts pass through _persist with the cell as the
+        # `configured` side. `observed=None` intentionally — the
+        # cell verdict aggregates evidence across many observed
+        # facts, not a single one. Provenance list is on
+        # contributing_observed_fact_ids.
+        _persist(
+            run=run, domain='pricing',
+            observed=None, configured=cell,
+            observed_value=observed_value,
+            relationship=v.verdict,
+            consistency=v.consistency,
+            quality_flags=[],
+            onboarding_class=onboarding_class,
+            onboarding_rationale=rationale,
+            support_n=len(v.unique_samples),
+            extra_observed_ids=v.contributing_observed_fact_ids,
+        )
+        written += 1
+
+    # RESIDUAL: observed subjects that fit no configured cell — the
+    # "doesn't fit your setup" list the reviewer asked us to surface
+    # separately.
+    for orph in orphans:
+        obs = orph.observed_fact
+        observed_value = _pricing_observed_summary(obs.value_json or {})
+        observed_value['matcher'] = {
+            'verdict': ReconstructedBusinessFact.RelationshipToConfig.OBSERVED_NOT_CONFIGURED,
+            'anchor': 'observed_orphan',
+            'rationale': orph.reason,
+        }
+        onboarding_class, rationale = _pricing_onboarding_class(
+            relationship=ReconstructedBusinessFact.RelationshipToConfig.OBSERVED_NOT_CONFIGURED,
+            consistency=ReconstructedBusinessFact.Consistency.CONSISTENT if (obs.support_n or 0) >= MIN_SUPPORT_INSUFFICIENT else ReconstructedBusinessFact.Consistency.UNDETERMINED,
             support=obs.support_n or 0,
             quality_flags=[],
         )
         _persist(
             run=run, domain='pricing',
-            observed=obs, configured=matched_cfg,
+            observed=obs, configured=None,
             observed_value=observed_value,
-            relationship=outcome.verdict,
-            consistency=outcome.consistency,
+            relationship=ReconstructedBusinessFact.RelationshipToConfig.OBSERVED_NOT_CONFIGURED,
+            consistency=ReconstructedBusinessFact.Consistency.UNDETERMINED,
             quality_flags=[],
             onboarding_class=onboarding_class,
             onboarding_rationale=rationale,
             support_n=obs.support_n or 0,
-        )
-        written += 1
-
-    # Configured-only pricing facts (no observed counterpart).
-    for cfg_row in orphaned_cfg:
-        _persist(
-            run=run, domain='pricing',
-            observed=None, configured=cfg_row,
-            observed_value={},
-            relationship=ReconstructedBusinessFact.RelationshipToConfig.CONFIGURED_NOT_OBSERVED,
-            consistency=ReconstructedBusinessFact.Consistency.UNDETERMINED,
-            quality_flags=[],
-            onboarding_class=ReconstructedBusinessFact.OnboardingClass.NEEDS_OWNER_CONFIRMATION,
-            onboarding_rationale=(
-                'configured pricing entry not observed in agent '
-                'conversations; may be stale or applied outside chat'
-            ),
-            support_n=0,
         )
         written += 1
     return written

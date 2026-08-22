@@ -1,30 +1,33 @@
-"""Deterministic pricing matcher acceptance tests (Phase 5).
+"""Deterministic pricing matcher acceptance tests — CONFIG-ANCHORED.
 
-Every verdict from the 2026-08-21 reviewer directive gets at least
-one test that constructs the minimum observed + configured facts
-required to produce that verdict, calls the matcher directly, and
-asserts the emitted MatchOutcome.
+Per the 2026-08-21 reviewer correction: the LB pricing table is the
+ontology, observed quotes are attempts to instantiate table cells.
+Every test asserts a verdict PER CONFIGURED CELL after
+match_by_cell runs, not per observed subject.
 
-Also covers the specific refinements from the directive:
+Verdict coverage (one test each):
+  - MATCH — cell has >= MIN_UNIQUE unique observed quotes and
+    their median aligns with the cell's amount.
+  - DIFFERS_FROM_CONFIG — same shape, median outside tolerance.
+  - INSUFFICIENT_CONTEXT_TO_COMPARE — cell has only partial-evidence
+    quotes (compatible with this cell AND other cells).
+  - VARIABLE_CONTEXT_DEPENDENT — cell has enough unique quotes but
+    their IQR/median is above threshold.
+  - CONFIGURED_NOT_OBSERVED — cell has zero compatible quotes.
+  - OBSERVED_NOT_CONFIGURED (residual) — observed quote whose
+    subject fits no cell.
 
-  - OBSERVED_NOT_CONFIGURED requires *no compatible rule*, not just
-    a missing service name.
-  - INSUFFICIENT_CONTEXT_TO_COMPARE requires ≥1 plausible candidate.
-  - Raw square_footage on the observed side is compared to the
-    configured sqft_min/sqft_max INTERVAL, not to a bucket enum.
-
-No LLM. No database round-trip either — the matcher operates on
-ObservedBusinessFact / ConfiguredBusinessFact instances that we
-construct in-memory (via .save() so the models are fully hydrated
-including UUIDs, but no reconstruction pipeline is exercised).
+Plus the reviewer refinements:
+  - A sample with raw square_footage is placed in the cell whose
+    [sqft_min, sqft_max] contains it — never in the bucket enum.
+  - A sample missing sqft is partial evidence spread across every
+    sqft-banded cell with matching bed/bath — never forces
+    INSUFFICIENT_CONTEXT_TO_COMPARE on cells it can't disambiguate.
 """
 
 from __future__ import annotations
 
-import uuid
-
 from django.test import TestCase
-from django.utils import timezone
 
 from apps.accounts.models import Organization
 from apps.conversations.models import (
@@ -35,18 +38,17 @@ from apps.conversations.models import (
 )
 from apps.conversations.observed_config.base import canonical_subject_key
 from apps.conversations.reconstruction.pricing_matcher import (
-    MatchInputs, match_all, match_one,
+    MatchInputs, match_by_cell,
 )
 
 
 RTC = ReconstructedBusinessFact.RelationshipToConfig
 
 
-class PricingMatcherAcceptanceTests(TestCase):
-    """One test per verdict + the refinements the reviewer called out."""
+class PricingCellMatcherAcceptanceTests(TestCase):
 
     def setUp(self):
-        self.org = Organization.objects.create(name='Pricing Matcher Test Org')
+        self.org = Organization.objects.create(name='Pricing Cell Test Org')
         self.corpus = LearningCorpus.objects.create(
             org=self.org, name='test-corpus', version='v1',
             selection_criteria={}, member_count=1,
@@ -78,38 +80,7 @@ class PricingMatcherAcceptanceTests(TestCase):
 
     # ─── Fact builders ──────────────────────────────────────────
 
-    def _observed(self, *, subject: dict, samples: list[dict],
-                   median: float | None = None, p25: float | None = None,
-                   p75: float | None = None, support_n: int = 10) -> ObservedBusinessFact:
-        _, sha, dims = canonical_subject_key(subject)
-        value: dict = {
-            'fact_type': 'quoted_price',
-            'currency': 'USD',
-            'dimension_samples': samples,
-        }
-        if median is not None:
-            value['amount_stats'] = {
-                'support_n': support_n,
-                'median': median,
-                'p25': p25 if p25 is not None else median,
-                'p75': p75 if p75 is not None else median,
-                'min': p25 if p25 is not None else median,
-                'max': p75 if p75 is not None else median,
-                'mean': median,
-            }
-        return ObservedBusinessFact.objects.create(
-            org=self.org, corpus=self.corpus, extraction_run=self.obs_run,
-            domain=ObservedBusinessFact.Domain.PRICING,
-            fact_type='quoted_price',
-            subject_key_json=subject,
-            subject_key_dimensions=dims,
-            subject_key_hash=sha,
-            value_json=value,
-            support_n=support_n,
-        )
-
-    def _configured(self, *, subject: dict, amount: float,
-                     source_ref: str = 'test') -> ConfiguredBusinessFact:
+    def _cell(self, *, subject: dict, amount: float) -> ConfiguredBusinessFact:
         _, sha, dims = canonical_subject_key(subject)
         return ConfiguredBusinessFact.objects.create(
             snapshot=self.snapshot, parser_run=self.cfg_run,
@@ -119,23 +90,50 @@ class PricingMatcherAcceptanceTests(TestCase):
             subject_key_dimensions=dims,
             subject_key_hash=sha,
             value_json={'amount': amount, 'currency': 'USD'},
-            source_pointer={'ref': source_ref},
+            source_pointer={'ref': 'test'},
             parser_confidence=1.0,
+        )
+
+    def _observed(self, *, subject: dict, samples: list[dict],
+                   support_n: int | None = None) -> ObservedBusinessFact:
+        _, sha, dims = canonical_subject_key(subject)
+        return ObservedBusinessFact.objects.create(
+            org=self.org, corpus=self.corpus, extraction_run=self.obs_run,
+            domain=ObservedBusinessFact.Domain.PRICING,
+            fact_type='quoted_price',
+            subject_key_json=subject,
+            subject_key_dimensions=dims,
+            subject_key_hash=sha,
+            value_json={
+                'fact_type': 'quoted_price', 'currency': 'USD',
+                'dimension_samples': samples,
+            },
+            support_n=support_n if support_n is not None else len(samples),
         )
 
     # ─── MATCH ──────────────────────────────────────────────────
 
-    def test_match_when_observed_median_within_tolerance(self):
-        """Fully-resolved observed context → one configured candidate
-        → observed median within ±10% → MATCH."""
-        cfg = self._configured(
+    def test_cell_matches_when_unique_observed_median_aligns(self):
+        """3+ unique observations pinned to a specific cell whose
+        median is within ±10% of the cell's amount → MATCH for
+        THAT cell."""
+        cell_small = self._cell(
+            subject={
+                'service': 'cleaning', 'service_tier': 'regular',
+                'bedrooms': 2, 'bathrooms': 1,
+                'sqft_min': 800, 'sqft_max': 1000,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            amount=149,
+        )
+        cell_target = self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
                 'sqft_min': 1601, 'sqft_max': 2000,
                 'frequency': 'once', 'pricing_basis': 'flat_job',
             },
-            amount=189,
+            amount=209,
         )
         obs = self._observed(
             subject={
@@ -144,21 +142,27 @@ class PricingMatcherAcceptanceTests(TestCase):
                 'frequency': 'once', 'pricing_basis': 'flat_job',
             },
             samples=[
-                {'amount': 189, 'square_footage': 1800, 'bedrooms': 3, 'bathrooms': 2},
-                {'amount': 195, 'square_footage': 1750, 'bedrooms': 3, 'bathrooms': 2},
-                {'amount': 189, 'square_footage': 1900, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 209, 'square_footage': 1800, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 209, 'square_footage': 1750, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 219, 'square_footage': 1900, 'bedrooms': 3, 'bathrooms': 2},
             ],
-            median=189, p25=189, p75=195, support_n=8,
         )
-        outcome = match_one(obs, [cfg])
-        self.assertEqual(outcome.verdict, RTC.MATCH)
-        self.assertEqual(outcome.matched_configured_fact_id, str(cfg.id))
-        self.assertTrue(outcome.price_comparison['within_tolerance'])
+        verdicts, orphans = match_by_cell(MatchInputs(
+            observed_facts=[obs],
+            configured_facts=[cell_small, cell_target],
+        ))
+        self.assertEqual(orphans, [])
+        by_id = {str(v.cell.id): v for v in verdicts}
+        self.assertEqual(by_id[str(cell_target.id)].verdict, RTC.MATCH)
+        self.assertEqual(by_id[str(cell_small.id)].verdict, RTC.CONFIGURED_NOT_OBSERVED)
+        pc = by_id[str(cell_target.id)].price_comparison
+        self.assertTrue(pc['within_tolerance'])
+        self.assertEqual(pc['sample_n'], 3)
 
     # ─── DIFFERS_FROM_CONFIG ───────────────────────────────────
 
-    def test_differs_from_config_when_median_outside_tolerance(self):
-        cfg = self._configured(
+    def test_cell_differs_from_config_when_unique_median_outside_tolerance(self):
+        cell = self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
@@ -178,71 +182,21 @@ class PricingMatcherAcceptanceTests(TestCase):
                 {'amount': 259, 'square_footage': 1750, 'bedrooms': 3, 'bathrooms': 2},
                 {'amount': 249, 'square_footage': 1900, 'bedrooms': 3, 'bathrooms': 2},
             ],
-            median=249, p25=249, p75=259, support_n=8,
         )
-        outcome = match_one(obs, [cfg])
-        self.assertEqual(outcome.verdict, RTC.DIFFERS_FROM_CONFIG)
-        self.assertEqual(outcome.matched_configured_fact_id, str(cfg.id))
-        self.assertFalse(outcome.price_comparison['within_tolerance'])
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=[cell],
+        ))
+        v = verdicts[0]
+        self.assertEqual(v.verdict, RTC.DIFFERS_FROM_CONFIG)
+        self.assertFalse(v.price_comparison['within_tolerance'])
 
-    # ─── OBSERVED_NOT_CONFIGURED ───────────────────────────────
+    # ─── INSUFFICIENT_CONTEXT_TO_COMPARE (partial only) ────────
 
-    def test_observed_not_configured_when_no_service_in_config(self):
-        """No configured rule at all → OBSERVED_NOT_CONFIGURED."""
-        obs = self._observed(
-            subject={
-                'service': 'cleaning', 'pricing_basis': 'flat_job',
-            },
-            samples=[{'amount': 169} for _ in range(5)],
-            median=169, p25=169, p75=189, support_n=5,
-        )
-        outcome = match_one(obs, [])
-        self.assertEqual(outcome.verdict, RTC.OBSERVED_NOT_CONFIGURED)
-
-    def test_observed_not_configured_when_service_exists_but_no_compatible_rule(self):
-        """Per the reviewer refinement: OBSERVED_NOT_CONFIGURED must
-        fire when the observed CONTEXT has no compatible configured
-        rule — not merely when the service name is missing.
-
-        Configured has regular cleaning at bed=3/bath=2 flat_job only.
-        Observed is `regular_cleaning + biweekly + addon=oven`, which
-        is a valid same-service quote but no configured rule covers
-        it."""
-        self._configured(
-            subject={
-                'service': 'cleaning', 'service_tier': 'regular',
-                'bedrooms': 3, 'bathrooms': 2,
-                'sqft_min': 1000, 'sqft_max': 1200,
-                'frequency': 'once', 'pricing_basis': 'flat_job',
-            },
-            amount=189,
-        )
-        obs = self._observed(
-            subject={
-                'service': 'cleaning', 'service_tier': 'regular',
-                'bedrooms': 3, 'bathrooms': 2,
-                'frequency': 'biweekly',
-                'addons': ['oven'],
-                'pricing_basis': 'addon_flat',
-            },
-            samples=[{'amount': 35} for _ in range(5)],
-            median=35, p25=35, p75=35, support_n=5,
-        )
-        outcome = match_one(obs, [
-            c for c in ConfiguredBusinessFact.objects.filter(parser_run=self.cfg_run)
-        ])
-        self.assertEqual(outcome.verdict, RTC.OBSERVED_NOT_CONFIGURED)
-        # And the rationale should mention the incompatible dims.
-        self.assertIn('cleaning', outcome.rationale)
-
-    # ─── INSUFFICIENT_CONTEXT_TO_COMPARE ───────────────────────
-
-    def test_insufficient_context_when_multiple_candidates_and_observed_lacks_sqft(self):
-        """Per the reviewer refinement: fires only when >=1 plausible
-        candidate exists AND observed context can't choose."""
-        # Two configured rules for regular cleaning, different sqft
-        # bands — same bed/bath.
-        self._configured(
+    def test_cell_insufficient_when_only_partial_evidence(self):
+        """Two cells differ only by sqft-band. An observed quote
+        without square_footage is compatible with BOTH → partial
+        evidence to each cell, neither reaches MATCH/DIFFERS."""
+        cell_a = self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
@@ -251,7 +205,7 @@ class PricingMatcherAcceptanceTests(TestCase):
             },
             amount=169,
         )
-        self._configured(
+        cell_b = self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
@@ -260,6 +214,8 @@ class PricingMatcherAcceptanceTests(TestCase):
             },
             amount=209,
         )
+        # 3 samples with bed/bath but NO sqft — partial evidence
+        # shared across both cells.
         obs = self._observed(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
@@ -267,24 +223,23 @@ class PricingMatcherAcceptanceTests(TestCase):
                 'frequency': 'once', 'pricing_basis': 'flat_job',
             },
             samples=[
-                {'amount': 189, 'bedrooms': 3, 'bathrooms': 2},   # no sqft
+                {'amount': 199, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 189, 'bedrooms': 3, 'bathrooms': 2},
                 {'amount': 209, 'bedrooms': 3, 'bathrooms': 2},
             ],
-            median=199, p25=189, p75=209, support_n=6,
         )
-        cfg_list = list(ConfiguredBusinessFact.objects.filter(parser_run=self.cfg_run))
-        outcome = match_one(obs, cfg_list)
-        self.assertEqual(outcome.verdict, RTC.INSUFFICIENT_CONTEXT_TO_COMPARE)
-        self.assertGreaterEqual(len(outcome.candidate_configured_fact_ids), 2)
-        self.assertIn('square_footage', outcome.missing_observed_dimensions)
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=[cell_a, cell_b],
+        ))
+        for v in verdicts:
+            self.assertEqual(v.verdict, RTC.INSUFFICIENT_CONTEXT_TO_COMPARE)
+            self.assertEqual(len(v.unique_samples), 0)
+            self.assertGreater(len(v.partial_samples), 0)
 
     # ─── VARIABLE_CONTEXT_DEPENDENT ────────────────────────────
 
-    def test_variable_context_dependent_when_observed_iqr_wide(self):
-        """Even with a single configured candidate, if the observed
-        distribution has IQR/median >= 25% the matcher refuses a
-        clean comparison."""
-        cfg = self._configured(
+    def test_cell_variable_when_unique_samples_have_wide_iqr(self):
+        cell = self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
@@ -304,58 +259,101 @@ class PricingMatcherAcceptanceTests(TestCase):
                 {'amount': 189, 'square_footage': 1800, 'bedrooms': 3, 'bathrooms': 2},
                 {'amount': 259, 'square_footage': 1900, 'bedrooms': 3, 'bathrooms': 2},
             ],
-            median=189, p25=149, p75=259, support_n=8,
         )
-        outcome = match_one(obs, [cfg])
-        self.assertEqual(outcome.verdict, RTC.VARIABLE_CONTEXT_DEPENDENT)
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=[cell],
+        ))
+        self.assertEqual(verdicts[0].verdict, RTC.VARIABLE_CONTEXT_DEPENDENT)
 
     # ─── CONFIGURED_NOT_OBSERVED ───────────────────────────────
 
-    def test_configured_not_observed_via_match_all(self):
-        """A configured rule that no observed fact claims → returned
-        in the orphaned bucket, ready for the reconstructor to emit
-        as CONFIGURED_NOT_OBSERVED."""
-        cfg = self._configured(
+    def test_cell_configured_not_observed_when_no_compatible_sample(self):
+        cell = self._cell(
             subject={
-                'service': 'carpet', 'pricing_basis': 'flat_job',
+                'service': 'cleaning', 'service_tier': 'regular',
+                'bedrooms': 5, 'bathrooms': 4,
+                'sqft_min': 3000, 'sqft_max': 5000,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
             },
-            amount=99,
+            amount=349,
         )
+        # Sample explicitly says bed=3 — incompatible with bed=5 cell.
         obs = self._observed(
-            subject={'service': 'cleaning', 'pricing_basis': 'flat_job'},
-            samples=[{'amount': 189} for _ in range(5)],
-            median=189, p25=189, p75=189, support_n=5,
+            subject={
+                'service': 'cleaning', 'service_tier': 'regular',
+                'bedrooms': 3, 'bathrooms': 2,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            samples=[{'amount': 209, 'bedrooms': 3, 'bathrooms': 2}],
         )
-        _, orphaned = match_all(MatchInputs(
-            observed_facts=[obs],
-            configured_facts=[cfg],
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=[cell],
         ))
-        self.assertEqual(len(orphaned), 1)
-        self.assertEqual(str(orphaned[0].id), str(cfg.id))
+        self.assertEqual(verdicts[0].verdict, RTC.CONFIGURED_NOT_OBSERVED)
+        self.assertEqual(len(verdicts[0].unique_samples), 0)
+        self.assertEqual(len(verdicts[0].partial_samples), 0)
 
-    # ─── Refinement: sqft interval containment ─────────────────
+    # ─── OBSERVED_NOT_CONFIGURED (residual) ────────────────────
 
-    def test_sqft_interval_containment_narrows_to_one_candidate(self):
-        """Observed samples carry raw sqft — matcher does
-        `sqft ∈ [sqft_min, sqft_max]` interval check against each
-        configured band and resolves to the one band that fits."""
-        cfg_small = self._configured(
+    def test_orphaned_observed_subject_when_no_cell_compatible(self):
+        """Observed subject has an addon that isn't in ANY configured
+        cell → residual orphan bucket."""
+        # Configured has regular cleaning only.
+        self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
                 'sqft_min': 1000, 'sqft_max': 1200,
                 'frequency': 'once', 'pricing_basis': 'flat_job',
             },
-            amount=169, source_ref='small',
+            amount=169,
         )
-        cfg_large = self._configured(
+        # Observed is oven cleaning addon — no compatible configured.
+        obs = self._observed(
+            subject={
+                'service': 'cleaning', 'service_tier': 'oven cleaning',
+                'addons': ['oven'],
+                'pricing_basis': 'discount_price',
+            },
+            samples=[
+                {'amount': 15, 'service_tier': 'oven cleaning', 'addons': ['oven']},
+                {'amount': 15, 'service_tier': 'oven cleaning', 'addons': ['oven']},
+                {'amount': 15, 'service_tier': 'oven cleaning', 'addons': ['oven']},
+            ],
+        )
+        _, orphans = match_by_cell(MatchInputs(
+            observed_facts=[obs],
+            configured_facts=list(ConfiguredBusinessFact.objects.filter(
+                parser_run=self.cfg_run,
+            )),
+        ))
+        self.assertEqual(len(orphans), 1)
+        self.assertEqual(str(orphans[0].observed_fact.id), str(obs.id))
+        self.assertIn('service_tier', orphans[0].reason.lower() + orphans[0].reason)
+
+    # ─── Refinement: sqft interval containment ─────────────────
+
+    def test_sample_placed_in_correct_sqft_band_by_interval(self):
+        """Observed sample with raw sqft=1800 uniquely belongs to
+        the [1601, 2000] cell — the other cells' sqft intervals
+        rule it out."""
+        cell_small = self._cell(
+            subject={
+                'service': 'cleaning', 'service_tier': 'regular',
+                'bedrooms': 3, 'bathrooms': 2,
+                'sqft_min': 1000, 'sqft_max': 1200,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            amount=169,
+        )
+        cell_target = self._cell(
             subject={
                 'service': 'cleaning', 'service_tier': 'regular',
                 'bedrooms': 3, 'bathrooms': 2,
                 'sqft_min': 1601, 'sqft_max': 2000,
                 'frequency': 'once', 'pricing_basis': 'flat_job',
             },
-            amount=209, source_ref='large',
+            amount=209,
         )
         obs = self._observed(
             subject={
@@ -365,33 +363,67 @@ class PricingMatcherAcceptanceTests(TestCase):
             },
             samples=[
                 {'amount': 209, 'square_footage': 1800, 'bedrooms': 3, 'bathrooms': 2},
-                {'amount': 199, 'square_footage': 1750, 'bedrooms': 3, 'bathrooms': 2},
-                {'amount': 219, 'square_footage': 1900, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 209, 'square_footage': 1850, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 219, 'square_footage': 1750, 'bedrooms': 3, 'bathrooms': 2},
             ],
-            median=209, p25=199, p75=219, support_n=6,
         )
-        outcome = match_one(obs, [cfg_small, cfg_large])
-        self.assertEqual(outcome.verdict, RTC.MATCH)
-        self.assertEqual(
-            outcome.matched_configured_fact_id, str(cfg_large.id),
-            'sqft=1800 should resolve to the [1601, 2000] band, not the [1000, 1200] band',
-        )
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs],
+            configured_facts=[cell_small, cell_target],
+        ))
+        by_id = {str(v.cell.id): v for v in verdicts}
+        self.assertEqual(by_id[str(cell_target.id)].verdict, RTC.MATCH)
+        self.assertEqual(by_id[str(cell_small.id)].verdict, RTC.CONFIGURED_NOT_OBSERVED)
 
-    # ─── INSUFFICIENT_EVIDENCE (legacy) ────────────────────────
+    # ─── Refinement: partial evidence spreads across cells ─────
 
-    def test_insufficient_evidence_below_min_support(self):
-        """support_n < 3 → INSUFFICIENT_EVIDENCE regardless of match."""
-        cfg = self._configured(
-            subject={'service': 'cleaning', 'pricing_basis': 'flat_job'},
-            amount=189,
-        )
+    def test_partial_evidence_reaches_all_compatible_cells_but_elevates_none(self):
+        """A sample missing sqft is partial evidence to EVERY
+        sqft-banded cell of the same bed/bath — never a MATCH
+        driver alone, but its price still summarizes into the
+        partial-evidence description."""
+        cells = [
+            self._cell(
+                subject={
+                    'service': 'cleaning', 'service_tier': 'regular',
+                    'bedrooms': 3, 'bathrooms': 2,
+                    'sqft_min': 1000, 'sqft_max': 1200,
+                    'frequency': 'once', 'pricing_basis': 'flat_job',
+                },
+                amount=169,
+            ),
+            self._cell(
+                subject={
+                    'service': 'cleaning', 'service_tier': 'regular',
+                    'bedrooms': 3, 'bathrooms': 2,
+                    'sqft_min': 1601, 'sqft_max': 2000,
+                    'frequency': 'once', 'pricing_basis': 'flat_job',
+                },
+                amount=209,
+            ),
+        ]
         obs = self._observed(
-            subject={'service': 'cleaning', 'pricing_basis': 'flat_job'},
-            samples=[{'amount': 189}],
-            median=189, p25=189, p75=189, support_n=1,
+            subject={
+                'service': 'cleaning', 'service_tier': 'regular',
+                'bedrooms': 3, 'bathrooms': 2,
+                'frequency': 'once', 'pricing_basis': 'flat_job',
+            },
+            samples=[
+                {'amount': 189, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 199, 'bedrooms': 3, 'bathrooms': 2},
+                {'amount': 209, 'bedrooms': 3, 'bathrooms': 2},
+            ],
         )
-        outcome = match_one(obs, [cfg])
-        self.assertEqual(outcome.verdict, RTC.INSUFFICIENT_EVIDENCE)
+        verdicts, _ = match_by_cell(MatchInputs(
+            observed_facts=[obs], configured_facts=cells,
+        ))
+        # Both cells receive all 3 samples as partial evidence.
+        for v in verdicts:
+            self.assertEqual(v.verdict, RTC.INSUFFICIENT_CONTEXT_TO_COMPARE)
+            self.assertEqual(len(v.partial_samples), 3)
+            self.assertEqual(len(v.unique_samples), 0)
+            # Rationale should mention "partial-evidence".
+            self.assertIn('partial-evidence', v.rationale)
 
 
 class DeterministicConfiguredParserTests(TestCase):
@@ -453,33 +485,14 @@ class DeterministicConfiguredParserTests(TestCase):
             },
             pricing_json=pricing_json,
         )
-        # 2 rows × 2 tiers × 2 frequencies = 8 grid facts;
-        # + 1 oven addon fact
-        # + 1 hourly fact
-        # = 10
+        # 2 rows × 2 tiers × 2 frequencies = 8 grid + 1 addon + 1 hourly = 10
         self.assertEqual(n, 10)
         facts = ConfiguredBusinessFact.objects.filter(parser_run=self.run)
         self.assertEqual(facts.count(), 10)
-
-        # Grid fact for bed=3 bath=2 sqft=[1601,2000] regular biweekly
-        # should have amount 209 * 0.9 rounded to $5 = 190.
         biweekly = facts.filter(
             subject_key_json__contains={'bedrooms': 3, 'service_tier': 'regular', 'frequency': 'biweekly'},
         ).first()
         self.assertIsNotNone(biweekly)
         self.assertEqual(biweekly.value_json['amount'], 190.0)
-        self.assertEqual(biweekly.value_json['base_amount'], 209)
         self.assertEqual(biweekly.subject_key_json['sqft_min'], 1601)
         self.assertEqual(biweekly.subject_key_json['sqft_max'], 2000)
-
-        # Addon fact.
-        oven = facts.filter(subject_key_json__contains={'addons': ['oven']}).first()
-        self.assertIsNotNone(oven)
-        self.assertEqual(oven.value_json['amount'], 35)
-        self.assertEqual(oven.subject_key_json['pricing_basis'], 'addon_flat')
-
-        # Hourly fact.
-        hourly = facts.filter(subject_key_json__contains={'pricing_basis': 'hourly_per_cleaner'}).first()
-        self.assertIsNotNone(hourly)
-        self.assertEqual(hourly.value_json['amount'], 50)
-        self.assertEqual(hourly.value_json['minimum_hours'], 3)

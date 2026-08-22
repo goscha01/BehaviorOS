@@ -1,48 +1,59 @@
-"""Deterministic pricing matcher (Pipeline 1D, 2026-08-21 refresh).
+"""Deterministic pricing matcher — CONFIG-ANCHORED (2026-08-21 v2).
 
-Replaces the old subject_key_hash lookup in _reconstruct_pricing with
-a compatibility-based candidate search:
+Correction on 2026-08-21 (reviewer): the LB configured pricing table
+is the ontology. Every observed quote is a candidate observation OF
+a specific cell in that table. The matcher iterates configured
+cells first, not observed subjects, and asks per cell:
 
-  1. For each observed pricing fact, find compatible configured
-     candidates — same `service`, same `pricing_basis` (when both
-     sides declare one), and no dimension the observed side EXPLICITLY
-     states that contradicts a value the configured side pins.
-  2. Apply the observed side's known dimensions to narrow the
-     candidate set.
-       - Interval containment for sqft:
-           observed.square_footage ∈ [cfg.sqft_min, cfg.sqft_max]
-         An observed sqft with no LB-configured bounds is compatible
-         with any bounds-less configured rule for the same
-         bed/bath/tier.
-       - Exact match for bedrooms / bathrooms / service_tier /
-         frequency / addons when the observed side states them.
-  3. Verdict per the reviewer directive:
-       - One rule resolves        → compare price → MATCH / DIFFERS_FROM_CONFIG
-       - Multiple candidates left because observed lacks dims
-                                  → INSUFFICIENT_CONTEXT_TO_COMPARE
-                                    (with the list of missing dims)
-       - No compatible candidate  → OBSERVED_NOT_CONFIGURED
-       - Observed distribution is materially heterogeneous
-                                  → VARIABLE_CONTEXT_DEPENDENT
-  4. Configured facts never claimed by any observed fact
-       → CONFIGURED_NOT_OBSERVED
+  "Which observed quotes could belong here, and do they agree with
+   the price this cell has configured?"
 
-Never uses an LLM for the verdict. Price tolerance for MATCH is
-±10 % (mirrors the LB pricing engine's round-to-$5 semantics + the
-old reconstructor's tolerance so the schema change alone does not
-shift MATCH/DIFFERS boundaries).
+Per cell we split compatible observed samples into:
 
-The matcher consumes ObservedBusinessFact and ConfiguredBusinessFact
-rows via the shapes produced by P2 (deterministic config parser) and
-P3 (observed extractor v3). It gracefully accepts v2-shaped
-observed facts too — sqft is simply treated as missing when the fact
-only carries the legacy square_footage_bucket instead of raw sqft.
+  UNIQUE_HERE   — the sample's declared dimensions rule out every
+                  other cell, so this cell is the only place the
+                  quote could live. This is the primary evidence
+                  for the cell's verdict.
+
+  PARTIAL_HERE  — the sample is compatible with this cell AND with
+                  ≥ 1 other cell. Partial evidence: contributes to
+                  INSUFFICIENT_CONTEXT_TO_COMPARE narrative but
+                  never elevates a cell to MATCH or DIFFERS on its
+                  own.
+
+Cell verdicts:
+
+  MATCH                              ≥ MIN_UNIQUE unique samples
+                                     whose median is within ±tolerance
+                                     of cell.amount
+
+  DIFFERS_FROM_CONFIG                ≥ MIN_UNIQUE unique samples whose
+                                     median falls outside ±tolerance
+
+  VARIABLE_CONTEXT_DEPENDENT         ≥ MIN_UNIQUE unique samples but
+                                     their IQR/median >= threshold
+                                     (a single price can't capture
+                                     the variance the team quotes)
+
+  INSUFFICIENT_CONTEXT_TO_COMPARE    < MIN_UNIQUE unique samples but
+                                     partial evidence exists
+
+  CONFIGURED_NOT_OBSERVED            no compatible observed samples
+                                     (neither unique nor partial)
+
+Residual observed subjects — quotes that have NO compatible cell in
+the entire configured table (e.g. observed "$15 discount_price oven
+cleaning" while LB has only "$35 addon_flat oven") — are collected
+into a residual bucket and surfaced as OBSERVED_NOT_CONFIGURED for
+the operator's "doesn't fit your setup" review.
+
+No LLM.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 from apps.conversations.models import (
@@ -56,9 +67,8 @@ logger = logging.getLogger(__name__)
 
 # ─── Tunables ───────────────────────────────────────────────────────
 
-# MATCH tolerance for MATCH/DIFFERS_FROM_CONFIG on a single-candidate
-# comparison. ±10% of the configured amount, floored at $5 to allow
-# LB's own round-to-$5 recurring discount output to still MATCH.
+# MATCH tolerance for MATCH / DIFFERS_FROM_CONFIG on the median of
+# uniquely-attributed observed samples for a cell.
 PRICE_TOLERANCE_PCT = 0.10
 PRICE_TOLERANCE_FLOOR = 5.0
 
@@ -66,31 +76,70 @@ PRICE_TOLERANCE_FLOOR = 5.0
 # considered too heterogeneous to compare deterministically.
 VARIABLE_IQR_SHARE_THRESHOLD = 0.25
 
-# Minimum support (distinct conversations) to emit a verdict at all;
-# below this we emit INSUFFICIENT_EVIDENCE (legacy generic value —
-# not a pricing-specific verdict).
-MIN_SUPPORT_FOR_VERDICT = 3
+# Minimum unique observations to promote a cell out of
+# INSUFFICIENT_CONTEXT_TO_COMPARE into a hard MATCH / DIFFERS /
+# VARIABLE verdict.
+MIN_UNIQUE_SAMPLES_FOR_VERDICT = 3
 
 
-# ─── Public types ───────────────────────────────────────────────────
+# ─── Public dataclasses ────────────────────────────────────────────
 
 @dataclass
-class MatchOutcome:
-    """Result of matching one observed fact against the configured set."""
+class ObservedSample:
+    """Single per-quote observation with its declared dimensions.
+
+    Built from ObservedBusinessFact.value_json.dimension_samples[] +
+    the parent ObservedBusinessFact.subject_key_json (as fallback
+    when the per-quote sample didn't restate a dim the aggregate
+    subject already carries).
+    """
+    amount: float | None
+    service: str | None
+    service_tier: str | None
+    bedrooms: int | None
+    bathrooms: int | None
+    square_footage: int | None
+    frequency: str | None
+    pricing_basis: str | None
+    addons: list[str]
+    conversation_id: str | None
+    turn_id: str | None
+    observed_fact_id: str
+    subject_hash: str
+
+    def stated_dimensions(self) -> set[str]:
+        """Dimension keys the sample explicitly declares."""
+        out = set()
+        for k in ('service', 'service_tier', 'bedrooms', 'bathrooms',
+                  'square_footage', 'frequency', 'pricing_basis'):
+            if getattr(self, k) not in (None, ''):
+                out.add(k)
+        if self.addons:
+            out.add('addons')
+        return out
+
+
+@dataclass
+class CellVerdict:
+    """Per-configured-cell reconstruction output."""
+    cell: ConfiguredBusinessFact
     verdict: str  # ReconstructedBusinessFact.RelationshipToConfig value
+    consistency: str
     rationale: str
-    consistency: str  # ReconstructedBusinessFact.Consistency value
-    candidate_configured_fact_ids: list[str]
-    matched_configured_fact_id: str | None
-    missing_observed_dimensions: list[str]
-    price_comparison: dict | None  # {'observed_median':..,'configured':..,'delta_pct':..}
-    # Aggregate view of the configured candidates the observed fact is
-    # compatible with. Populated on INSUFFICIENT_CONTEXT_TO_COMPARE so
-    # the UI can honestly render "N rules configured, $X–$Y" instead
-    # of the misleading "Not configured yet". Empty on MATCH /
-    # DIFFERS_FROM_CONFIG (single rule matched) and on
-    # OBSERVED_NOT_CONFIGURED (no candidates).
-    candidate_summary: dict | None = None
+    unique_samples: list[ObservedSample] = field(default_factory=list)
+    partial_samples: list[ObservedSample] = field(default_factory=list)
+    price_comparison: dict | None = None
+    contributing_observed_fact_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class OrphanedObservedSubject:
+    """An observed pricing subject whose quotes couldn't be attributed
+    to any compatible configured cell. Surfaced as
+    OBSERVED_NOT_CONFIGURED for the operator to decide whether to add
+    a configured rule."""
+    observed_fact: ObservedBusinessFact
+    reason: str
 
 
 @dataclass
@@ -99,387 +148,415 @@ class MatchInputs:
     configured_facts: list[ConfiguredBusinessFact]
 
 
-# ─── Entry points ───────────────────────────────────────────────────
+# ─── Public entry point ────────────────────────────────────────────
 
-def match_all(inputs: MatchInputs) -> tuple[list[tuple[ObservedBusinessFact, MatchOutcome]],
-                                             list[ConfiguredBusinessFact]]:
-    """Run the matcher across every observed fact. Returns:
-      - list of (observed_fact, MatchOutcome) pairs
-      - list of configured facts that were never claimed by any
-        observed fact (→ CONFIGURED_NOT_OBSERVED)
+def match_by_cell(inputs: MatchInputs) -> tuple[list[CellVerdict], list[OrphanedObservedSubject]]:
+    """For each configured pricing cell, decide MATCH / DIFFERS /
+    INSUFFICIENT / VARIABLE / CONFIGURED_NOT_OBSERVED. Return per-cell
+    verdicts + a residual list of observed subjects that couldn't be
+    attributed to any cell.
     """
-    observed_by_id: dict[str, ObservedBusinessFact] = {
-        str(o.id): o for o in inputs.observed_facts
-    }
-    outcomes: list[tuple[ObservedBusinessFact, MatchOutcome]] = []
-    claimed_cfg_ids: set[str] = set()
+    # Flatten observed facts into per-quote samples.
+    samples = _flatten_samples(inputs.observed_facts)
+    logger.info(
+        'pricing matcher (config-anchored): %d configured cells × '
+        '%d observed samples',
+        len(inputs.configured_facts), len(samples),
+    )
 
-    for obs in observed_by_id.values():
-        outcome = match_one(obs, inputs.configured_facts)
-        outcomes.append((obs, outcome))
-        for cid in outcome.candidate_configured_fact_ids:
-            claimed_cfg_ids.add(cid)
+    # Pre-compute compatibility: for each sample, the list of cells it
+    # could belong to. This drives both cell verdicts (per cell, the
+    # samples where it appears) and orphan detection (samples that
+    # appear in ZERO cell lists).
+    compat_map: dict[str, list[str]] = {}  # sample_id -> [cell_id]
+    for s in samples:
+        sample_key = _sample_key(s)
+        compat_map[sample_key] = []
+    for cell in inputs.configured_facts:
+        for s in samples:
+            if _sample_compatible_with_cell(s, cell):
+                compat_map[_sample_key(s)].append(str(cell.id))
 
-    orphaned = [
-        c for c in inputs.configured_facts
-        if str(c.id) not in claimed_cfg_ids
-    ]
-    return outcomes, orphaned
+    # Build cell verdicts.
+    verdicts: list[CellVerdict] = []
+    for cell in inputs.configured_facts:
+        unique: list[ObservedSample] = []
+        partial: list[ObservedSample] = []
+        for s in samples:
+            candidates = compat_map[_sample_key(s)]
+            if str(cell.id) not in candidates:
+                continue
+            if len(candidates) == 1:
+                unique.append(s)
+            else:
+                partial.append(s)
+        verdicts.append(_verdict_for_cell(cell, unique, partial))
+
+    # Residual: observed subjects where NO sample fit any cell.
+    orphans: list[OrphanedObservedSubject] = []
+    seen_observed_ids: set[str] = set()
+    for f in inputs.observed_facts:
+        f_samples = [s for s in samples if s.observed_fact_id == str(f.id)]
+        if not f_samples:
+            continue
+        # A subject is orphaned when EVERY one of its samples has no
+        # compatible cell. If even one sample landed somewhere, the
+        # subject is represented via the cell verdicts and we don't
+        # emit it again.
+        has_any_placement = any(
+            compat_map[_sample_key(s)] for s in f_samples
+        )
+        if has_any_placement:
+            continue
+        if str(f.id) in seen_observed_ids:
+            continue
+        seen_observed_ids.add(str(f.id))
+        orphans.append(OrphanedObservedSubject(
+            observed_fact=f,
+            reason=_orphan_reason(f, inputs.configured_facts),
+        ))
+
+    return verdicts, orphans
 
 
-def match_one(
-    obs: ObservedBusinessFact,
-    configured_facts: Iterable[ConfiguredBusinessFact],
-) -> MatchOutcome:
-    """Compute a MatchOutcome for one observed pricing fact."""
-    obs_subj = obs.subject_key_json or {}
-    obs_value = obs.value_json or {}
-    support_n = obs.support_n or 0
+# ─── Verdict computation for one cell ──────────────────────────────
 
-    # Short-circuit: too little evidence to bother matching.
-    if support_n < MIN_SUPPORT_FOR_VERDICT:
-        return MatchOutcome(
-            verdict=ReconstructedBusinessFact.RelationshipToConfig.INSUFFICIENT_EVIDENCE,
+def _verdict_for_cell(
+    cell: ConfiguredBusinessFact,
+    unique: list[ObservedSample],
+    partial: list[ObservedSample],
+) -> CellVerdict:
+    RTC = ReconstructedBusinessFact.RelationshipToConfig
+    Con = ReconstructedBusinessFact.Consistency
+    cell_amount = _configured_amount(cell.value_json or {})
+
+    unique_amounts = [s.amount for s in unique if s.amount is not None]
+    partial_amounts = [s.amount for s in partial if s.amount is not None]
+    contributing = sorted({s.observed_fact_id for s in (unique + partial)})
+
+    if not unique and not partial:
+        return CellVerdict(
+            cell=cell,
+            verdict=RTC.CONFIGURED_NOT_OBSERVED,
+            consistency=Con.UNDETERMINED,
             rationale=(
-                f'support_n={support_n} < {MIN_SUPPORT_FOR_VERDICT}; '
-                'not enough evidence to emit a pricing verdict'
+                'no observed pricing quote is compatible with this '
+                'configured cell'
             ),
-            consistency=ReconstructedBusinessFact.Consistency.UNDETERMINED,
-            candidate_configured_fact_ids=[],
-            matched_configured_fact_id=None,
-            missing_observed_dimensions=[],
+            unique_samples=[], partial_samples=[],
             price_comparison=None,
+            contributing_observed_fact_ids=[],
         )
 
-    # Step 1: find compatible candidates.
-    plausible = _plausible_candidates(obs_subj, configured_facts)
-
-    # Step 2: apply per-quote dimension samples for finer selection.
-    # An observed fact aggregates many quotes; each quote may have
-    # raw sqft that lets us pick a specific configured row.
-    dim_samples = obs_value.get('dimension_samples') or []
-    if plausible and dim_samples:
-        narrowed = _narrow_by_samples(plausible, dim_samples)
-    else:
-        narrowed = plausible
-
-    # Step 3: verdict.
-    consistency = _consistency_from_iqr(obs_value, support_n)
-
-    if not plausible:
-        # No compatible configured rule under ANY subset of observed
-        # dims — this is a real "not in the config" case.
-        return MatchOutcome(
-            verdict=ReconstructedBusinessFact.RelationshipToConfig.OBSERVED_NOT_CONFIGURED,
+    # Not enough UNIQUE evidence for a hard verdict.
+    if len(unique_amounts) < MIN_UNIQUE_SAMPLES_FOR_VERDICT:
+        partial_desc = ''
+        if partial_amounts:
+            partial_med = _median(partial_amounts)
+            partial_desc = (
+                f' (backed by {len(partial_amounts)} partial-evidence '
+                f'quote{"s" if len(partial_amounts) != 1 else ""} '
+                f'worth median ${partial_med:.2f})'
+            )
+        return CellVerdict(
+            cell=cell,
+            verdict=RTC.INSUFFICIENT_CONTEXT_TO_COMPARE,
+            consistency=Con.UNDETERMINED,
             rationale=(
-                'no configured pricing rule is compatible with the '
-                f'observed context: {_describe_observed_context(obs_subj)}'
+                f'{len(unique_amounts)} uniquely-attributed observed '
+                f'quote{"s" if len(unique_amounts) != 1 else ""} '
+                f'(need >= {MIN_UNIQUE_SAMPLES_FOR_VERDICT}){partial_desc}'
             ),
-            consistency=consistency,
-            candidate_configured_fact_ids=[],
-            matched_configured_fact_id=None,
-            missing_observed_dimensions=[],
-            price_comparison=None,
+            unique_samples=unique, partial_samples=partial,
+            price_comparison=(
+                _price_comparison(unique_amounts, cell_amount)
+                if unique_amounts else None
+            ),
+            contributing_observed_fact_ids=contributing,
         )
 
-    if len(narrowed) == 1:
-        cfg = narrowed[0]
-        comparison = _compare_prices(obs_value, cfg)
-        if comparison is None:
-            # No usable observed median → treat as insufficient
-            # context (we have a candidate but nothing to compare).
-            return MatchOutcome(
-                verdict=ReconstructedBusinessFact.RelationshipToConfig.INSUFFICIENT_CONTEXT_TO_COMPARE,
-                rationale=(
-                    f'one compatible configured rule (cfg={cfg.id}) '
-                    'but observed price distribution has no usable '
-                    'median to compare against'
-                ),
-                consistency=consistency,
-                candidate_configured_fact_ids=[str(cfg.id)],
-                matched_configured_fact_id=None,
-                missing_observed_dimensions=['price_distribution'],
-                price_comparison=None,
-            )
-        if consistency == ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT:
-            return MatchOutcome(
-                verdict=ReconstructedBusinessFact.RelationshipToConfig.VARIABLE_CONTEXT_DEPENDENT,
-                rationale=(
-                    f'observed distribution IQR/median >= '
-                    f'{VARIABLE_IQR_SHARE_THRESHOLD:.0%}; a single '
-                    'configured rule cannot capture this variance'
-                ),
-                consistency=consistency,
-                candidate_configured_fact_ids=[str(cfg.id)],
-                matched_configured_fact_id=None,
-                missing_observed_dimensions=[],
-                price_comparison=comparison,
-            )
-        if comparison['within_tolerance']:
-            return MatchOutcome(
-                verdict=ReconstructedBusinessFact.RelationshipToConfig.MATCH,
-                rationale=(
-                    f'observed median ${comparison["observed_median"]:.2f} '
-                    f'vs configured ${comparison["configured"]:.2f} '
-                    f'(delta {comparison["delta_pct"]:+.1%}, within ±{PRICE_TOLERANCE_PCT:.0%})'
-                ),
-                consistency=consistency,
-                candidate_configured_fact_ids=[str(cfg.id)],
-                matched_configured_fact_id=str(cfg.id),
-                missing_observed_dimensions=[],
-                price_comparison=comparison,
-            )
-        return MatchOutcome(
-            verdict=ReconstructedBusinessFact.RelationshipToConfig.DIFFERS_FROM_CONFIG,
-            rationale=(
-                f'observed median ${comparison["observed_median"]:.2f} '
-                f'vs configured ${comparison["configured"]:.2f} '
-                f'(delta {comparison["delta_pct"]:+.1%}, outside ±{PRICE_TOLERANCE_PCT:.0%})'
-            ),
+    # Enough unique evidence — check price alignment.
+    unique_median = _median(unique_amounts)
+    consistency = _consistency_from_distribution(unique_amounts)
+    if cell_amount is None:
+        return CellVerdict(
+            cell=cell,
+            verdict=RTC.INSUFFICIENT_CONTEXT_TO_COMPARE,
             consistency=consistency,
-            candidate_configured_fact_ids=[str(cfg.id)],
-            matched_configured_fact_id=str(cfg.id),
-            missing_observed_dimensions=[],
+            rationale=(
+                f'{len(unique_amounts)} unique observed quotes '
+                f'(median ${unique_median:.2f}) but configured cell '
+                f'carries no comparable amount'
+            ),
+            unique_samples=unique, partial_samples=partial,
+            price_comparison=None,
+            contributing_observed_fact_ids=contributing,
+        )
+
+    if consistency == ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT:
+        return CellVerdict(
+            cell=cell,
+            verdict=RTC.VARIABLE_CONTEXT_DEPENDENT,
+            consistency=consistency,
+            rationale=(
+                f'{len(unique_amounts)} unique observed quotes span '
+                f'IQR/median >= {VARIABLE_IQR_SHARE_THRESHOLD:.0%}; '
+                f'single configured amount ${cell_amount:.2f} cannot '
+                'capture this variance'
+            ),
+            unique_samples=unique, partial_samples=partial,
+            price_comparison=_price_comparison(unique_amounts, cell_amount),
+            contributing_observed_fact_ids=contributing,
+        )
+
+    comparison = _price_comparison(unique_amounts, cell_amount)
+    if comparison['within_tolerance']:
+        return CellVerdict(
+            cell=cell,
+            verdict=RTC.MATCH,
+            consistency=consistency,
+            rationale=(
+                f'{len(unique_amounts)} unique observed quotes with '
+                f'median ${comparison["observed_median"]:.2f} vs '
+                f'configured ${comparison["configured"]:.2f} '
+                f'(delta {comparison["delta_pct"]:+.1%}, within '
+                f'±{PRICE_TOLERANCE_PCT:.0%})'
+            ),
+            unique_samples=unique, partial_samples=partial,
             price_comparison=comparison,
+            contributing_observed_fact_ids=contributing,
         )
-
-    # More than one plausible configured candidate — observed
-    # context lacks the discriminators to choose. Report which
-    # dimensions vary across the candidates AND include a compact
-    # summary of the candidate amounts so the UI can render
-    # "N configured rules span $min–$max" instead of "Not
-    # configured yet".
-    missing = _dimensions_varying_across_candidates(narrowed, obs_subj)
-    candidate_summary = _summarize_candidates(narrowed)
-    return MatchOutcome(
-        verdict=ReconstructedBusinessFact.RelationshipToConfig.INSUFFICIENT_CONTEXT_TO_COMPARE,
-        rationale=(
-            f'{len(narrowed)} configured rules are plausible for the '
-            f'observed context {_describe_observed_context(obs_subj)}; '
-            f'missing observed dimensions to choose among them: '
-            f'{", ".join(missing) if missing else "(unable to determine)"}'
-        ),
+    return CellVerdict(
+        cell=cell,
+        verdict=RTC.DIFFERS_FROM_CONFIG,
         consistency=consistency,
-        candidate_configured_fact_ids=[str(c.id) for c in narrowed],
-        matched_configured_fact_id=None,
-        missing_observed_dimensions=missing,
-        price_comparison=None,
-        candidate_summary=candidate_summary,
+        rationale=(
+            f'{len(unique_amounts)} unique observed quotes with '
+            f'median ${comparison["observed_median"]:.2f} vs '
+            f'configured ${comparison["configured"]:.2f} '
+            f'(delta {comparison["delta_pct"]:+.1%}, outside '
+            f'±{PRICE_TOLERANCE_PCT:.0%})'
+        ),
+        unique_samples=unique, partial_samples=partial,
+        price_comparison=comparison,
+        contributing_observed_fact_ids=contributing,
     )
 
 
-def _summarize_candidates(candidates: list[ConfiguredBusinessFact]) -> dict:
-    """Compact per-verdict summary of the configured candidates a
-    matcher call ended up with. Fed straight to the UI so the
-    'Currently in LeadBridge' column can say
-    "3 rules · $149–$329" instead of showing empty."""
-    amounts = []
-    for c in candidates:
-        a = _configured_amount(c.value_json or {})
-        if a is not None:
-            amounts.append(float(a))
-    if not amounts:
-        return {
-            'count': len(candidates),
-            'amount_min': None,
-            'amount_max': None,
-        }
-    return {
-        'count': len(candidates),
-        'amount_min': min(amounts),
-        'amount_max': max(amounts),
-    }
+# ─── Compatibility (per-sample × per-cell) ─────────────────────────
 
+def _sample_compatible_with_cell(
+    s: ObservedSample, cell: ConfiguredBusinessFact,
+) -> bool:
+    """A sample is compatible with a cell when every dimension the
+    sample DECLARES is consistent with the cell's dimensions.
 
-# ─── Compatibility ─────────────────────────────────────────────────
-
-# Dimensions on which observed vs configured MUST agree when both
-# sides declare them. Any of these being explicitly incompatible
-# eliminates a candidate.
-COMPAT_DIMENSIONS = (
-    'service', 'service_tier', 'bedrooms', 'bathrooms',
-    'frequency', 'pricing_basis',
-)
-
-
-def _plausible_candidates(
-    obs_subj: dict, configured: Iterable[ConfiguredBusinessFact],
-) -> list[ConfiguredBusinessFact]:
-    """Filter configured facts to those compatible with the observed
-    subject. Compatibility rules:
-
-    - Service: MUST match when both are declared. When observed has
-      no service, no candidate is plausible (a matcher without any
-      shared discriminator would explode).
-    - service_tier, bedrooms, bathrooms, frequency, pricing_basis:
-      when observed declares → must equal configured (when
-      configured declares). Silent on either side is compatible.
-    - sqft interval: handled in _narrow_by_samples (per-quote).
-    - addons: when observed lists addons, configured must list a
-      compatible superset OR the same set. When observed has no
-      addons declared, addon-only configured rules (pricing_basis=
-      addon_flat/addon_hourly) are excluded unless the observed
-      pricing_basis is also addon_*.
+    - Service must match (both sides always declare it; observed
+      side normalizes via observed_config.base.normalize_service).
+    - service_tier / bedrooms / bathrooms / frequency / pricing_basis
+      must equal cell's value WHEN the sample declares them; silent
+      on either side is compatible (the "unknown stays unknown"
+      invariant).
+    - sqft: interval containment when both sides carry it. A cell
+      with no sqft bounds is compatible with any sqft. A sample
+      without sqft is compatible with any bounds — but such
+      universal samples become partial evidence spread across
+      multiple cells and never elevate a cell to MATCH alone.
+    - addons: sample.addons must be a superset of cell.addons when
+      cell declares addons (i.e. cell requires the addon; sample
+      may include additional addons alongside).
     """
-    obs_service = _norm_scalar(obs_subj.get('service'))
-    if obs_service is None:
-        return []
-    out: list[ConfiguredBusinessFact] = []
-    for cfg in configured:
-        c_subj = cfg.subject_key_json or {}
-        cfg_service = _norm_scalar(c_subj.get('service'))
-        if cfg_service is not None and cfg_service != obs_service:
-            continue
-        # Compatibility check for each compat dimension.
-        skip = False
-        for dim in COMPAT_DIMENSIONS:
-            o = _norm_scalar(obs_subj.get(dim))
-            c = _norm_scalar(c_subj.get(dim))
-            if o is None or c is None:
-                continue
-            if o != c:
-                skip = True
-                break
-        if skip:
-            continue
-        # Addon compatibility.
-        obs_addons = _norm_list(obs_subj.get('addons'))
-        cfg_addons = _norm_list(c_subj.get('addons'))
-        if obs_addons and cfg_addons:
-            if not set(cfg_addons).issubset(set(obs_addons)):
-                continue
-        elif not obs_addons and cfg_addons:
-            # Observed didn't declare addons but configured is an
-            # addon-only rule — only compatible if observed
-            # pricing_basis is addon-flavored too.
-            obs_basis = _norm_scalar(obs_subj.get('pricing_basis'))
-            if obs_basis is None or not obs_basis.startswith('addon_'):
-                continue
-        out.append(cfg)
+    csubj = cell.subject_key_json or {}
+    if _norm_scalar(s.service) is None:
+        return False
+    cell_service = _norm_scalar(csubj.get('service'))
+    if cell_service is not None and cell_service != _norm_scalar(s.service):
+        return False
+    for dim, sample_val in (
+        ('service_tier', s.service_tier),
+        ('frequency', s.frequency),
+        ('pricing_basis', s.pricing_basis),
+    ):
+        cell_val = _norm_scalar(csubj.get(dim))
+        sv = _norm_scalar(sample_val)
+        if cell_val is not None and sv is not None and cell_val != sv:
+            return False
+    for dim, sample_val in (
+        ('bedrooms', s.bedrooms),
+        ('bathrooms', s.bathrooms),
+    ):
+        cell_val = _as_int(csubj.get(dim))
+        sv = _as_int(sample_val)
+        if cell_val is not None and sv is not None and cell_val != sv:
+            return False
+    # sqft interval containment.
+    cell_sqft_min = _as_int(csubj.get('sqft_min'))
+    cell_sqft_max = _as_int(csubj.get('sqft_max'))
+    s_sqft = _as_int(s.square_footage)
+    if (
+        cell_sqft_min is not None and cell_sqft_max is not None
+        and s_sqft is not None
+        and not (cell_sqft_min <= s_sqft <= cell_sqft_max)
+    ):
+        return False
+    # Addons: if cell requires addons, sample must include them.
+    cell_addons = _norm_list(csubj.get('addons'))
+    sample_addons = _norm_list(s.addons)
+    if cell_addons and not set(cell_addons).issubset(set(sample_addons)):
+        return False
+    return True
+
+
+# ─── Sample flattening ─────────────────────────────────────────────
+
+def _flatten_samples(
+    observed_facts: Iterable[ObservedBusinessFact],
+) -> list[ObservedSample]:
+    """Turn observed facts into per-quote samples for the matcher.
+    Each sample inherits missing dims from its parent aggregate
+    subject_key so per-quote raw sqft can coexist with per-subject
+    bed/bath."""
+    out: list[ObservedSample] = []
+    for f in observed_facts:
+        subj = f.subject_key_json or {}
+        parent_service = subj.get('service')
+        parent_tier = subj.get('service_tier')
+        parent_bed = subj.get('bedrooms')
+        parent_bath = subj.get('bathrooms')
+        parent_freq = subj.get('frequency')
+        parent_basis = subj.get('pricing_basis')
+        parent_addons = subj.get('addons') or []
+        for s in (f.value_json or {}).get('dimension_samples') or []:
+            out.append(ObservedSample(
+                amount=_as_float(s.get('amount')),
+                service=s.get('service') or parent_service,
+                service_tier=s.get('service_tier') or parent_tier,
+                bedrooms=_as_int(s.get('bedrooms') if s.get('bedrooms') is not None else parent_bed),
+                bathrooms=_as_int(s.get('bathrooms') if s.get('bathrooms') is not None else parent_bath),
+                square_footage=_as_int(s.get('square_footage')),
+                frequency=s.get('frequency') or parent_freq,
+                pricing_basis=s.get('pricing_basis') or parent_basis,
+                addons=list(s.get('addons') or parent_addons),
+                conversation_id=s.get('conversation_id'),
+                turn_id=s.get('turn_id'),
+                observed_fact_id=str(f.id),
+                subject_hash=f.subject_key_hash,
+            ))
     return out
 
 
-def _narrow_by_samples(
-    candidates: list[ConfiguredBusinessFact],
-    dim_samples: list[dict],
-) -> list[ConfiguredBusinessFact]:
-    """Given per-quote dimension samples (each with raw sqft +
-    resolved bedrooms/bathrooms), narrow the candidate set by
-    interval containment on sqft and equality on the coarse dims.
-
-    A candidate is KEPT if AT LEAST ONE sample is compatible with it
-    (i.e. its sqft ∈ [sqft_min, sqft_max] when both sides declare
-    them, and its bedrooms / bathrooms equal the candidate's).
-
-    If none of the samples carry any narrowing dimension (e.g. the
-    observed extractor could not resolve sqft for any quote), the
-    candidate set is returned unchanged and the caller resolves via
-    INSUFFICIENT_CONTEXT_TO_COMPARE.
-    """
-    if not candidates or not dim_samples:
-        return candidates
-    any_narrowing_signal = any(
-        (s.get('square_footage') is not None
-         or s.get('bedrooms') is not None
-         or s.get('bathrooms') is not None)
-        for s in dim_samples
+def _sample_key(s: ObservedSample) -> str:
+    """Opaque key for compat_map. Uses observed_fact_id +
+    conversation_id + turn_id + amount so two identical (amount,
+    dims) samples from different quotes stay distinct."""
+    return (
+        f'{s.observed_fact_id}::{s.conversation_id or ""}::'
+        f'{s.turn_id or ""}::{s.amount}'
     )
-    if not any_narrowing_signal:
-        return candidates
-    kept: list[ConfiguredBusinessFact] = []
-    for cfg in candidates:
-        c_subj = cfg.subject_key_json or {}
-        c_sqft_min = _as_int(c_subj.get('sqft_min'))
-        c_sqft_max = _as_int(c_subj.get('sqft_max'))
-        c_bed = _as_int(c_subj.get('bedrooms'))
-        c_bath = _as_int(c_subj.get('bathrooms'))
-        for s in dim_samples:
-            s_sqft = _as_int(s.get('square_footage'))
-            s_bed = _as_int(s.get('bedrooms'))
-            s_bath = _as_int(s.get('bathrooms'))
-            if c_bed is not None and s_bed is not None and c_bed != s_bed:
-                continue
-            if c_bath is not None and s_bath is not None and c_bath != s_bath:
-                continue
-            if c_sqft_min is not None and c_sqft_max is not None and s_sqft is not None:
-                if not (c_sqft_min <= s_sqft <= c_sqft_max):
-                    continue
-            kept.append(cfg)
-            break
-    return kept
 
 
-def _dimensions_varying_across_candidates(
-    candidates: list[ConfiguredBusinessFact], obs_subj: dict,
-) -> list[str]:
-    """Return the dimension names that (a) are not declared on the
-    observed side and (b) vary across the compatible configured
-    candidates — the observer needs to state one of them to
-    disambiguate."""
-    reportable = (
-        'service_tier', 'bedrooms', 'bathrooms',
-        'sqft_min', 'sqft_max', 'frequency', 'addons',
+# ─── Orphan detection ──────────────────────────────────────────────
+
+def _orphan_reason(
+    f: ObservedBusinessFact, configured: list[ConfiguredBusinessFact],
+) -> str:
+    """Human-readable explanation for why an observed subject has no
+    compatible configured cell. Used in the OBSERVED_NOT_CONFIGURED
+    rationale."""
+    subj = f.subject_key_json or {}
+    service = _norm_scalar(subj.get('service'))
+    same_service = [
+        c for c in configured
+        if _norm_scalar((c.subject_key_json or {}).get('service')) == service
+    ]
+    if not same_service:
+        return (
+            f'no configured pricing rule for service={service!r}; '
+            'observed subject falls entirely outside the LB pricing '
+            'table'
+        )
+    # There ARE rules for this service — the incompatibility must be
+    # on another dimension.
+    basis = _norm_scalar(subj.get('pricing_basis'))
+    same_basis = [
+        c for c in same_service
+        if _norm_scalar((c.subject_key_json or {}).get('pricing_basis')) == basis
+    ]
+    if not same_basis:
+        return (
+            f'observed pricing_basis={basis!r} has no compatible '
+            f'configured rule under service={service!r}; the LB '
+            'table uses other bases for this service'
+        )
+    return (
+        f'observed context {_describe_observed_subject(subj)} '
+        f'is not compatible with any of the {len(same_service)} '
+        f'configured rules under service={service!r}'
     )
-    missing: list[str] = []
-    for dim in reportable:
-        if obs_subj.get(dim) not in (None, [], ''):
-            continue
-        values = set()
-        for c in candidates:
-            v = (c.subject_key_json or {}).get(dim)
-            if v is None:
-                continue
-            if isinstance(v, list):
-                v = tuple(v)
-            values.add(v)
-        if len(values) > 1:
-            # collapse sqft_min/sqft_max into one reported dim
-            if dim in ('sqft_min', 'sqft_max'):
-                if 'square_footage' not in missing:
-                    missing.append('square_footage')
-            else:
-                missing.append(dim)
-    return missing
 
 
-# ─── Price comparison ──────────────────────────────────────────────
+# ─── Number crunching ──────────────────────────────────────────────
 
-def _compare_prices(
-    obs_value: dict, cfg: ConfiguredBusinessFact,
-) -> dict | None:
-    """Compare the observed aggregate median against the configured
-    amount. Returns None when we cannot compute a comparison (missing
-    median or missing configured amount)."""
-    stats = obs_value.get('amount_stats') or {}
-    median = _as_float(stats.get('median'))
-    cfg_amount = _configured_amount(cfg.value_json or {})
-    if median is None or cfg_amount is None:
-        return None
-    delta = median - cfg_amount
-    delta_pct = delta / cfg_amount if cfg_amount else 0.0
-    tolerance = max(cfg_amount * PRICE_TOLERANCE_PCT, PRICE_TOLERANCE_FLOOR)
+def _price_comparison(unique_amounts: list[float], cell_amount: float) -> dict:
+    median = _median(unique_amounts)
+    delta = median - cell_amount
+    delta_pct = delta / cell_amount if cell_amount else 0.0
+    tolerance = max(cell_amount * PRICE_TOLERANCE_PCT, PRICE_TOLERANCE_FLOOR)
     return {
         'observed_median': float(median),
-        'configured': float(cfg_amount),
+        'configured': float(cell_amount),
         'delta': float(delta),
         'delta_pct': float(delta_pct),
         'tolerance': float(tolerance),
         'within_tolerance': abs(delta) <= tolerance,
+        'sample_n': len(unique_amounts),
     }
 
 
+def _consistency_from_distribution(amounts: list[float]) -> str:
+    if not amounts:
+        return ReconstructedBusinessFact.Consistency.UNDETERMINED
+    med = _median(amounts)
+    if med <= 0 or len(amounts) < 3:
+        return ReconstructedBusinessFact.Consistency.CONSISTENT
+    p25, p75 = _percentile(amounts, 25), _percentile(amounts, 75)
+    iqr_share = (p75 - p25) / med if med > 0 else 0.0
+    if iqr_share >= VARIABLE_IQR_SHARE_THRESHOLD:
+        return ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT
+    return ReconstructedBusinessFact.Consistency.CONSISTENT
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def _percentile(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * (p / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    if lo == hi:
+        return s[lo]
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
 def _configured_amount(value_json: dict) -> float | None:
-    """Extract a comparable configured amount from a
-    ConfiguredBusinessFact.value_json produced by either the
-    deterministic parser (P2) or the legacy LLM parser."""
     if not isinstance(value_json, dict):
         return None
-    # Deterministic parser (P2) stores post-discount amount here.
     for k in ('amount', 'median', 'value', 'price'):
         v = _as_float(value_json.get(k))
         if v is not None:
             return v
-    # LLM parser sometimes emits min_amount + max_amount only.
     lo = _as_float(value_json.get('min_amount'))
     hi = _as_float(value_json.get('max_amount'))
     if lo is not None and hi is not None:
@@ -487,36 +564,16 @@ def _configured_amount(value_json: dict) -> float | None:
     return None
 
 
-def _consistency_from_iqr(obs_value: dict, support_n: int) -> str:
-    stats = obs_value.get('amount_stats') or {}
-    median = _as_float(stats.get('median'))
-    p25 = _as_float(stats.get('p25'))
-    p75 = _as_float(stats.get('p75'))
-    if median is None or p25 is None or p75 is None or median <= 0:
-        return (
-            ReconstructedBusinessFact.Consistency.CONSISTENT
-            if support_n >= MIN_SUPPORT_FOR_VERDICT
-            else ReconstructedBusinessFact.Consistency.UNDETERMINED
-        )
-    iqr_share = (p75 - p25) / median
-    if iqr_share >= VARIABLE_IQR_SHARE_THRESHOLD and support_n >= MIN_SUPPORT_FOR_VERDICT:
-        return ReconstructedBusinessFact.Consistency.CONTEXT_DEPENDENT
-    return (
-        ReconstructedBusinessFact.Consistency.CONSISTENT
-        if support_n >= MIN_SUPPORT_FOR_VERDICT
-        else ReconstructedBusinessFact.Consistency.UNDETERMINED
-    )
+# ─── Rendering helpers ─────────────────────────────────────────────
 
-
-def _describe_observed_context(obs_subj: dict) -> str:
-    """Compact string for rationale messages."""
+def _describe_observed_subject(subj: dict) -> str:
     parts = []
     for k in ('service', 'service_tier', 'bedrooms', 'bathrooms',
               'frequency', 'pricing_basis'):
-        v = obs_subj.get(k)
+        v = subj.get(k)
         if v not in (None, '', []):
             parts.append(f'{k}={v}')
-    addons = obs_subj.get('addons')
+    addons = subj.get('addons')
     if addons:
         parts.append(f'addons={sorted(addons)}')
     return '{' + ', '.join(parts) + '}'
@@ -557,3 +614,16 @@ def _as_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# ─── Legacy alias so any importer still using match_all keeps building ──
+
+def match_all(inputs: MatchInputs):
+    """Deprecated shim. The old observed-primary API returned
+    (per-observed outcomes, orphaned configured). Callers should
+    migrate to match_by_cell.
+    """
+    raise NotImplementedError(
+        'pricing_matcher.match_all() was replaced by match_by_cell() '
+        'on 2026-08-21. See module docstring.'
+    )
