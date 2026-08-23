@@ -45,9 +45,9 @@ def _make_reconstruction(org):
         org=org,
         source_system='leadbridge',
         tenant_external_id='test-tenant',
-        status='completed',
-        config_hash='hash',
-        raw_config_json={},
+        contract_version='v1',
+        raw_config={},
+        raw_config_sha256='h' * 64,
     )
     parser = ConfiguredFactParserRun.objects.create(
         snapshot=snapshot, domain='pricing',

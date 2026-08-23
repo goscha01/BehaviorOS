@@ -3,7 +3,7 @@
 Minimal semantic per operator directive (2026-08-23):
 
   1. Read the tenant's existing response-time policy from the latest
-     TenantConfigSnapshot.raw_config_json. NO defaults — absent policy
+     TenantConfigSnapshot.raw_config. NO defaults — absent policy
      yields UNKNOWN, never a fabricated compliance warning.
   2. Find the first customer message in the conversation.
   3. Find the first agent message that comes after it.
@@ -25,7 +25,7 @@ Does NOT add:
 
 Only Reads:
   * ConversationTurn (occurred_at, speaker, source_turn_id)
-  * TenantConfigSnapshot.raw_config_json (candidate SLA paths)
+  * TenantConfigSnapshot.raw_config (candidate SLA paths)
 """
 
 from __future__ import annotations
@@ -193,7 +193,7 @@ class ResponseTimingDimension(BaseDimension):
             .filter(org=conversation.org, source_system='leadbridge')
             .order_by('-created_at').first()
         )
-        raw = snapshot.raw_config_json if snapshot else None
+        raw = snapshot.raw_config if snapshot else None
         sla_seconds, sla_path = _read_sla_seconds(raw)
 
         latency_str = _format_latency(latency_seconds)

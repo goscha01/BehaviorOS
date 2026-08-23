@@ -62,9 +62,9 @@ def _snapshot(org, raw_config):
     return TenantConfigSnapshot.objects.create(
         org=org, source_system='leadbridge',
         tenant_external_id='test-tenant',
-        status='completed',
-        config_hash='h',
-        raw_config_json=raw_config,
+        contract_version='v1',
+        raw_config=raw_config,
+        raw_config_sha256='h' * 64,
     )
 
 
