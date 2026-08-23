@@ -1846,6 +1846,25 @@ class PricingAcceptanceReportView(APIView):
                 for f in by_cat.get(cat, [])[:per_cat]
             ]
 
+        # Per-verdict examples — for post-canonical-context audit of
+        # every verdict class, especially the singletons like
+        # DIFFERS_FROM_CONFIG that never surface in category examples.
+        by_verdict_examples: dict[str, list] = {}
+        by_verdict_facts: dict[str, list] = defaultdict(list)
+        for f in facts:
+            by_verdict_facts[f.relationship_to_config].append(f)
+        try:
+            examples_per_verdict = int(
+                request.query_params.get('examples_per_verdict') or 5
+            )
+        except ValueError:
+            examples_per_verdict = 5
+        for verdict, verdict_facts in by_verdict_facts.items():
+            by_verdict_examples[verdict] = [
+                _describe_example(f, cfg_by_id)
+                for f in verdict_facts[:examples_per_verdict]
+            ]
+
         return Response({
             'tenant_external_id': tenant,
             'reconstruction_run_id': str(run.id),
@@ -1859,6 +1878,7 @@ class PricingAcceptanceReportView(APIView):
                 c: len(by_cat.get(c, [])) for c in REQUIRED_CATEGORIES
             },
             'examples': examples,
+            'examples_by_verdict': by_verdict_examples,
         })
 
 
