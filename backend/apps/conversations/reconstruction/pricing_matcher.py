@@ -407,23 +407,32 @@ def _verdict_for_cell(
 def _sample_compatible_with_cell(
     s: ObservedSample, cell: ConfiguredBusinessFact,
 ) -> bool:
-    """A sample is compatible with a cell when every dimension the
-    sample DECLARES is consistent with the cell's dimensions.
+    """A sample is compatible with a cell only when every dimension
+    the CELL requires is declared by the sample AND consistent with
+    the cell's value.
+
+    Invariant (operator directive 2026-08-23, false-attribution fix):
+      **Missing dimension cannot behave like a wildcard when that
+      dimension is required to select among configured pricing cells.**
+
+    In other words: silence on the sample side is NOT compatibility.
+    A quote that never established sqft cannot be attributed to a
+    sqft-banded cell; a quote that never established service_tier
+    cannot be attributed to a tier-specific cell; and so on.
 
     - Service must match (both sides always declare it; observed
       side normalizes via observed_config.base.normalize_service).
-    - service_tier / bedrooms / bathrooms / frequency / pricing_basis
-      must equal cell's value WHEN the sample declares them; silent
-      on either side is compatible (the "unknown stays unknown"
-      invariant).
-    - sqft: interval containment when both sides carry it. A cell
-      with no sqft bounds is compatible with any sqft. A sample
-      without sqft is compatible with any bounds — but such
-      universal samples become partial evidence spread across
-      multiple cells and never elevate a cell to MATCH alone.
+    - service_tier / pricing_basis / bedrooms / bathrooms: when the
+      cell declares the dimension, the sample must too, and they
+      must be equal.
+    - sqft: when the cell declares sqft bounds, the sample must
+      declare square_footage AND fall inside the interval. Sample
+      without sqft can only match cells without sqft bounds.
+    - frequency: only enforced for frequency_discount cells (the
+      grid flat_job cells don't declare frequency). When the cell
+      declares frequency, the sample must too, and they must equal.
     - addons: sample.addons must be a superset of cell.addons when
-      cell declares addons (i.e. cell requires the addon; sample
-      may include additional addons alongside).
+      the cell requires addons.
     """
     csubj = cell.subject_key_json or {}
     # Service must always be declared and canonically match. Both
@@ -435,53 +444,54 @@ def _sample_compatible_with_cell(
     cell_service = normalize_service(csubj.get('service'))
     if cell_service is not None and cell_service != obs_service:
         return False
-    # service_tier / pricing_basis: plain lowercased-string equality
-    # when both sides declare them.
+    # service_tier / pricing_basis: when cell declares, sample must
+    # declare + equal. Silence on the sample side is NOT compatibility.
     for dim, sample_val in (
         ('service_tier', s.service_tier),
         ('pricing_basis', s.pricing_basis),
     ):
         cell_val = _norm_scalar(csubj.get(dim))
+        if cell_val is None:
+            continue
         sv = _norm_scalar(sample_val)
-        if cell_val is not None and sv is not None and cell_val != sv:
+        if sv is None or sv != cell_val:
             return False
     # frequency compat depends on the cell's pricing_basis:
-    #   flat_job cells (the grid) — no `frequency` in the subject;
+    #   flat_job / addon_* cells — no `frequency` in the subject;
     #     any observed frequency is compatible (the frequency discount
-    #     is applied as a separate factor at runtime, not a separate
-    #     cell)
-    #   frequency_discount cells — MUST equal the observed frequency
-    #     (that's the whole point of the fact)
+    #     applies as a separate factor at runtime, not a separate cell).
+    #   frequency_discount cells — MUST equal the observed frequency;
+    #     silence on the sample side is NOT compatibility.
     cell_basis = _norm_scalar(csubj.get('pricing_basis'))
     if cell_basis == 'frequency_discount':
         cell_freq = normalize_frequency(csubj.get('frequency'))
-        obs_freq = normalize_frequency(s.frequency)
-        if cell_freq is not None and obs_freq is not None and cell_freq != obs_freq:
-            return False
-    # else: grid cells (flat_job) don't carry frequency; the base
-    # cell matches any-frequency observed quote for its bed/bath/
-    # sqft/tier. Observed samples for recurring frequencies still
-    # go through the same compat — the matcher currently doesn't
-    # try to unwind the frequency discount, but at least the row
-    # itself becomes reachable.
+        if cell_freq is not None:
+            obs_freq = normalize_frequency(s.frequency)
+            if obs_freq is None or obs_freq != cell_freq:
+                return False
     for dim, sample_val in (
         ('bedrooms', s.bedrooms),
         ('bathrooms', s.bathrooms),
     ):
         cell_val = _as_int(csubj.get(dim))
+        if cell_val is None:
+            continue
         sv = _as_int(sample_val)
-        if cell_val is not None and sv is not None and cell_val != sv:
+        if sv is None or sv != cell_val:
             return False
-    # sqft interval containment.
+    # sqft interval containment. When cell declares bounds, sample
+    # must declare a square_footage inside the interval; silence on
+    # the sample side is NOT compatibility (was the source of the
+    # false-attribution bug flagged 2026-08-23 for the airbnb
+    # 3BR/3BA 1500-1800 sqft "$125" cell).
     cell_sqft_min = _as_int(csubj.get('sqft_min'))
     cell_sqft_max = _as_int(csubj.get('sqft_max'))
-    s_sqft = _as_int(s.square_footage)
-    if (
-        cell_sqft_min is not None and cell_sqft_max is not None
-        and s_sqft is not None
-        and not (cell_sqft_min <= s_sqft <= cell_sqft_max)
-    ):
-        return False
+    if cell_sqft_min is not None and cell_sqft_max is not None:
+        s_sqft = _as_int(s.square_footage)
+        if s_sqft is None:
+            return False
+        if not (cell_sqft_min <= s_sqft <= cell_sqft_max):
+            return False
     # Addons: if cell requires addons, sample must include them.
     cell_addons = _norm_list(csubj.get('addons'))
     sample_addons = _norm_list(s.addons)
