@@ -1600,25 +1600,29 @@ class ExtractionRunStatusView(APIView):
 class LeadMetadataCoverageView(APIView):
     """GET /api/v1/insights/audit/lead-metadata-coverage?tenantId=<uuid>
 
-    Diagnostic: for the tenant's ingested conversations, report how
-    many have an OutcomeSnapshot carrying `source_payload['lb_lead']`,
-    and how many of those payloads actually contain
-    bedrooms / bathrooms / sqft. Answers "does my pricing extractor's
-    v4 lead-metadata enrichment have anything to enrich?" without
-    guessing.
+    Diagnostic — post-canonical-context version. Reports per-attribute
+    coverage from persisted `ConversationContext` rows AND the thin
+    OutcomeSnapshot payload state (kept as the pre-refactor baseline
+    reference).
+
+    Answers "how many conversations know each canonical attribute,
+    and from what source?" — the exact metric Phase 7 acceptance
+    needs to show before/after the LB /leads/context endpoint deploys.
     """
 
     authentication_classes = [InsightsServiceTokenAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        from collections import Counter
+        from apps.conversations.context.types import (
+            ALL_ATTRIBUTES,
+        )
         from apps.conversations.models import (
             Conversation as _Conv,
+            ConversationContext as _CC,
             OutcomeSnapshot as _OS,
             TenantConfigSnapshot as _TCS,
-        )
-        from apps.conversations.observed_config.pricing.lead_metadata import (
-            extract_dimensions_from_lead,
         )
 
         tenant = (request.query_params.get('tenantId') or '').strip()
@@ -1639,63 +1643,51 @@ class LeadMetadataCoverageView(APIView):
         for c in convs.values('source').distinct():
             by_source[c['source']] = convs.filter(source=c['source']).count()
 
-        # How many conversations have at least one OutcomeSnapshot?
+        # Baseline (pre-refactor reference): OutcomeSnapshot coverage.
         conv_ids_with_os = set(
             _OS.objects.filter(conversation__org_id=org_id)
             .values_list('conversation_id', flat=True).distinct()
         )
-        with_os = len(conv_ids_with_os)
-
-        # How many have OutcomeSnapshot with non-empty source_payload?
         with_payload_conv_ids = set(
             _OS.objects.filter(conversation__org_id=org_id)
             .exclude(source_payload={})
             .values_list('conversation_id', flat=True).distinct()
         )
-        with_payload = len(with_payload_conv_ids)
 
-        # For a small sample, check what dimensions the enricher
-        # actually returns.
-        sample_size = 30
-        sample_convs = list(
-            convs.filter(id__in=with_payload_conv_ids)[:sample_size]
-        )
-        sample_stats = {
-            'sample_size': len(sample_convs),
-            'with_bedrooms': 0,
-            'with_bathrooms': 0,
-            'with_square_footage': 0,
-            'with_service_hint': 0,
-            'with_any_dim': 0,
-            'examples': [],
-        }
-        for c in sample_convs:
-            dims = extract_dimensions_from_lead(c)
-            if 'bedrooms' in dims:
-                sample_stats['with_bedrooms'] += 1
-            if 'bathrooms' in dims:
-                sample_stats['with_bathrooms'] += 1
-            if 'square_footage' in dims:
-                sample_stats['with_square_footage'] += 1
-            if 'service_hint' in dims:
-                sample_stats['with_service_hint'] += 1
-            if any(k in dims for k in ('bedrooms', 'bathrooms', 'square_footage')):
-                sample_stats['with_any_dim'] += 1
-            if len(sample_stats['examples']) < 5:
-                sample_stats['examples'].append({
-                    'conversation_id': str(c.id),
-                    'source': c.source,
-                    'resolved_dimensions': dims,
-                })
+        # Canonical context coverage (post-refactor). One row per
+        # conversation once the resolver has run for it.
+        context_rows = _CC.objects.filter(conversation__org_id=org_id)
+        context_row_count = context_rows.count()
 
-        # Peek at the raw lb_lead top-level keys on the first sampled
-        # conversation so the operator can eyeball what fields ARE
-        # in the payload (helps us map new field-name aliases if
-        # extract_dimensions_from_lead misses common Quo/Sigcore keys).
+        # Per-attribute breakdown: for each canonical attribute,
+        # how many conversations have a known value + which source.
+        per_attr: dict = {}
+        source_counts: dict[str, Counter] = {}
+        for attr in ALL_ATTRIBUTES:
+            per_attr[attr] = {'known': 0, 'unknown': 0, 'by_source': {}}
+            source_counts[attr] = Counter()
+
+        for row in context_rows.values('coverage_json'):
+            cov = row.get('coverage_json') or {}
+            for attr in ALL_ATTRIBUTES:
+                entry = cov.get(attr) or {}
+                if entry.get('known'):
+                    per_attr[attr]['known'] += 1
+                    source_counts[attr][entry.get('source') or 'unknown'] += 1
+                else:
+                    per_attr[attr]['unknown'] += 1
+
+        for attr in ALL_ATTRIBUTES:
+            per_attr[attr]['by_source'] = dict(source_counts[attr])
+
+        # Raw lb_lead key peek for one sampled conversation — helps
+        # diagnose whether the LB source_payload carries enrichable
+        # fields or just identity.
         raw_lb_lead_keys_sample = None
-        if sample_convs:
+        first_conv_id = next(iter(with_payload_conv_ids), None)
+        if first_conv_id is not None:
             first_os = (
-                _OS.objects.filter(conversation=sample_convs[0])
+                _OS.objects.filter(conversation_id=first_conv_id)
                 .exclude(source_payload={}).order_by('-captured_at').first()
             )
             if first_os is not None:
@@ -1709,13 +1701,21 @@ class LeadMetadataCoverageView(APIView):
             'ingest': {
                 'total_conversations': total_convs,
                 'by_source': by_source,
-                'with_outcome_snapshot': with_os,
-                'with_source_payload': with_payload,
+                'with_outcome_snapshot': len(conv_ids_with_os),
+                'with_source_payload': len(with_payload_conv_ids),
                 'coverage_pct': (
-                    round(100.0 * with_payload / max(total_convs, 1), 1)
+                    round(100.0 * len(with_payload_conv_ids)
+                          / max(total_convs, 1), 1)
                 ),
             },
-            'lead_metadata_enrichment_sample': sample_stats,
+            'canonical_context': {
+                'total_rows': context_row_count,
+                'coverage_pct': (
+                    round(100.0 * context_row_count
+                          / max(total_convs, 1), 1)
+                ),
+                'per_attribute': per_attr,
+            },
             'raw_lb_lead_top_level_keys_sample': raw_lb_lead_keys_sample,
         })
 
