@@ -1,6 +1,16 @@
 """Pricing extractor prompt v3 — whole-conversation dimension
 resolution.
 
+v6 -> v7 changes (2026-08-22, voice-transcript inclusion):
+  - SIGCORE_FETCH_TRANSCRIPTS=1 set on BOS services so Quo voice
+    calls now hydrate with per-segment transcript text.
+    Previously voice-only conversations contributed only
+    `call_no_transcript` marker turns (empty text) → LLM extracted
+    zero prices from them. v7 sees the actual spoken content.
+  - Version bump forces re-extraction so v6 SMS-only-enriched
+    facts don't get confused with v7 SMS+voice facts.
+  - Prompt content unchanged from v4.
+
 v5 -> v6 changes (2026-08-22, post LB /leads/context deploy):
   - LB endpoint POST /api/v1/learning/leads/context is live on
     thumbtack-bridge-production. Canonical resolver now gets
@@ -59,7 +69,7 @@ Retains v2 semantics:
 from __future__ import annotations
 
 
-PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v6'
+PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v7'
 
 
 SYSTEM_PROMPT = '''You extract pricing facts from residential-service
