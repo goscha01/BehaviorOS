@@ -79,12 +79,17 @@ def resolve_conversation_context(
     lb_context_client: Optional[LbClient] = None,
     lb_user_id: Optional[str] = None,
     use_cache: bool = True,
+    max_age_seconds: Optional[int] = None,
 ) -> CanonicalConversationContext:
     """Build a `CanonicalConversationContext` for one conversation.
 
     When `use_cache=True` (default), reads/writes a persisted
     `ConversationContext` row keyed by (conversation, source_versions).
     See `apps.conversations.context.service` for the cache adapter.
+
+    `max_age_seconds` controls the "skip-LB fast path" TTL. Pass 0 to
+    always call LB (needed for reconstruction runs that must reflect
+    current LB state). Omit for the service default (15 min).
 
     `conversation_observations` — pre-built `Observation` list produced
     by an LLM extractor for this conversation (e.g. Pricing P3
@@ -99,13 +104,17 @@ def resolve_conversation_context(
     conv_obs_list = list(conversation_observations or [])
     if use_cache:
         from apps.conversations.context.service import (
-            get_or_build_context,
+            DEFAULT_MAX_AGE_SECONDS, get_or_build_context,
         )
         return get_or_build_context(
             conversation,
             conversation_observations=conv_obs_list,
             lb_context_client=lb_context_client,
             lb_user_id=lb_user_id,
+            max_age_seconds=(
+                DEFAULT_MAX_AGE_SECONDS
+                if max_age_seconds is None else max_age_seconds
+            ),
         )
 
     return build_context_uncached(

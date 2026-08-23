@@ -1,6 +1,16 @@
 """Pricing extractor prompt v3 — whole-conversation dimension
 resolution.
 
+v5 -> v6 changes (2026-08-22, post LB /leads/context deploy):
+  - LB endpoint POST /api/v1/learning/leads/context is live on
+    thumbtack-bridge-production. Canonical resolver now gets
+    Thumbtack/Yelp survey answers directly from LB (bedrooms,
+    bathrooms, square_footage, frequency, service, service_tier)
+    instead of falling back to conversation-only observations.
+  - Version bump forces re-extraction so pre-LB v5 facts don't
+    contaminate the post-LB corpus.
+  - Prompt content unchanged from v4 — pure cache invalidation.
+
 v4 -> v5 changes (2026-08-22, driven by Canonical Context
 Resolution Layer):
   - Extractor now feeds each price's `resolved_context` into
@@ -49,7 +59,7 @@ Retains v2 semantics:
 from __future__ import annotations
 
 
-PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v5'
+PRICING_EXTRACTOR_VERSION = 'observed-config-pricing-extractor-v6'
 
 
 SYSTEM_PROMPT = '''You extract pricing facts from residential-service

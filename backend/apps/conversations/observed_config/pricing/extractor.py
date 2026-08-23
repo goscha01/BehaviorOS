@@ -227,12 +227,17 @@ def _resolve_canonical_context(conv, aggregated_prices: list[dict]):
     conv_observations = _observations_from_prices(conv, aggregated_prices)
 
     try:
+        # max_age_seconds=0 forces a fresh LB fetch on every extraction
+        # run — a pricing extraction is our authoritative reconstruction
+        # moment and must reflect the current LB state, not a
+        # possibly-stale cached row from an earlier analyzer.
         return resolve_conversation_context(
             conv,
             conversation_observations=conv_observations,
             lb_context_client=lb_client,
             lb_user_id=lb_user_id,
             use_cache=True,
+            max_age_seconds=0,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
