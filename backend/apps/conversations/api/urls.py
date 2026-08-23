@@ -12,6 +12,7 @@ from apps.conversations.api.views import (
     AddCustomBusinessRuleView,
     ApproveCommunicationDiffView, ApproveReconstructedFactView,
     BootstrapOrgView,
+    CanonicalContextTraceView,
     CommunicationProfileLatestView, CommunicationProfileRunView,
     ConfiguredFaqRunView, ConfiguredPricingRunView,
     ConfiguredQualificationRunView, ConfiguredServiceScopeRunView,
@@ -140,6 +141,11 @@ urlpatterns = _router.urls + [
         'audit/lead-metadata-coverage',
         LeadMetadataCoverageView.as_view(),
         name='insights-audit-lead-metadata-coverage',
+    ),
+    path(
+        'audit/canonical-context/<uuid:conversation_id>',
+        CanonicalContextTraceView.as_view(),
+        name='insights-audit-canonical-context-trace',
     ),
     path(
         'audit/setup/bootstrap-org',

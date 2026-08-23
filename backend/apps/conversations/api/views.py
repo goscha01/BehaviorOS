@@ -1720,6 +1720,69 @@ class LeadMetadataCoverageView(APIView):
         })
 
 
+class CanonicalContextTraceView(APIView):
+    """GET /api/v1/insights/audit/canonical-context/<uuid:conversation_id>
+
+    Per-conversation trace of the Canonical Context Resolution Layer's
+    output for one Conversation. Exists so any downstream analyst
+    (Quality Manager, ROM, ad-hoc audit) can answer "why did the
+    resolver pick X for this conversation?" without SSH-ing the DB.
+
+    Returns the persisted `ConversationContext` row VERBATIM plus a
+    small pointer to the source Conversation. No transformation — the
+    field shapes match `apps.conversations.context.types` dataclasses'
+    to_json() output.
+
+    404 when no ConversationContext exists for this conversation
+    (e.g. the resolver has never been called on it, typically because
+    no extractor has run on it yet).
+    """
+
+    authentication_classes = [InsightsServiceTokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, conversation_id):
+        from apps.conversations.models import (
+            Conversation as _Conv,
+            ConversationContext as _CC,
+        )
+        try:
+            conv = _Conv.objects.get(pk=conversation_id)
+        except _Conv.DoesNotExist:
+            raise NotFound({'detail': f'no conversation {conversation_id}'})
+        try:
+            ctx = _CC.objects.get(conversation=conv)
+        except _CC.DoesNotExist:
+            raise NotFound({
+                'detail': (
+                    f'no canonical context for conversation {conversation_id} '
+                    '— resolver has not been called on it yet'
+                ),
+            })
+        return Response({
+            'conversation_id': str(conv.id),
+            'conversation': {
+                'org_id': str(conv.org_id),
+                'source': conv.source,
+                'source_conversation_id': conv.source_conversation_id,
+                'channel': conv.channel,
+                'customer_phone': conv.customer_phone,
+                'customer_email': conv.customer_email,
+                'started_at': (
+                    conv.started_at.isoformat() if conv.started_at else None
+                ),
+            },
+            'canonical_context': {
+                'resolved_at': ctx.resolved_at.isoformat(),
+                'source_versions': ctx.source_versions_json,
+                'attributes': ctx.attributes_json,
+                'observations': ctx.observations_json,
+                'conflicts': ctx.conflicts_json,
+                'coverage': ctx.coverage_json,
+            },
+        })
+
+
 class PricingAcceptanceReportView(APIView):
     """GET /api/v1/insights/audit/pricing-1d-acceptance?tenantId=<uuid>[&per_category=N]
 
