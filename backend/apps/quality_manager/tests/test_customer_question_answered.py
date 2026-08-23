@@ -129,13 +129,16 @@ class QuestionAnsweredEvaluateTests(TestCase):
         from decimal import Decimal
         parsed = {'verdicts': verdicts}
         fake_result = LLMResult(
+            raw_response='',
             parsed_json=parsed,
             input_tokens=0, output_tokens=0,
-            cache_read_input_tokens=0, cache_creation_input_tokens=0,
-            cost_usd=Decimal('0'), raw_response='', model='test',
+            cache_read_tokens=0, cache_write_tokens=0,
+            cost_usd=Decimal('0'),
+            model_used='test',
+            provider='stub',
         )
         return patch(
-            'apps.learning.services.llm_client.LLMClient.analyze',
+            'apps.learning.services.llm_client.LearningLLMClient.analyze',
             return_value=fake_result,
         )
 
@@ -227,7 +230,7 @@ class QuestionAnsweredEvaluateTests(TestCase):
         _turn(conv, 't1', Speaker.AGENT, 60, "Sure, we do")
         dim = CustomerQuestionAnsweredDimension()
         with patch(
-            'apps.learning.services.llm_client.LLMClient.analyze',
+            'apps.learning.services.llm_client.LearningLLMClient.analyze',
             side_effect=RuntimeError('llm down'),
         ):
             r = list(dim.evaluate(reconstruction_run=self.recon, conversation=conv))

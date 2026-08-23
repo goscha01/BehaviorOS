@@ -169,7 +169,7 @@ class CustomerQuestionAnsweredDimension(BaseDimension):
         from apps.conversations.models import (
             ConversationTurn, Speaker,
         )
-        from apps.learning.services.llm_client import LLMClient
+        from apps.learning.services.llm_client import LearningLLMClient
 
         conv_id = str(conversation.id)
         turns = list(
@@ -257,7 +257,7 @@ class CustomerQuestionAnsweredDimension(BaseDimension):
         # One LLM call per conversation, batched over all questions.
         user_prompt = _build_user_prompt(needing_llm)
         try:
-            client = LLMClient()
+            client = LearningLLMClient()
             result = client.analyze(
                 system_prompt=SYSTEM_PROMPT,
                 user_prompt=user_prompt,
