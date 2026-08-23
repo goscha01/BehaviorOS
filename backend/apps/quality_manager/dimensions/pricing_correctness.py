@@ -106,6 +106,41 @@ def _describe_delta(comparison: dict) -> str:
     )
 
 
+def _fact_references_conversation(fact, conv_id: str) -> bool:
+    """True iff the reconstructed fact names this conversation via
+    either fact.evidence_conversation_ids (reserved for non-pricing
+    aggregators) or the pricing aggregator's per-quote
+    dimension_samples[].conversation_id.
+    """
+    if conv_id in (fact.evidence_conversation_ids or []):
+        return True
+    obs_val = fact.observed_value_json or {}
+    for sample in (obs_val.get('dimension_samples') or []):
+        if isinstance(sample, dict) and sample.get('conversation_id') == conv_id:
+            return True
+    return False
+
+
+def _fact_supporting_conversation_ids(fact) -> list[str]:
+    """Union of the two provenance sources so corpus-level findings
+    can list every supporting conversation."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for cid in (fact.evidence_conversation_ids or []):
+        c = str(cid)
+        if c not in seen:
+            ids.append(c)
+            seen.add(c)
+    obs_val = fact.observed_value_json or {}
+    for sample in (obs_val.get('dimension_samples') or []):
+        if isinstance(sample, dict):
+            c = sample.get('conversation_id')
+            if c and str(c) not in seen:
+                ids.append(str(c))
+                seen.add(str(c))
+    return ids
+
+
 def _describe_subject(subject: dict) -> str:
     """Compact human-readable subject descriptor for rationales."""
     parts = []
@@ -139,29 +174,30 @@ class PricingCorrectnessDimension(BaseDimension):
         )
         conv_id = str(conversation.id)
 
-        # All pricing reconstructed facts that name this conversation
-        # as evidence. The __contains lookup on Django JSONField uses
-        # Postgres @> containment on JSONB arrays.
-        facts = list(
-            _RBF.objects
-            .filter(
+        # Two ways a fact can name this conversation as evidence:
+        #   1. `evidence_conversation_ids` (fact-level, currently
+        #      populated as [] on pricing facts — reserved for other
+        #      verticals' aggregator behavior)
+        #   2. `observed_value_json.dimension_samples[].conversation_id`
+        #      (per-quote provenance from the pricing aggregator)
+        # We iterate the pricing facts for this run once and filter
+        # in Python rather than trying a JSONB path query on nested
+        # dimension_samples. Corpus is bounded; scan is cheap.
+        all_pricing_facts = list(
+            _RBF.objects.filter(
                 reconstruction_run=reconstruction_run,
                 domain='pricing',
-                evidence_conversation_ids__contains=[conv_id],
             )
         )
+        facts = [
+            f for f in all_pricing_facts
+            if _fact_references_conversation(f, conv_id)
+        ]
 
         if not facts:
-            # No pricing observation from this conversation was
-            # aggregated into any reconstructed fact — pricing
-            # correctness is NOT_APPLICABLE for this conversation.
-            #
-            # Note: a conversation might contribute observations that
-            # got trimmed by the aggregator's 20-conversation
-            # evidence cap; in that case we correctly miss it here
-            # but the corpus-level pattern finding still surfaces the
-            # aggregate. This is a known trade-off documented in the
-            # V1 GO/NO-GO.
+            # This conversation did not contribute any pricing quotes
+            # to any reconstructed fact — pricing correctness is
+            # NOT_APPLICABLE.
             yield DimensionResult(
                 dimension=self.name,
                 state=State.NOT_APPLICABLE,
@@ -313,13 +349,14 @@ class PricingCorrectnessDimension(BaseDimension):
             subject_desc = _describe_subject(subject)
             fact_id = str(fact.id)
             obs_val = fact.observed_value_json or {}
-            comparison = obs_val.get('price_comparison') or {}
+            matcher_out = obs_val.get('matcher') or {}
+            comparison = matcher_out.get('price_comparison') or {}
             delta_pct = comparison.get('delta_pct')
             severity = _severity_from_delta_pct(delta_pct)
             direction = 'below' if (delta_pct or 0) < 0 else 'above'
             reason_code = f'observed_{direction}_configured'
 
-            supporting_convs = fact.evidence_conversation_ids or []
+            supporting_convs = _fact_supporting_conversation_ids(fact)
             evidence = [
                 EvidenceRef(
                     kind='reconstructed_fact',
