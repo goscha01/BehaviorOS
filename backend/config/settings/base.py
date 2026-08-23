@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'apps.learning',
     'apps.context',
     'apps.conversations',
+    'apps.quality_manager',
 ]
 
 MIDDLEWARE = [
