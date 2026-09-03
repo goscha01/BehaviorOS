@@ -1,31 +1,49 @@
-"""BusinessConfigProposal synthesizer.
+"""BusinessConfigProposal synthesizer (V2).
 
-Reads a tenant's historical EvidenceInsight corpus (source_system starting
-with 'leadbridge-historical'), calls the LLM once per requested domain to
-extract observed values, then compares those observations against both the
-template baseline AND the current tenant configuration provided in the
-request. Emits a BusinessConfigProposal that LB can apply (or dry-run).
+Reads a tenant's historical EvidenceEvent corpus (persisted via
+/api/context/v1/context, mode=report), calls the LLM once per requested
+domain-group to extract structured observations, then compares those against
+BOTH the template baseline AND the current tenant configuration provided in
+the request. Emits a BusinessConfigProposal.
 
-No models added by this module — all output is returned inline. Persistence
-can come later if needed for audit.
+V2 differences vs v1:
+  - pricing_model is a first-class structured field
+  - pricing_examples[] emit as separate observed_example Changes (never
+    tenant-wide rules)
+  - Commercial policies (materials_included, payment_methods) go to the
+    'policies' domain
+  - Services observed go to the 'services' domain
+  - FAQ candidates are filtered by the LLM to durable Q&A only (see
+    prompts.FAQ_SYSTEM REJECT list)
+  - Each Change carries effectiveCurrentValue and factKind
+  - status computation uses effectiveCurrentValue so template-default
+    matches don't produce redundant proposed writes
 
 Provenance rule (LB → BehaviorOS contract):
-  status = f(templateValue, currentTenantValue, currentTenantProvenance, historicalObservedValue)
+  status = f(templateValue, currentTenantValue, effectiveCurrentValue,
+             historicalObservedValue)
 
-  historicalObservedValue is None  → 'insufficient_evidence' (unless tenant
-                                     has a value and it equals template →
-                                     'template_default_retained')
-  tenant absent, history has value → 'proposed_new_from_history'
-  tenant present, history matches  → 'confirmed_by_history'
-  tenant present, history differs  → 'contradicted_by_history'
+  effectiveCurrentValue = currentTenantValue if present, else templateValue
+
+  history absent  → 'insufficient_evidence' (if tenant has explicit) OR
+                    'template_default_retained' (otherwise)
+  history == effectiveCurrentValue  → 'confirmed_by_history'   (no-op)
+  history != effectiveCurrentValue  →
+      tenant absent   → 'proposed_new_from_history'   (set_value; must_review)
+      tenant present  → 'contradicted_by_history'     (set_value; must_review)
+
+factKind is:
+  - explicit_rule       — pro explicitly stated a general rule
+  - inferred_rule       — pattern across ≥N conversations
+  - observed_example    — one-off concrete instance (never overwrites)
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -42,9 +60,24 @@ from . import prompts
 logger = logging.getLogger(__name__)
 
 
-# Fields we ask the LLM about in the pricing prompt. Kept centralized so the
-# prompt and the comparator can't drift out of sync.
-PRICING_FIELD_KEYS = ('hourly_rate', 'minimum_hours', 'minimum_charge', 'quote_required')
+# Structured pricing fields the pricing prompt fills.
+# fieldKey (semantic) → LLM key (same string for now).
+PRICING_STRUCTURED_FIELDS = (
+    'pricing_model',
+    'hourly_rate',
+    'minimum_hours',
+    'minimum_charge',
+    'quote_required',
+)
+
+# Commercial-policy fields (also filled by the pricing prompt but routed to
+# the 'policies' domain).
+POLICY_STRUCTURED_FIELDS = (
+    'materials_included',
+    'payment_methods',
+)
+
+VALID_FACT_KINDS = {'explicit_rule', 'inferred_rule', 'observed_example'}
 
 
 @dataclass
@@ -65,11 +98,10 @@ class ProposalRequest:
             raise ValueError('template_snapshot must be dict')
         if not isinstance(self.current_tenant_snapshot, dict):
             raise ValueError('current_tenant_snapshot must be dict')
-        # Only pricing + faq for Slice 1. Others are reserved.
-        valid = {'pricing', 'faq'}
+        valid = {'pricing', 'faq', 'services', 'policies'}
         unknown = [d for d in self.domains if d not in valid]
         if unknown:
-            raise ValueError(f'unsupported domains for Slice 1: {unknown}')
+            raise ValueError(f'unsupported domains: {unknown} (valid: {sorted(valid)})')
 
 
 @dataclass
@@ -96,12 +128,6 @@ class BusinessConfigProposalSynthesizer:
     def synthesize(self, req: ProposalRequest) -> ProposalResult:
         org = _ensure_org(req.tenant_id)
 
-        # 1. Load historical evidence for this tenant. LB backfill posts via
-        # /api/context/v1/context (mode=report), which persists as
-        # EvidenceEvent (apps/context/). We filter to LB historical rows via
-        # runtime='leadbridge' AND payload.sourceSystem starting with
-        # 'leadbridge-historical' — this excludes live runtime events from
-        # the same tenant.
         events = list(
             EvidenceEvent.objects
             .filter(org=org, runtime='leadbridge')
@@ -123,16 +149,26 @@ class BusinessConfigProposalSynthesizer:
         if not transcripts:
             synthesizer_notes.append(
                 f'No historical evidence available for tenant {req.tenant_id}. '
-                'Nothing to compare against; all fields will default to '
-                'template_default_retained or insufficient_evidence.'
+                'All fields default to insufficient_evidence or '
+                'template_default_retained.'
             )
 
-        if 'pricing' in req.domains:
-            pricing_changes, cost = self._synthesize_pricing(req, transcripts, synthesizer_notes)
-            changes.extend(pricing_changes)
+        # ---- One LLM call covers pricing + commercial + services observations. ----
+        pricing_llm_output = None
+        if any(d in req.domains for d in ('pricing', 'services', 'policies')) and transcripts:
+            pricing_llm_output, cost = self._call_pricing_prompt(req, transcripts, synthesizer_notes)
             total_cost += cost
 
-        if 'faq' in req.domains:
+        if 'pricing' in req.domains:
+            changes.extend(self._build_pricing_changes(req, pricing_llm_output))
+
+        if 'policies' in req.domains:
+            changes.extend(self._build_policy_changes(req, pricing_llm_output))
+
+        if 'services' in req.domains:
+            changes.extend(self._build_services_changes(req, pricing_llm_output))
+
+        if 'faq' in req.domains and transcripts:
             faq_changes, cost = self._synthesize_faq(req, transcripts, synthesizer_notes)
             changes.extend(faq_changes)
             total_cost += cost
@@ -155,129 +191,178 @@ class BusinessConfigProposalSynthesizer:
             evidence_count=len(transcripts),
         )
 
-    # ---- pricing --------------------------------------------------------
+    # ---- pricing prompt call --------------------------------------------
 
-    def _synthesize_pricing(
+    def _call_pricing_prompt(
         self,
         req: ProposalRequest,
         transcripts: list[dict],
         notes: list[str],
-    ) -> tuple[list[dict], Decimal]:
+    ) -> tuple[dict, Decimal]:
         template_pricing = req.template_snapshot.get('pricing') or {}
         tenant_pricing = req.current_tenant_snapshot.get('pricing') or {}
-
-        if not transcripts:
-            # Emit stub changes so LB always sees the same shape.
-            return (
-                [self._emit_pricing_no_evidence(field, template_pricing, tenant_pricing)
-                 for field in PRICING_FIELD_KEYS],
-                Decimal('0'),
-            )
-
         user_prompt = _format_pricing_user_prompt(template_pricing, tenant_pricing, transcripts)
         result = self.llm.analyze(
             system_prompt=prompts.PRICING_SYSTEM,
             user_prompt=user_prompt,
             model=self.model,
-            max_tokens=2500,
+            max_tokens=4000,
         )
         parsed = result.parsed_json or {}
-
-        # If the stub returned analyzer-shape output (candidate_playbook_rules etc.),
-        # detect it and note — but still emit correctly-shaped Change objects.
-        if 'hourly_rate' not in parsed and 'candidate_playbook_rules' in parsed:
+        # Detect stub response — analyzer-shape output (has candidate_playbook_rules).
+        if 'pricing_model' not in parsed and 'candidate_playbook_rules' in parsed:
             notes.append(
                 '[stub LLM detected] No real Anthropic/OpenAI key configured; '
-                'pricing observations will be empty. Configure API key for real synthesis.'
+                'pricing/commercial observations will be empty.'
             )
-            parsed = {}
+            return {}, result.cost_usd
+        return parsed, result.cost_usd
 
+    # ---- pricing domain -------------------------------------------------
+
+    def _build_pricing_changes(self, req: ProposalRequest, llm_output: dict | None) -> list[dict]:
+        template_pricing = req.template_snapshot.get('pricing') or {}
+        tenant_pricing = req.current_tenant_snapshot.get('pricing') or {}
         changes = []
-        for field_key in PRICING_FIELD_KEYS:
-            observation = parsed.get(field_key) or {}
-            change = self._build_pricing_change(field_key, observation, template_pricing, tenant_pricing)
+        for field_key in PRICING_STRUCTURED_FIELDS:
+            observation = (llm_output or {}).get(field_key)
+            change = self._build_structured_change(
+                domain='pricing',
+                field_key=field_key,
+                human_label=_pricing_human_label(field_key),
+                observation=observation,
+                template_field=template_pricing,
+                tenant_field=tenant_pricing,
+                camel_map=_PRICING_CAMEL_MAP,
+                coerce=lambda k, v: _coerce_pricing_type(k, v),
+            )
             changes.append(change)
 
-        # Non-fixed "other_pricing_notes" — surfaced as synthesizer notes, not as a Change.
-        other = parsed.get('other_pricing_notes') or {}
-        if isinstance(other, dict) and other.get('observed_value'):
-            notes.append(f"[pricing] Additional pattern observed: {other.get('observed_value')} "
-                         f"(confidence={other.get('confidence', 0)})")
+        # pricing_examples — each becomes its own observed_example Change.
+        examples = (llm_output or {}).get('pricing_examples') or []
+        if isinstance(examples, list):
+            for ex in examples[:20]:  # hard cap
+                if not isinstance(ex, dict):
+                    continue
+                item = str(ex.get('item') or '').strip()
+                price = ex.get('price')
+                if not item or price is None:
+                    continue
+                conv_id = str(ex.get('supporting_conversation_id') or '')
+                snippet = str(ex.get('representative_snippet') or '')
+                unit = str(ex.get('unit') or 'unknown')
+                slug = _slugify(item)[:60] or f'example_{uuid.uuid4().hex[:8]}'
+                changes.append({
+                    'id': str(uuid.uuid4()),
+                    'domain': 'pricing',
+                    'fieldKey': f'pricing_example:{slug}',
+                    'humanLabel': f'Observed example: {item}',
+                    'templateValue': None,
+                    'currentTenantValue': None,
+                    'currentTenantProvenance': 'absent',
+                    'effectiveCurrentValue': None,
+                    'historicalObservedValue': {'item': item, 'price': price, 'unit': unit},
+                    'status': 'proposed_new_from_history',
+                    'factKind': 'observed_example',
+                    'evidence': _mk_evidence(
+                        confidence=0.9,  # examples are inherently concrete
+                        support_ids=[conv_id] if conv_id else [],
+                        snippet=snippet,
+                        reasoning='Concrete observed price quote; NOT a tenant-wide rule.',
+                    ),
+                    'reviewPolicy': 'must_review',
+                    # Examples are informational: apply is a no-op until we
+                    # have a pricing_examples writer.
+                    'proposedAction': {
+                        'kind': 'no_op',
+                        'reason': 'Observed example — informational only; not a tenant-wide rule.',
+                    },
+                })
+        return changes
 
-        return changes, result.cost_usd
+    # ---- policies domain ------------------------------------------------
 
-    def _emit_pricing_no_evidence(
-        self,
-        field_key: str,
-        template_pricing: dict,
-        tenant_pricing: dict,
-    ) -> dict:
-        template_val, tenant_val, tenant_prov = _resolve_pricing_field(
-            field_key, template_pricing, tenant_pricing
-        )
-        status = _compute_status(tenant_val, tenant_prov, None, template_val)
-        return _change_object(
-            domain='pricing',
-            field_key=field_key,
-            human_label=_pricing_human_label(field_key),
+    def _build_policy_changes(self, req: ProposalRequest, llm_output: dict | None) -> list[dict]:
+        template_policies = req.template_snapshot.get('faq') or {}  # policies live under faq in template
+        tenant_policies = req.current_tenant_snapshot.get('faq') or {}
+        changes = []
+
+        # materials_included
+        obs = (llm_output or {}).get('materials_included')
+        template_val = _extract_bool(template_policies.get('materialsIncluded'))
+        tenant_val, tenant_prov = _tenant_field(tenant_policies, 'materialsIncluded')
+        changes.append(self._structured_change_from_observation(
+            domain='policies',
+            field_key='materials_included',
+            human_label='Materials included in estimates',
+            observation=obs,
             template_value=template_val,
             tenant_value=tenant_val,
             tenant_provenance=tenant_prov,
-            historical_value=None,
-            status=status,
-            evidence=None,
-        )
+            coerce=_coerce_bool,
+        ))
 
-    def _build_pricing_change(
-        self,
-        field_key: str,
-        observation: dict,
-        template_pricing: dict,
-        tenant_pricing: dict,
-    ) -> dict:
-        template_val, tenant_val, tenant_prov = _resolve_pricing_field(
-            field_key, template_pricing, tenant_pricing
-        )
-        observed = observation.get('observed_value') if isinstance(observation, dict) else None
-        confidence = float(observation.get('confidence', 0.0)) if isinstance(observation, dict) else 0.0
-        support_ids = observation.get('supporting_conversation_ids', []) if isinstance(observation, dict) else []
-        snippet = observation.get('representative_snippet', '') if isinstance(observation, dict) else ''
-        reasoning = observation.get('reasoning', '') if isinstance(observation, dict) else ''
+        # payment_methods (array)
+        obs = (llm_output or {}).get('payment_methods')
+        template_val = template_policies.get('paymentMethods') if isinstance(template_policies.get('paymentMethods'), list) else []
+        tenant_val, tenant_prov = _tenant_field(tenant_policies, 'paymentMethods', default=[])
+        obs_value = obs.get('observed_value') if isinstance(obs, dict) else None
+        # Normalize observed_value to a sorted deduped list.
+        historical_value = _coerce_string_list(obs_value)
+        effective = tenant_val if tenant_val else template_val
+        status = _compute_status_array(tenant_val, tenant_prov, historical_value, template_val, effective)
+        changes.append({
+            'id': str(uuid.uuid4()),
+            'domain': 'policies',
+            'fieldKey': 'payment_methods',
+            'humanLabel': 'Payment methods accepted',
+            'templateValue': template_val,
+            'currentTenantValue': tenant_val,
+            'currentTenantProvenance': tenant_prov,
+            'effectiveCurrentValue': effective,
+            'historicalObservedValue': historical_value if historical_value else None,
+            'status': status,
+            'factKind': _extract_fact_kind(obs),
+            'evidence': _mk_evidence_from_obs(obs) if historical_value else None,
+            'reviewPolicy': 'must_review',
+            'proposedAction': _proposed_action(status, historical_value, tenant_val),
+        })
 
-        historical_value = _coerce_pricing_type(field_key, observed)
-        # `insufficient_evidence` if the LLM explicitly said so (null value) or
-        # confidence is very low (<0.35).
-        has_signal = historical_value is not None and confidence >= 0.35
-        status = _compute_status(
-            tenant_val,
-            tenant_prov,
-            historical_value if has_signal else None,
-            template_val,
-        )
+        return changes
 
-        evidence = None
-        if has_signal:
-            evidence = {
-                'confidence': confidence,
-                'supportingConversationCount': len(support_ids) if isinstance(support_ids, list) else 0,
-                'representativeExcerpts': _snippet_to_excerpts(snippet, support_ids),
-                'source': 'historical_analysis',
-                'reasoning': reasoning or None,
-            }
+    # ---- services domain ------------------------------------------------
 
-        return _change_object(
-            domain='pricing',
-            field_key=field_key,
-            human_label=_pricing_human_label(field_key),
-            template_value=template_val,
-            tenant_value=tenant_val,
-            tenant_provenance=tenant_prov,
-            historical_value=historical_value if has_signal else None,
-            status=status,
-            evidence=evidence,
-        )
+    def _build_services_changes(self, req: ProposalRequest, llm_output: dict | None) -> list[dict]:
+        obs = (llm_output or {}).get('services_observed')
+        if not isinstance(obs, dict):
+            return []
+        historical_value = _coerce_string_list(obs.get('observed_value'))
+        # Services baseline lives in template.serviceOptionsJson (not part of
+        # our snapshot v1 — treat as null baseline; owner reviews the whole
+        # list at once).
+        changes = [{
+            'id': str(uuid.uuid4()),
+            'domain': 'services',
+            'fieldKey': 'services_offered',
+            'humanLabel': 'Services observed in historical work',
+            'templateValue': None,
+            'currentTenantValue': None,
+            'currentTenantProvenance': 'absent',
+            'effectiveCurrentValue': None,
+            'historicalObservedValue': historical_value if historical_value else None,
+            'status': 'proposed_new_from_history' if historical_value else 'insufficient_evidence',
+            'factKind': _extract_fact_kind(obs) or 'inferred_rule',
+            'evidence': _mk_evidence_from_obs(obs) if historical_value else None,
+            'reviewPolicy': 'must_review',
+            'proposedAction': (
+                {'kind': 'set_value', 'value': historical_value}
+                if historical_value
+                else {'kind': 'no_op', 'reason': 'No specific services observed.'}
+            ),
+        }]
+        return changes
 
-    # ---- faq ------------------------------------------------------------
+    # ---- faq domain -----------------------------------------------------
 
     def _synthesize_faq(
         self,
@@ -287,10 +372,6 @@ class BusinessConfigProposalSynthesizer:
     ) -> tuple[list[dict], Decimal]:
         template_faq = req.template_snapshot.get('faq') or {}
         tenant_faq = req.current_tenant_snapshot.get('faq') or {}
-
-        if not transcripts:
-            return ([], Decimal('0'))
-
         user_prompt = _format_faq_user_prompt(template_faq, tenant_faq, transcripts)
         result = self.llm.analyze(
             system_prompt=prompts.FAQ_SYSTEM,
@@ -299,27 +380,20 @@ class BusinessConfigProposalSynthesizer:
             max_tokens=3000,
         )
         parsed = result.parsed_json or {}
-
         if 'candidates' not in parsed and 'candidate_faq' in parsed:
-            notes.append(
-                '[stub LLM detected] Fallback stub used for FAQ synthesis; '
-                'no real candidates emitted.'
-            )
+            notes.append('[stub LLM detected] Fallback stub used for FAQ.')
             return ([], result.cost_usd)
-
         raw_candidates = parsed.get('candidates') or []
         if not isinstance(raw_candidates, list):
-            notes.append(f'[faq] Synthesizer returned non-list candidates; dropping. Got: {type(raw_candidates).__name__}')
             return ([], result.cost_usd)
 
         tenant_customqa = _get_tenant_field(tenant_faq, 'customQA', default=[])
-        template_customqa = _get_tenant_field(template_faq, 'customQA', default=[])
         existing_questions = {(qa.get('question') or '').strip().lower()
                               for qa in (tenant_customqa or [])
                               if isinstance(qa, dict)}
 
         changes = []
-        for cand in raw_candidates[:15]:  # hard cap
+        for cand in raw_candidates[:8]:
             if not isinstance(cand, dict):
                 continue
             field_key = str(cand.get('field_key') or '').strip()
@@ -329,132 +403,232 @@ class BusinessConfigProposalSynthesizer:
             answer = str(cand.get('answer') or '').strip()
             if not question or not answer:
                 continue
+            fact_kind = str(cand.get('fact_kind') or '').strip()
+            if fact_kind not in {'explicit_rule', 'inferred_rule'}:
+                # V2 FAQ prompt forbids observed_example for FAQ. If the LLM
+                # emits one, drop it (should have gone into pricing_examples).
+                notes.append(
+                    f'[faq] Dropped candidate {field_key}: fact_kind={fact_kind!r} '
+                    'not allowed for FAQ (only explicit_rule or inferred_rule).'
+                )
+                continue
             confidence = float(cand.get('confidence', 0.0))
-            support_ids = cand.get('supporting_conversation_ids', []) if isinstance(cand.get('supporting_conversation_ids'), list) else []
+            support_ids = cand.get('supporting_conversation_ids', [])
+            if not isinstance(support_ids, list):
+                support_ids = []
             snippet = str(cand.get('representative_snippet') or '')
             reasoning = str(cand.get('reasoning') or '')
             human_label = str(cand.get('human_label') or question)[:120]
 
-            already_answered = question.lower() in existing_questions
             proposed_value = {'question': question, 'answer': answer}
+            already_answered = question.lower() in existing_questions
 
             if already_answered:
-                # We have an entry already — treat as confirmed_by_history
-                # (we're not proposing to overwrite an existing FAQ in Slice 1;
-                # no fallback / merging).
                 status = 'confirmed_by_history'
-                action = {'kind': 'no_op', 'reason': 'Tenant already has an FAQ entry matching this question.'}
+                action = {'kind': 'no_op', 'reason': 'Tenant already has this FAQ.'}
                 tenant_value = proposed_value
                 tenant_prov = 'explicit_owner_input'
+                effective = proposed_value
             else:
-                # New entry.
                 status = 'proposed_new_from_history'
                 action = {'kind': 'set_value', 'value': proposed_value}
                 tenant_value = None
                 tenant_prov = 'absent'
+                effective = None
 
-            change = {
+            changes.append({
                 'id': str(uuid.uuid4()),
                 'domain': 'faq',
                 'fieldKey': f'faq:{field_key}',
                 'humanLabel': human_label,
-                'templateValue': None,  # template FAQs are unstructured; treat as null baseline
+                'templateValue': None,
                 'currentTenantValue': tenant_value,
                 'currentTenantProvenance': tenant_prov,
+                'effectiveCurrentValue': effective,
                 'historicalObservedValue': proposed_value,
                 'status': status,
-                'evidence': {
-                    'confidence': confidence,
-                    'supportingConversationCount': len(support_ids),
-                    'representativeExcerpts': _snippet_to_excerpts(snippet, support_ids),
-                    'source': 'historical_analysis',
-                    'reasoning': reasoning or None,
-                },
-                # Slice 1 policy: all FAQ candidates require review even
-                # if the schema supports auto_apply_eligible for high-confidence
-                # cases. The must_review vs auto_apply_eligible distinction
-                # is stored so the applier can honor it later.
+                'factKind': fact_kind,
+                'evidence': _mk_evidence(
+                    confidence=confidence,
+                    support_ids=[str(s) for s in support_ids],
+                    snippet=snippet,
+                    reasoning=reasoning,
+                ),
                 'reviewPolicy': 'must_review',
                 'proposedAction': action,
-            }
-            changes.append(change)
-
-        # Also mention template default customQA that the tenant hasn't
-        # populated, as a note (not a Change).
-        if template_customqa and not tenant_customqa:
-            notes.append(
-                f'[faq] Template has {len(template_customqa)} default customQA entries; '
-                'tenant has none. Consider whether template defaults should backfill '
-                'in a separate flow.'
-            )
+            })
 
         return changes, result.cost_usd
 
+    # ---- structured-change builder used by pricing (and reusable) -------
 
-# ---- comparators ----------------------------------------------------------
+    def _build_structured_change(
+        self,
+        *,
+        domain: str,
+        field_key: str,
+        human_label: str,
+        observation: dict | None,
+        template_field: dict,
+        tenant_field: dict,
+        camel_map: dict,
+        coerce,
+    ) -> dict:
+        camel = camel_map[field_key]
+        template_val = template_field.get(camel)
+        tenant_raw = tenant_field.get(camel)
+        if isinstance(tenant_raw, dict) and 'value' in tenant_raw:
+            tenant_value = tenant_raw.get('value')
+            tenant_prov = tenant_raw.get('provenance', 'absent')
+        else:
+            tenant_value = tenant_raw
+            tenant_prov = 'absent' if tenant_value in (None, '', 0, False) else 'explicit_owner_input'
 
-def _compute_status(
-    tenant_value: Any,
-    tenant_provenance: str,
-    historical_value: Any,
-    template_value: Any,
-) -> str:
-    tenant_present = tenant_value is not None and tenant_value != ''
-    historical_present = historical_value is not None
+        # For numeric zero from template, treat as "unset default" — so a
+        # tenant zero is 'template_default'. But an EXPLICIT non-zero value
+        # is explicit_owner_input.
+        # (LB's tenant-snapshot builder already computes provenance; we
+        # trust it when present as a dict.)
 
-    if not historical_present:
-        if tenant_present and _values_equal(tenant_value, template_value):
-            return 'template_default_retained'
-        if tenant_present:
-            # Tenant has an explicit non-template value; history didn't cover it.
-            return 'insufficient_evidence'
-        return 'template_default_retained' if template_value is not None else 'insufficient_evidence'
+        return self._structured_change_from_observation(
+            domain=domain,
+            field_key=field_key,
+            human_label=human_label,
+            observation=observation,
+            template_value=template_val,
+            tenant_value=tenant_value,
+            tenant_provenance=tenant_prov,
+            coerce=lambda v: coerce(field_key, v),
+        )
 
-    if not tenant_present:
-        return 'proposed_new_from_history'
+    def _structured_change_from_observation(
+        self,
+        *,
+        domain: str,
+        field_key: str,
+        human_label: str,
+        observation: dict | None,
+        template_value: Any,
+        tenant_value: Any,
+        tenant_provenance: str,
+        coerce,
+    ) -> dict:
+        if isinstance(observation, dict):
+            observed_raw = observation.get('observed_value')
+            confidence = float(observation.get('confidence', 0.0))
+            support_ids = observation.get('supporting_conversation_ids', [])
+            if not isinstance(support_ids, list):
+                support_ids = []
+            snippet = str(observation.get('representative_snippet') or '')
+            reasoning = str(observation.get('reasoning') or '')
+            fact_kind = observation.get('fact_kind')
+        else:
+            observed_raw = None
+            confidence = 0.0
+            support_ids = []
+            snippet = ''
+            reasoning = ''
+            fact_kind = None
 
-    if _values_equal(tenant_value, historical_value):
-        return 'confirmed_by_history'
-    return 'contradicted_by_history'
+        historical_value = coerce(observed_raw)
+        # Require confidence ≥0.35 AND non-null value for a "real" signal.
+        has_signal = historical_value is not None and confidence >= 0.35
+
+        effective = _effective_current(tenant_value, template_value)
+        status = _compute_status_scalar(
+            tenant_value=tenant_value,
+            tenant_provenance=tenant_provenance,
+            historical_value=historical_value if has_signal else None,
+            template_value=template_value,
+            effective_value=effective,
+        )
+        evidence = _mk_evidence(
+            confidence=confidence,
+            support_ids=[str(s) for s in support_ids],
+            snippet=snippet,
+            reasoning=reasoning,
+        ) if has_signal else None
+
+        return {
+            'id': str(uuid.uuid4()),
+            'domain': domain,
+            'fieldKey': field_key,
+            'humanLabel': human_label,
+            'templateValue': template_value,
+            'currentTenantValue': tenant_value,
+            'currentTenantProvenance': tenant_provenance,
+            'effectiveCurrentValue': effective,
+            'historicalObservedValue': historical_value if has_signal else None,
+            'status': status,
+            'factKind': fact_kind if fact_kind in VALID_FACT_KINDS else None,
+            'evidence': evidence,
+            'reviewPolicy': 'must_review',
+            'proposedAction': _proposed_action(status, historical_value if has_signal else None, tenant_value),
+        }
 
 
-def _values_equal(a: Any, b: Any) -> bool:
-    if a is None and b is None:
-        return True
-    if type(a) is bool or type(b) is bool:
-        return bool(a) == bool(b)
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        # Small tolerance for hourly rates / minimum charges scraped from prose.
-        return abs(float(a) - float(b)) < 0.01
-    return a == b
+# =============================================================================
+# Helpers
+# =============================================================================
+
+_PRICING_CAMEL_MAP = {
+    'pricing_model': 'pricingModel',
+    'hourly_rate': 'hourlyRate',
+    'minimum_hours': 'minimumHours',
+    'minimum_charge': 'minimumCharge',
+    'quote_required': 'quoteRequired',
+}
 
 
-def _resolve_pricing_field(field_key: str, template_pricing: dict, tenant_pricing: dict):
-    """Extract (template_value, tenant_value, tenant_provenance) for a pricing field."""
-    camel_map = {
-        'hourly_rate': 'hourlyRate',
-        'minimum_hours': 'minimumHours',
-        'minimum_charge': 'minimumCharge',
-        'quote_required': 'quoteRequired',
-    }
-    key = camel_map[field_key]
-    template_val = template_pricing.get(key)
-    tenant_field = tenant_pricing.get(key)
-    if isinstance(tenant_field, dict):
-        return template_val, tenant_field.get('value'), tenant_field.get('provenance', 'absent')
-    return template_val, tenant_field, 'absent'
+def _pricing_human_label(field_key: str) -> str:
+    return {
+        'pricing_model':   'Pricing model',
+        'hourly_rate':     'Hourly rate (USD/hr)',
+        'minimum_hours':   'Minimum billable hours',
+        'minimum_charge':  'Minimum charge (USD)',
+        'quote_required':  'Quote required before booking',
+    }[field_key]
+
+
+def _tenant_field(tenant_faq: dict, camel_key: str, default=None):
+    """Read tenant snapshot's {value, provenance} FAQ/policy field."""
+    field = tenant_faq.get(camel_key)
+    if isinstance(field, dict) and 'value' in field:
+        return field.get('value'), field.get('provenance', 'absent')
+    if field is None:
+        return default, 'absent'
+    return field, 'explicit_owner_input'
+
+
+def _extract_bool(v: Any) -> bool | None:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {'true', 'yes', 'y', '1'}:
+            return True
+        if s in {'false', 'no', 'n', '0'}:
+            return False
+    if isinstance(v, dict) and 'value' in v:
+        return _extract_bool(v['value'])
+    return None
+
+
+def _coerce_bool(v: Any) -> bool | None:
+    return _extract_bool(v)
 
 
 def _coerce_pricing_type(field_key: str, value: Any) -> Any:
     if value is None:
         return None
-    if field_key == 'quote_required':
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            return value.strip().lower() in {'true', 'yes', 'y', '1'}
+    if field_key == 'pricing_model':
+        if isinstance(value, str) and value.strip():
+            v = value.strip().lower()
+            allowed = {'hourly', 'flat_project', 'itemized', 'hybrid', 'unclear'}
+            return v if v in allowed else None
         return None
-    # Numeric fields
+    if field_key == 'quote_required':
+        return _coerce_bool(value)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     if isinstance(value, str):
@@ -465,37 +639,152 @@ def _coerce_pricing_type(field_key: str, value: Any) -> Any:
     return None
 
 
-def _pricing_human_label(field_key: str) -> str:
-    return {
-        'hourly_rate': 'Hourly rate (USD/hr)',
-        'minimum_hours': 'Minimum billable hours',
-        'minimum_charge': 'Minimum charge (USD)',
-        'quote_required': 'Quote required before booking',
-    }[field_key]
+def _coerce_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    seen = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            s = item.strip()
+            if s not in seen:
+                seen.append(s)
+    return seen
 
 
-def _change_object(*, domain, field_key, human_label, template_value, tenant_value,
-                   tenant_provenance, historical_value, status, evidence):
-    action = _proposed_action(status, historical_value, tenant_value)
+def _extract_fact_kind(obs: Any) -> str | None:
+    if not isinstance(obs, dict):
+        return None
+    fk = obs.get('fact_kind')
+    return fk if fk in VALID_FACT_KINDS else None
+
+
+def _mk_evidence(*, confidence: float, support_ids: list[str], snippet: str, reasoning: str) -> dict:
+    excerpts = []
+    if snippet:
+        first = support_ids[0] if support_ids else '<unknown>'
+        excerpts.append({'conversationId': str(first), 'snippet': snippet[:500]})
     return {
-        'id': str(uuid.uuid4()),
-        'domain': domain,
-        'fieldKey': field_key,
-        'humanLabel': human_label,
-        'templateValue': template_value,
-        'currentTenantValue': tenant_value,
-        'currentTenantProvenance': tenant_provenance,
-        'historicalObservedValue': historical_value,
-        'status': status,
-        'evidence': evidence,
-        'reviewPolicy': 'must_review',  # Slice 1: everything requires review
-        'proposedAction': action,
+        'confidence': confidence,
+        'supportingConversationCount': len(support_ids),
+        'representativeExcerpts': excerpts,
+        'source': 'historical_analysis',
+        'reasoning': reasoning or None,
     }
+
+
+def _mk_evidence_from_obs(obs: dict) -> dict:
+    return _mk_evidence(
+        confidence=float(obs.get('confidence', 0.0)),
+        support_ids=[str(s) for s in (obs.get('supporting_conversation_ids') or [])],
+        snippet=str(obs.get('representative_snippet') or ''),
+        reasoning=str(obs.get('reasoning') or ''),
+    )
+
+
+# ---- status / effectiveCurrent -------------------------------------------
+
+def _is_effectively_present(v: Any) -> bool:
+    """Does this value count as 'the tenant has an explicit value'?
+
+    Numeric zero / empty-string / empty-list / None all count as ABSENT.
+    Booleans (including False) count as present.
+    """
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return True
+    if v == 0:
+        return False
+    if v == '':
+        return False
+    if isinstance(v, (list, dict)) and len(v) == 0:
+        return False
+    return True
+
+
+def _effective_current(tenant_value: Any, template_value: Any) -> Any:
+    if _is_effectively_present(tenant_value):
+        return tenant_value
+    if _is_effectively_present(template_value):
+        return template_value
+    return None
+
+
+def _values_equal(a: Any, b: Any) -> bool:
+    if a is None and b is None:
+        return True
+    # None ≠ anything else — including False (bool coercion would say
+    # bool(None)==False, which is wrong for absence semantics).
+    if a is None or b is None:
+        return False
+    if type(a) is bool or type(b) is bool:
+        return bool(a) == bool(b)
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) < 0.01
+    return a == b
+
+
+def _compute_status_scalar(
+    *,
+    tenant_value: Any,
+    tenant_provenance: str,
+    historical_value: Any,
+    template_value: Any,
+    effective_value: Any,
+) -> str:
+    """Status computation for scalar fields.
+
+    Uses effective_value so that when tenant is absent but template supplies
+    a default, a matching history observation is confirmed (no redundant
+    write) rather than proposed_new.
+    """
+    tenant_explicit = _is_effectively_present(tenant_value)
+    historical_present = historical_value is not None
+
+    if not historical_present:
+        # No history signal.
+        if tenant_explicit and not _values_equal(tenant_value, template_value):
+            return 'insufficient_evidence'
+        # Tenant absent OR tenant matches template default.
+        if effective_value is not None:
+            return 'template_default_retained'
+        return 'insufficient_evidence'
+
+    # History has a value.
+    if _values_equal(historical_value, effective_value):
+        return 'confirmed_by_history'
+    if not tenant_explicit:
+        return 'proposed_new_from_history'
+    return 'contradicted_by_history'
+
+
+def _compute_status_array(
+    tenant_value: list | None,
+    tenant_provenance: str,
+    historical_value: list | None,
+    template_value: list | None,
+    effective_value: list | None,
+) -> str:
+    tenant_explicit = _is_effectively_present(tenant_value)
+    historical_present = _is_effectively_present(historical_value)
+
+    if not historical_present:
+        if tenant_explicit:
+            return 'insufficient_evidence'
+        if _is_effectively_present(effective_value):
+            return 'template_default_retained'
+        return 'insufficient_evidence'
+
+    if set(historical_value or []) == set(effective_value or []):
+        return 'confirmed_by_history'
+    if not tenant_explicit:
+        return 'proposed_new_from_history'
+    return 'contradicted_by_history'
 
 
 def _proposed_action(status: str, historical_value: Any, tenant_value: Any) -> dict:
     if status == 'confirmed_by_history':
-        return {'kind': 'no_op', 'reason': 'Tenant value matches historical observation.'}
+        return {'kind': 'no_op', 'reason': 'Effective value already matches history.'}
     if status == 'template_default_retained':
         return {'kind': 'no_op', 'reason': 'No historical evidence; template default retained.'}
     if status == 'insufficient_evidence':
@@ -507,13 +796,6 @@ def _proposed_action(status: str, historical_value: Any, tenant_value: Any) -> d
     return {'kind': 'no_op', 'reason': f'Unknown status: {status}'}
 
 
-def _snippet_to_excerpts(snippet: str, support_ids: list) -> list:
-    if not snippet:
-        return []
-    first_id = support_ids[0] if support_ids and isinstance(support_ids, list) else 'unknown'
-    return [{'conversationId': str(first_id), 'snippet': snippet[:500]}]
-
-
 def _get_tenant_field(tenant_faq: dict, key: str, default=None):
     field = tenant_faq.get(key)
     if isinstance(field, dict) and 'value' in field:
@@ -521,14 +803,9 @@ def _get_tenant_field(tenant_faq: dict, key: str, default=None):
     return field if field is not None else default
 
 
-# ---- evidence I/O ---------------------------------------------------------
+# ---- evidence I/O + slugs ------------------------------------------------
 
 def _ensure_org(tenant_id: str) -> Organization:
-    """Get-or-create the Organization row for this tenant.
-
-    LB uses its User.id as the Organization.id. Auto-provisioning here means
-    Slice 1 doesn't need a separate onboarding call.
-    """
     try:
         return Organization.objects.get(pk=tenant_id)
     except Organization.DoesNotExist:
@@ -536,6 +813,12 @@ def _ensure_org(tenant_id: str) -> Organization:
             id=uuid.UUID(tenant_id),
             name=f'LB tenant {tenant_id[:8]}',
         )
+
+
+def _slugify(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r'[^a-z0-9]+', '_', s)
+    return s.strip('_')
 
 
 def _event_has_transcript(event: EvidenceEvent) -> bool:
@@ -552,9 +835,6 @@ def _transcript_for_event(event: EvidenceEvent) -> dict:
     transcript = metadata.get('transcript') or []
     if not isinstance(transcript, list):
         transcript = []
-    # LB sets conversationId at top of request body AND in metadata.externalId
-    # (see behavior-os-client.ts). Prefer the conversationId field, then
-    # metadata.externalId, then event.conversation_id, else '<unknown>'.
     conv_id = (
         payload.get('conversationId')
         or metadata.get('externalId')
@@ -604,7 +884,7 @@ def _format_pricing_user_prompt(template: dict, tenant: dict, transcripts: list[
         return v
 
     lines = []
-    lines.append('# Template baseline (starting shape; usually zero/unset)')
+    lines.append('# Template baseline pricing')
     for k in ('pricingModel', 'hourlyRate', 'minimumHours', 'minimumCharge', 'quoteRequired', 'currency'):
         lines.append(f'  {k}: {template.get(k)!r}')
     lines.append('')

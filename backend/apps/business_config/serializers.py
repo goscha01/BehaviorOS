@@ -15,11 +15,11 @@ class GenerateProposalSerializer(serializers.Serializer):
 
     def validate_domains(self, value):
         if not value:
-            return ['pricing', 'faq']
-        allowed = {'pricing', 'faq'}
+            return ['pricing', 'faq', 'services', 'policies']
+        allowed = {'pricing', 'faq', 'services', 'policies'}
         bad = [d for d in value if d not in allowed]
         if bad:
             raise serializers.ValidationError(
-                f'Slice 1 supports only pricing + faq; got {bad}'
+                f'unsupported domain(s): {bad} (allowed: {sorted(allowed)})'
             )
         return value
