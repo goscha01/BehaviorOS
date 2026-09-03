@@ -105,16 +105,22 @@ def _resolve_org(tenant_id: str):
     """Map a runtime's tenantId to an Organization.
 
     Phase 1 convention: tenantId is the Organization.id (UUID) as a string.
-    A missing / unknown tenant DOES NOT raise — it just means no evidence
-    will match and the response naturally becomes `no_context`.
+    Auto-creates the row on first sight for any well-formed UUID so callers
+    (LB historical backfill, new Callio workspaces, etc.) don't need a
+    separate provisioning call. Non-UUID strings still resolve to None
+    safely so downstream code can no-op.
     """
     if not tenant_id:
         return None
     try:
-        return Organization.objects.filter(pk=tenant_id).first()
-    except (ValueError, TypeError, ValidationError):
-        # Non-UUID string — no match, but the endpoint still succeeds.
+        uuid_val = uuid.UUID(tenant_id)
+    except (ValueError, TypeError):
         return None
+    org, _ = Organization.objects.get_or_create(
+        pk=uuid_val,
+        defaults={'name': f'Auto-provisioned tenant {str(uuid_val)[:8]}'},
+    )
+    return org
 
 
 class ContextView(APIView):

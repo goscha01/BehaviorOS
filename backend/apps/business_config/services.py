@@ -34,7 +34,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from apps.accounts.models import Organization
-from apps.learning.models import EvidenceInsight
+from apps.context.models import EvidenceEvent
 from apps.learning.services.llm_client import LearningLLMClient
 
 from . import prompts
@@ -45,9 +45,6 @@ logger = logging.getLogger(__name__)
 # Fields we ask the LLM about in the pricing prompt. Kept centralized so the
 # prompt and the comparator can't drift out of sync.
 PRICING_FIELD_KEYS = ('hourly_rate', 'minimum_hours', 'minimum_charge', 'quote_required')
-
-
-HISTORICAL_SOURCE_PREFIXES = ('leadbridge-historical',)
 
 
 @dataclass
@@ -99,19 +96,24 @@ class BusinessConfigProposalSynthesizer:
     def synthesize(self, req: ProposalRequest) -> ProposalResult:
         org = _ensure_org(req.tenant_id)
 
-        # 1. Load historical evidence for this tenant.
-        insights = list(
-            EvidenceInsight.objects
-            .filter(org=org)
-            .filter(_source_filter())
+        # 1. Load historical evidence for this tenant. LB backfill posts via
+        # /api/context/v1/context (mode=report), which persists as
+        # EvidenceEvent (apps/context/). We filter to LB historical rows via
+        # runtime='leadbridge' AND payload.sourceSystem starting with
+        # 'leadbridge-historical' — this excludes live runtime events from
+        # the same tenant.
+        events = list(
+            EvidenceEvent.objects
+            .filter(org=org, runtime='leadbridge')
+            .filter(Q(payload__sourceSystem__startswith='leadbridge-historical'))
             .order_by('occurred_at')
         )
-        transcripts = [_transcript_for_prompt(i) for i in insights if _has_transcript(i)]
-        summary = _evidence_summary(insights, transcripts)
+        transcripts = [_transcript_for_event(e) for e in events if _event_has_transcript(e)]
+        summary = _evidence_summary(events, transcripts)
 
         logger.info(
-            'business_config synth tenant=%s org=%s corpus=%d transcripts=%d',
-            req.tenant_id, org.id, len(insights), len(transcripts),
+            'business_config synth tenant=%s org=%s events=%d transcripts=%d',
+            req.tenant_id, org.id, len(events), len(transcripts),
         )
 
         changes: list[dict] = []
@@ -536,37 +538,33 @@ def _ensure_org(tenant_id: str) -> Organization:
         )
 
 
-def _source_filter() -> Q:
-    q = Q()
-    for prefix in HISTORICAL_SOURCE_PREFIXES:
-        q |= Q(source_system__startswith=prefix)
-    return q
-
-
-def _has_transcript(insight: EvidenceInsight) -> bool:
-    payload = insight.source_payload or {}
+def _event_has_transcript(event: EvidenceEvent) -> bool:
+    payload = event.payload or {}
     metadata = payload.get('metadata') if isinstance(payload, dict) else None
-    if isinstance(metadata, dict) and metadata.get('transcript'):
-        return True
-    # Also look one level deeper (the ingest normalizes into `raw_request_body`).
-    body = payload.get('raw_request_body') if isinstance(payload, dict) else None
-    if isinstance(body, dict):
-        md = body.get('metadata') or {}
-        if isinstance(md, dict) and md.get('transcript'):
-            return True
-    return False
+    return isinstance(metadata, dict) and bool(metadata.get('transcript'))
 
 
-def _transcript_for_prompt(insight: EvidenceInsight) -> dict:
-    payload = insight.source_payload or {}
-    metadata = _extract_metadata(payload)
+def _transcript_for_event(event: EvidenceEvent) -> dict:
+    payload = event.payload or {}
+    metadata = payload.get('metadata') if isinstance(payload, dict) else {}
+    if not isinstance(metadata, dict):
+        metadata = {}
     transcript = metadata.get('transcript') or []
     if not isinstance(transcript, list):
         transcript = []
+    # LB sets conversationId at top of request body AND in metadata.externalId
+    # (see behavior-os-client.ts). Prefer the conversationId field, then
+    # metadata.externalId, then event.conversation_id, else '<unknown>'.
+    conv_id = (
+        payload.get('conversationId')
+        or metadata.get('externalId')
+        or event.conversation_id
+        or '<unknown>'
+    )
     return {
-        'conversation_id': insight.external_id,
-        'occurred_at': (insight.occurred_at or timezone.now()).isoformat(),
-        'outcome': insight.outcome or metadata.get('outcome') or 'unknown',
+        'conversation_id': str(conv_id),
+        'occurred_at': (event.occurred_at or timezone.now()).isoformat(),
+        'outcome': metadata.get('outcome') or 'unknown',
         'category': metadata.get('category') or '',
         'customer_name': metadata.get('customerName') or '',
         'turns': [
@@ -580,19 +578,7 @@ def _transcript_for_prompt(insight: EvidenceInsight) -> dict:
     }
 
 
-def _extract_metadata(payload: dict) -> dict:
-    md = payload.get('metadata') if isinstance(payload, dict) else None
-    if isinstance(md, dict) and md:
-        return md
-    body = payload.get('raw_request_body') if isinstance(payload, dict) else None
-    if isinstance(body, dict):
-        md = body.get('metadata') or {}
-        if isinstance(md, dict):
-            return md
-    return {}
-
-
-def _evidence_summary(insights: list, transcripts: list[dict]) -> dict:
+def _evidence_summary(events: list, transcripts: list[dict]) -> dict:
     total_messages = 0
     dates = []
     for t in transcripts:

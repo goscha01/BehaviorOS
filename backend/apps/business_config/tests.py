@@ -18,7 +18,7 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from apps.accounts.models import Organization
-from apps.learning.models import EvidenceInsight
+from apps.context.models import EvidenceEvent
 from apps.learning.services.llm_client import LLMResult
 
 from .services import (
@@ -121,15 +121,20 @@ class SynthesizerNoEvidenceTests(TestCase):
 class SynthesizerWithMockedLLMTests(TestCase):
     def setUp(self):
         self.tenant_id = str(uuid.uuid4())
-        # Create org and one insight so `synthesize` sees a corpus.
+        # Create org and one EvidenceEvent so `synthesize` sees a corpus.
+        # This mirrors what LB's backfill script produces via POST /context.
         org = Organization.objects.create(id=uuid.UUID(self.tenant_id), name='test')
-        EvidenceInsight.objects.create(
+        EvidenceEvent.objects.create(
             org=org,
-            source_system='leadbridge-historical',
-            external_id='conv-1',
-            evidence_type='conversation',
-            outcome='booked',
-            source_payload={
+            source_kind='runtime',
+            runtime='leadbridge',
+            channel='sms',
+            event_type='call_completed',
+            conversation_id='conv-1',
+            occurred_at='2026-01-01T00:00:00Z',
+            payload={
+                'sourceSystem': 'leadbridge-historical',
+                'conversationId': 'conv-1',
                 'metadata': {
                     'transcript': [
                         {'role': 'customer', 'text': 'How much for TV mounting?'},
