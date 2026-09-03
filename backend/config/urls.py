@@ -16,6 +16,7 @@ urlpatterns = [
     path('api/context/', include('apps.context.urls')),
     path('api/v1/insights/', include('apps.conversations.api.urls')),
     path('api/v1/quality-manager/', include('apps.quality_manager.api.urls')),
+    path('api/business-config/', include('apps.business_config.urls')),
 ]
 
 if settings.DEBUG:
