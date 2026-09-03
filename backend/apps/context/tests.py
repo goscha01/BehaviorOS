@@ -1116,3 +1116,108 @@ class ReportModeTest(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('mode', response.json())
         self.assertEqual(result.engine_result.context_version, CONTEXT_VERSION)
+
+
+class HistoricalIdempotencyTest(TestCase):
+    """`metadata.externalId` should make historical ingest idempotent.
+
+    Prevents duplicate EvidenceEvent rows when a caller (e.g. LB slice-1
+    backfill script) reruns the same historical corpus. Also verifies that
+    caller-supplied external_id auto-classifies the row as HISTORICAL and
+    that metadata.occurredAt lands on the row's occurred_at field.
+
+    Regression target: pre-fix, evidence_from_context_request hardcoded
+    external_id='' — every rerun created a new EvidenceEvent, doubling the
+    corpus and inflating LLM confidence.
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.org = Organization.objects.create(name='Idempotency Test Co')
+
+    def _post_historical(self, external_id: str, extra_metadata: dict | None = None,
+                         **overrides):
+        metadata = {'externalId': external_id, 'transcript': [{'role': 'customer', 'text': 'hi'}]}
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        data = {
+            'organizationId': str(self.org.id),
+            'product': 'leadbridge',
+            'sourceSystem': 'leadbridge-historical',
+            'mode': 'report',
+            'channel': 'sms',
+            'eventType': 'call_completed',
+            'conversationId': external_id.split(':', 1)[-1],
+            'metadata': metadata,
+        }
+        data.update(overrides)
+        return self.client.post(CONTEXT_URL, data=data, format='json')
+
+    def test_same_external_id_upserts_not_duplicates(self):
+        r1 = self._post_historical('lb-hist:conv-1')
+        r2 = self._post_historical('lb-hist:conv-1')
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(EvidenceEvent.objects.filter(org=self.org).count(), 1)
+
+    def test_different_external_ids_create_separate_rows(self):
+        self._post_historical('lb-hist:conv-1')
+        self._post_historical('lb-hist:conv-2')
+        self.assertEqual(EvidenceEvent.objects.filter(org=self.org).count(), 2)
+
+    def test_external_id_auto_classifies_as_historical(self):
+        self._post_historical('lb-hist:conv-1')
+        row = EvidenceEvent.objects.get(org=self.org)
+        self.assertEqual(row.source_kind, EvidenceEvent.SourceKind.HISTORICAL)
+        self.assertEqual(row.external_id, 'lb-hist:conv-1')
+
+    def test_no_external_id_stays_runtime_and_non_idempotent(self):
+        # Preserve the RUNTIME behavior for live traffic — Callio et al.
+        # should keep getting a new row per event.
+        data = {
+            'organizationId': str(self.org.id),
+            'product': 'callio',
+            'mode': 'report',
+            'channel': 'voice',
+            'eventType': 'call_completed',
+            'metadata': {'outcome': 'booked'},
+        }
+        self.client.post(CONTEXT_URL, data=data, format='json')
+        self.client.post(CONTEXT_URL, data=data, format='json')
+        rows = EvidenceEvent.objects.filter(org=self.org)
+        self.assertEqual(rows.count(), 2)
+        for r in rows:
+            self.assertEqual(r.source_kind, EvidenceEvent.SourceKind.RUNTIME)
+            self.assertEqual(r.external_id, '')
+
+    def test_same_external_id_different_orgs_are_isolated(self):
+        other_org = Organization.objects.create(name='Other Co')
+        self._post_historical('lb-hist:conv-shared')
+        # Post the same external_id under a different tenant.
+        data = {
+            'organizationId': str(other_org.id),
+            'product': 'leadbridge',
+            'sourceSystem': 'leadbridge-historical',
+            'mode': 'report',
+            'metadata': {'externalId': 'lb-hist:conv-shared', 'transcript': [{'role': 'customer', 'text': 'hi'}]},
+        }
+        self.client.post(CONTEXT_URL, data=data, format='json')
+        self.assertEqual(EvidenceEvent.objects.filter(org=self.org).count(), 1)
+        self.assertEqual(EvidenceEvent.objects.filter(org=other_org).count(), 1)
+
+    def test_metadata_occurred_at_is_persisted(self):
+        self._post_historical(
+            'lb-hist:conv-old',
+            extra_metadata={'occurredAt': '2026-05-31T21:15:16Z'},
+        )
+        row = EvidenceEvent.objects.get(org=self.org)
+        self.assertEqual(row.occurred_at.year, 2026)
+        self.assertEqual(row.occurred_at.month, 5)
+        self.assertEqual(row.occurred_at.day, 31)
+
+    def test_metadata_occurred_at_missing_falls_back_to_now(self):
+        before = django_timezone.now()
+        self._post_historical('lb-hist:conv-notime')
+        row = EvidenceEvent.objects.get(org=self.org)
+        # Should be roughly now (within 10 seconds).
+        self.assertGreaterEqual(row.occurred_at, before)
